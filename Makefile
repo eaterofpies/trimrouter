@@ -121,6 +121,17 @@ $(INITRAMFS): $(BINARY) $(TEST_BOOT_DIR)/.kernel_extracted
 				cp "$$path" "$(STAGING)/lib/modules/$$KVER/$$rel_path" 2>/dev/null || true; \
 			done; \
 		done; \
+		if [ -d "$(TEST_BOOT_DIR)/lib/modules/$$KVER/kernel/drivers/net/usb" ]; then \
+			echo "[build] Staging all USB network drivers and their dependencies..."; \
+			for ko in $$(find "$(TEST_BOOT_DIR)/lib/modules/$$KVER/kernel/drivers/net/usb" -name "*.ko" -o -name "*.ko.*"); do \
+				paths=$$(modprobe -d $(TEST_BOOT_DIR) -S $$KVER --show-depends "$$ko" 2>/dev/null | awk '/^insmod/ {print $$2}'); \
+				for path in $$paths; do \
+					rel_path=$${path#$(TEST_BOOT_DIR)/lib/modules/$$KVER/}; \
+					mkdir -p "$(STAGING)/lib/modules/$$KVER/$$(dirname $$rel_path)"; \
+					cp "$$path" "$(STAGING)/lib/modules/$$KVER/$$rel_path" 2>/dev/null || true; \
+				done; \
+			done; \
+		fi; \
 		echo "[build] Staging modules.dep and modules.alias for guest loading..."; \
 		cp "$(TEST_BOOT_DIR)/lib/modules/$$KVER/modules.dep" "$(STAGING)/lib/modules/$$KVER/" 2>/dev/null || true; \
 		cp "$(TEST_BOOT_DIR)/lib/modules/$$KVER/modules.alias" "$(STAGING)/lib/modules/$$KVER/" 2>/dev/null || true; \

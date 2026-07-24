@@ -270,7 +270,7 @@ async fn startup_stage() -> TestEnv {
     let wan_if = if test_arch == "x86_64" { "eth0" } else { "eth1" };
     let lan_if = if test_arch == "x86_64" { "eth1" } else { "eth0" };
     let append_arg = format!(
-        "console={} quiet panic=-1 net.ifnames=0 rustyrouter.wan={} rustyrouter.lan={} rustyrouter.lan_ip=192.168.1.1/24",
+        "console={} loglevel=8 panic=-1 net.ifnames=0 rustyrouter.wan={} rustyrouter.lan={} rustyrouter.lan_ip=192.168.1.1/24",
         console, wan_if, lan_if
     );
 
@@ -290,16 +290,18 @@ async fn startup_stage() -> TestEnv {
 
     let mut args = extra_args;
     args.extend([
-        "-m".to_string(), "256".to_string(),
-        "-kernel".to_string(), kernel,
-        "-initrd".to_string(), initrd,
-        "-append".to_string(), append_arg,
-        "-netdev".to_string(), "stream,id=wan0,server=off,addr.type=unix,addr.path=target/wan.sock".to_string(),
-        "-device".to_string(), dev_arg,
-        "-netdev".to_string(), "stream,id=lan0,server=on,addr.type=unix,addr.path=target/lan.sock".to_string(),
-        "-device".to_string(), dev_arg_lan,
-        "-nographic".to_string(),
-    ]);
+        "-m", "256",
+        "-kernel", &kernel,
+        "-initrd", &initrd,
+        "-append", &append_arg,
+        "-netdev", "stream,id=wan0,server=off,addr.type=unix,addr.path=target/wan.sock",
+        "-device", &dev_arg,
+        "-netdev", "stream,id=lan0,server=on,addr.type=unix,addr.path=target/lan.sock",
+        "-device", &dev_arg_lan,
+        "-device", "qemu-xhci",
+        "-device", "usb-net",
+        "-nographic",
+    ].map(String::from));
 
     // E. Launch QEMU pointing to UNIX domain sockets
     println!("[test-env] Launching QEMU VM ({test_arch})...");
