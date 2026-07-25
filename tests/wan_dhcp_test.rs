@@ -298,8 +298,6 @@ async fn startup_stage() -> TestEnv {
         "-device", &dev_arg,
         "-netdev", "stream,id=lan0,server=on,addr.type=unix,addr.path=target/lan.sock",
         "-device", &dev_arg_lan,
-        "-device", "qemu-xhci",
-        "-device", "usb-net",
         "-nographic",
     ].map(String::from));
 
