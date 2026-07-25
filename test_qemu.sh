@@ -27,7 +27,7 @@ if [ "$ARCH" = "x86_64" ]; then
       -m 256 \
       -kernel "$KERNEL" \
       -initrd "$INITRAMFS" \
-      -append "console=ttyS0 quiet panic=-1 net.ifnames=0 rustyrouter.wan=eth0 rustyrouter.lan=eth1 rustyrouter.lan_ip=192.168.1.1/24" \
+      -append "console=ttyS0 quiet panic=-1 net.ifnames=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
       -netdev user,id=wan0,net=10.0.2.0/24 \
       -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
       -netdev user,id=lan0,net=192.168.1.0/24 \
@@ -40,7 +40,7 @@ elif [ "$ARCH" = "arm64" ]; then
       -m 256 \
       -kernel "$KERNEL" \
       -initrd "$INITRAMFS" \
-      -append "console=ttyAMA0 quiet panic=-1 net.ifnames=0 rustyrouter.wan=eth1 rustyrouter.lan=eth0 rustyrouter.lan_ip=192.168.1.1/24" \
+      -append "console=ttyAMA0 quiet panic=-1 net.ifnames=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
       -netdev user,id=wan0,net=10.0.2.0/24 \
       -device virtio-net-device,netdev=wan0,mac=52:54:00:12:34:56 \
       -netdev user,id=lan0,net=192.168.1.0/24 \
@@ -53,7 +53,7 @@ elif [ "$ARCH" = "armhf" ]; then
       -m 256 \
       -kernel "$KERNEL" \
       -initrd "$INITRAMFS" \
-      -append "console=ttyAMA0 quiet panic=-1 net.ifnames=0 rustyrouter.wan=eth1 rustyrouter.lan=eth0 rustyrouter.lan_ip=192.168.1.1/24" \
+      -append "console=ttyAMA0 quiet panic=-1 net.ifnames=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
       -netdev user,id=wan0,net=10.0.2.0/24 \
       -device virtio-net-device,netdev=wan0,mac=52:54:00:12:34:56 \
       -netdev user,id=lan0,net=192.168.1.0/24 \

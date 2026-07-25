@@ -82,11 +82,12 @@ To emulate the actual Raspberry Pi 3 Board (`-M raspi3b`), QEMU requires the boa
 ```bash
 qemu-system-aarch64 \
     -M raspi3b \
+    -cpu cortex-a53 \
     -m 1024 \
     -kernel target/pi_boot/kernel8.img \
     -dtb target/pi_boot/bcm2710-rpi-3-b-plus.dtb \
     -drive file=target/rustyrouter.img,if=sd,format=raw \
-    -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet rustyrouter.wan=eth0 rustyrouter.lan=eth1 rustyrouter.lan_ip=192.168.1.1/24" \
+    -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
     -nographic
 ```
 
@@ -103,11 +104,11 @@ qemu-system-aarch64 \
     -m 1024 \
     -kernel target/pi_boot/kernel8.img \
     -initrd target/pi_boot/pi_initramfs.cpio.gz \
-    -device virtio-net-pci,netdev=wan0 \
+    -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
     -netdev user,id=wan0 \
-    -device virtio-net-pci,netdev=lan0 \
+    -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
     -netdev user,id=lan0 \
-    -append "console=ttyAMA0 root=/dev/ram0 rdinit=/init quiet rustyrouter.wan=eth0 rustyrouter.lan=eth1 rustyrouter.lan_ip=192.168.1.1/24" \
+    -append "console=ttyAMA0 root=/dev/ram0 rdinit=/init quiet rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
     -nographic
 ```
 *(Note: To boot QEMU's `-M virt`, ensure your `kernel8.img` or the host's generic arm64 kernel has the `CONFIG_VIRTIO_NET` and `CONFIG_PCI` options enabled).*

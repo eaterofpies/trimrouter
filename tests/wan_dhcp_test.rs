@@ -124,6 +124,7 @@ struct TestEnv {
     _qemu_child: tokio::process::Child,
     _wan_isp_handle: tokio::task::JoinHandle<bool>,
     wan_verification_rx: tokio::sync::mpsc::Receiver<String>,
+    wan_cmd_tx: tokio::sync::mpsc::Sender<String>,
     lan_client: UnixStreamMock,
     leased_ip: Option<Ipv4Addr>,
     router_lan_mac: MacAddr,
@@ -179,6 +180,12 @@ async fn run_all_steps(env: &mut TestEnv, passed: &mut usize, failed: &mut usize
     );
     run_step!("sntp_sync", verify_sntp_sync(env), *passed, *failed);
     run_step!("dhcp_renewal", verify_dhcp_renewal(env), *passed, *failed);
+    run_step!(
+        "firewall_wan_drop",
+        verify_firewall_wan_drop(env),
+        *passed,
+        *failed
+    );
 }
 
 #[tokio::main]
@@ -238,6 +245,7 @@ async fn startup_stage() -> TestEnv {
 
     // MPSC Channel to coordinate mock WAN ISP and mock LAN client test steps
     let (verification_tx, verification_rx) = tokio::sync::mpsc::channel::<String>(100);
+    let (wan_cmd_tx, wan_cmd_rx) = tokio::sync::mpsc::channel::<String>(100);
 
     // C. Start our mock WAN ISP gateway in a background task
     let wan_isp_handle = tokio::spawn(async move {
@@ -246,32 +254,44 @@ async fn startup_stage() -> TestEnv {
             .await
             .expect("Failed to accept WAN connection from QEMU");
         let mock = UnixStreamMock::new(stream);
-        run_mock_wan_isp(mock, verification_tx).await
+        run_mock_wan_isp(mock, verification_tx, wan_cmd_rx).await
     });
 
     // D. Detect target architecture for simulation
     let test_arch = std::env::var("TEST_ARCH").unwrap_or_else(|_| "x86_64".to_string());
 
     let (qemu_bin, extra_args) = if test_arch == "arm64" {
-        ("qemu-system-aarch64", vec![
-            "-M".to_string(), "virt".to_string(),
-            "-cpu".to_string(), "cortex-a53".to_string(),
-        ])
+        (
+            "qemu-system-aarch64",
+            vec![
+                "-M".to_string(),
+                "virt".to_string(),
+                "-cpu".to_string(),
+                "cortex-a53".to_string(),
+            ],
+        )
     } else if test_arch == "armhf" {
-        ("qemu-system-arm", vec![
-            "-M".to_string(), "virt".to_string(),
-            "-cpu".to_string(), "cortex-a7".to_string(),
-        ])
+        (
+            "qemu-system-arm",
+            vec![
+                "-M".to_string(),
+                "virt".to_string(),
+                "-cpu".to_string(),
+                "cortex-a7".to_string(),
+            ],
+        )
     } else {
         ("qemu-system-x86_64", vec![])
     };
 
-    let console = if test_arch == "x86_64" { "ttyS0" } else { "ttyAMA0" };
-    let wan_if = if test_arch == "x86_64" { "eth0" } else { "eth1" };
-    let lan_if = if test_arch == "x86_64" { "eth1" } else { "eth0" };
+    let console = if test_arch == "x86_64" {
+        "ttyS0"
+    } else {
+        "ttyAMA0"
+    };
     let append_arg = format!(
-        "console={} loglevel=8 panic=-1 net.ifnames=0 rustyrouter.wan={} rustyrouter.lan={} rustyrouter.lan_ip=192.168.1.1/24",
-        console, wan_if, lan_if
+        "console={} loglevel=8 panic=-1 net.ifnames=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57",
+        console
     );
 
     let kernel = format!("target/{test_arch}/test_boot/vmlinuz");
@@ -289,17 +309,28 @@ async fn startup_stage() -> TestEnv {
     };
 
     let mut args = extra_args;
-    args.extend([
-        "-m", "256",
-        "-kernel", &kernel,
-        "-initrd", &initrd,
-        "-append", &append_arg,
-        "-netdev", "stream,id=wan0,server=off,addr.type=unix,addr.path=target/wan.sock",
-        "-device", &dev_arg,
-        "-netdev", "stream,id=lan0,server=on,addr.type=unix,addr.path=target/lan.sock",
-        "-device", &dev_arg_lan,
-        "-nographic",
-    ].map(String::from));
+    args.extend(
+        [
+            "-m",
+            "256",
+            "-kernel",
+            &kernel,
+            "-initrd",
+            &initrd,
+            "-append",
+            &append_arg,
+            "-netdev",
+            "stream,id=wan0,server=off,addr.type=unix,addr.path=target/wan.sock",
+            "-device",
+            &dev_arg,
+            "-netdev",
+            "stream,id=lan0,server=on,addr.type=unix,addr.path=target/lan.sock",
+            "-device",
+            &dev_arg_lan,
+            "-nographic",
+        ]
+        .map(String::from),
+    );
 
     // E. Launch QEMU pointing to UNIX domain sockets
     println!("[test-env] Launching QEMU VM ({test_arch})...");
@@ -455,6 +486,7 @@ async fn startup_stage() -> TestEnv {
         _qemu_child: qemu_child,
         _wan_isp_handle: wan_isp_handle,
         wan_verification_rx: rx,
+        wan_cmd_tx,
         lan_client,
         leased_ip: Some(leased_ip),
         router_lan_mac,
@@ -637,6 +669,7 @@ async fn verify_dhcp_renewal(env: &mut TestEnv) {
 async fn run_mock_wan_isp(
     mut mock: UnixStreamMock,
     verification_tx: tokio::sync::mpsc::Sender<String>,
+    mut wan_cmd_rx: tokio::sync::mpsc::Receiver<String>,
 ) -> bool {
     let xid;
     let client_mac;
@@ -750,7 +783,7 @@ async fn run_mock_wan_isp(
     // Notify coordinator that WAN DHCP setup is finished
     let _ = verification_tx.send("WAN_DHCP_DONE".to_string()).await;
 
-    // 5. WAN Loop to handle ARP, ICMP transit, and DNS queries
+    // 5. WAN Loop to handle ARP, ICMP transit, DNS queries, and unsolicited drop tests
     println!("[isp-test] Entering WAN verification event loop...");
     let start = std::time::Instant::now();
     let timeout_dur = Duration::from_secs(60);
@@ -759,17 +792,60 @@ async fn run_mock_wan_isp(
         if start.elapsed() >= timeout_dur {
             break;
         }
-        let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await
-        {
-            Ok(Ok(frame)) => frame,
-            Ok(Err(_)) => {
-                println!(
-                    "[isp-test] WAN socket connection closed. Exiting verification event loop."
-                );
-                break;
+
+        tokio::select! {
+            cmd = wan_cmd_rx.recv() => {
+                if let Some(cmd_str) = cmd
+                    && cmd_str == "SEND_UNSOLICITED_WAN"
+                {
+                    println!("[isp-test] Sending unsolicited DNS query to router's WAN IP: {}", MOCK_CLIENT_IP);
+                    let unsolicited_pkt = build_udp_packet(
+                        MOCK_SERVER_MAC,
+                        client_mac,
+                        MOCK_DNS_SERVER,
+                        MOCK_CLIENT_IP,
+                        12345,
+                        53,
+                        DNS_QUERY,
+                    );
+                    let _ = mock.send_frame(&unsolicited_pkt).await;
+
+                    // Start a 1-second monitoring window to check if any response comes back from the router
+                    let monitor_start = std::time::Instant::now();
+                    let mut packet_received = false;
+                    while monitor_start.elapsed() < Duration::from_secs(1) {
+                        if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(50), mock.recv_frame()).await
+                            && let Some((src_ip, dest_ip, src_port, dest_port, _)) = parse_udp_packet(&f).ok().flatten()
+                            && src_ip == MOCK_CLIENT_IP
+                            && dest_ip == MOCK_DNS_SERVER
+                            && src_port == 53
+                            && dest_port == 12345
+                        {
+                            packet_received = true;
+                            break;
+                        }
+                    }
+
+                    if packet_received {
+                        println!("[isp-test] ERROR: Received DNS reply from router on WAN interface! Firewall did not drop the packet.");
+                        let _ = verification_tx.send("FIREWALL_DROP_FAILED".to_string()).await;
+                    } else {
+                        println!("[isp-test] Verified: Firewall successfully dropped DNS query on WAN (no reply).");
+                        let _ = verification_tx.send("FIREWALL_DROP_VERIFIED".to_string()).await;
+                    }
+                }
             }
-            Err(_) => continue, // Timeout
-        };
+            frame_res = tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()) => {
+                let frame = match frame_res {
+                    Ok(Ok(frame)) => frame,
+                    Ok(Err(_)) => {
+                        println!(
+                            "[isp-test] WAN socket connection closed. Exiting verification event loop."
+                        );
+                        break;
+                    }
+                    Err(_) => continue, // Timeout
+                };
 
         if let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame) {
             println!(
@@ -926,6 +1002,8 @@ async fn run_mock_wan_isp(
                         .await;
                     continue;
                 }
+            }
+        }
             }
         }
     }
@@ -1429,4 +1507,35 @@ fn build_udp_packet(
     }
 
     buf
+}
+
+async fn verify_firewall_wan_drop(env: &mut TestEnv) {
+    println!("[test] Triggering WAN firewall unsolicited packet drop test...");
+
+    // Send command to mock WAN ISP to send the unsolicited packet
+    env.wan_cmd_tx
+        .send("SEND_UNSOLICITED_WAN".to_string())
+        .await
+        .unwrap();
+
+    // Await drop verification result from mock WAN ISP
+    let mut verified = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if let Ok(Some(msg)) =
+            tokio::time::timeout(Duration::from_millis(100), env.wan_verification_rx.recv()).await
+        {
+            if msg == "FIREWALL_DROP_VERIFIED" {
+                verified = true;
+                break;
+            } else if msg == "FIREWALL_DROP_FAILED" {
+                panic!(
+                    "Firewall failed to drop unsolicited WAN traffic; packet leaked or triggered response!"
+                );
+            }
+        }
+    }
+
+    assert!(verified, "Timeout waiting for firewall drop verification");
+    println!("[test] Firewall WAN unsolicited packet drop verified successfully.");
 }

@@ -124,9 +124,21 @@ async fn run_as_init(sys: Arc<RealSystem>) {
 
     // 4. Configure Network Interfaces (lo, LAN, WAN)
     if sys.getpid() == Pid::from_raw(1) {
-        if let Err(e) =
-            network::configure_network(&config.wan_interface, &config.lan_interface, &config.lan_ip)
-                .await
+        let rename_res =
+            network::resolve_and_rename_interfaces(&config.wan_mac, &config.lan_mac).await;
+        if let Err(e) = rename_res {
+            eprintln!(
+                "[init] ERROR: Failed to rename interfaces based on MAC: {}",
+                e
+            );
+        }
+
+        if let Err(e) = network::configure_network(
+            network::WAN_INTERFACE,
+            network::LAN_INTERFACE,
+            &config.lan_ip,
+        )
+        .await
         {
             eprintln!(
                 "[init] ERROR: Failed to configure network interfaces: {}",
@@ -134,7 +146,8 @@ async fn run_as_init(sys: Arc<RealSystem>) {
             );
         }
 
-        if let Err(e) = netfilter::configure_firewall(&config.wan_interface, &config.lan_interface)
+        if let Err(e) =
+            netfilter::configure_firewall(network::WAN_INTERFACE, network::LAN_INTERFACE)
         {
             eprintln!("[init] FATAL: Failed to configure firewall: {}", e);
             let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
@@ -169,14 +182,14 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     let lease_state = Arc::new(std::sync::Mutex::new(services::WanLease::default()));
 
     // Spawn DHCP WAN Client
-    let client_wan = config.wan_interface.clone();
+    let client_wan = network::WAN_INTERFACE.to_string();
     let client_lease = lease_state.clone();
     tokio::spawn(async move {
         services::start_dhcp_client(client_wan, client_lease).await;
     });
 
     // Spawn DHCP LAN Server
-    let server_lan = config.lan_interface.clone();
+    let server_lan = network::LAN_INTERFACE.to_string();
     let server_lan_ip = config.lan_ip.clone();
     tokio::spawn(async move {
         services::start_dhcp_server(server_lan, server_lan_ip).await;

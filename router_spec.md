@@ -47,8 +47,8 @@ When running as PID 1:
 3. **Orphan Reaping**:
    - Run a non-blocking or asynchronous reaping loop using `waitpid` to prevent zombie processes.
 4. **Configuration Extraction**:
-   - Read and parse `/proc/cmdline` to extract network settings (e.g., `rustyrouter.wan=eth0`, `rustyrouter.lan=eth1`, `rustyrouter.lan_ip=192.168.1.1`).
-   - If not provided, automatically detect network interfaces (e.g., sort available interfaces and treat the first as WAN and the second as LAN).
+   - Read and parse `/proc/cmdline` to extract network settings (e.g., `rustyrouter.wan_mac=52:54:00:12:34:56`, `rustyrouter.lan_mac=52:54:00:12:34:57`, `rustyrouter.lan_ip=192.168.1.1/24`).
+   - The `wan_mac` and `lan_mac` parameters are strictly required. If either is missing, the init process immediately panics (halts). Upon successful extraction, matching interfaces are renamed to the constants `wan` and `lan`.
 5. **Panic & Unrecoverable Error Handling**:
    - Registers a custom panic hook (`std::panic::set_hook`) to intercept Rust panics.
    - If a panic or unrecoverable error occurs, logs the traceback or error message directly to `stdout`.
@@ -143,14 +143,12 @@ All services are implemented directly inside the `rustyrouter` binary using asyn
 When running as PID 1, `rustyrouter` settings are read from `/proc/cmdline` (the kernel command line). 
 
 Example parameters:
-- `rustyrouter.wan=eth0` (Specify the WAN interface)
-- `rustyrouter.lan=eth1` (Specify the LAN interface)
+- `rustyrouter.wan_mac=52:54:00:12:34:56` (Required: map WAN interface by MAC and rename to `wan`)
+- `rustyrouter.lan_mac=52:54:00:12:34:57` (Required: map LAN interface by MAC and rename to `lan`)
 - `rustyrouter.lan_ip=192.168.1.1/24` (Specify the static LAN gateway IP and subnet)
 - `rustyrouter.dns=8.8.8.8,1.1.1.1` (Optional static DNS resolver fallbacks)
 
-If these parameters are missing or `/proc/cmdline` cannot be read, the router automatically detects the interfaces:
-- Scans available interfaces and treats the first non-loopback ethernet-like interface as WAN.
-- Treats the second as LAN.
+The `rustyrouter.wan_mac` and `rustyrouter.lan_mac` parameters are strictly required. If they are missing or if `/proc/cmdline` cannot be read, the init process will print a configuration error and panic (halt).
 - Defaults the LAN IP to `192.168.1.1/24`.
 
 ---
@@ -216,7 +214,7 @@ We boot the router VM with two NICs:
 qemu-system-x86_64 \
   -kernel /path/to/vmlinuz \
   -initrd initramfs.cpio.gz \
-  -append "console=ttyS0 rustyrouter.wan=eth0 rustyrouter.lan=eth1 rustyrouter.lan_ip=192.168.1.1/24" \
+  -append "console=ttyS0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
   -netdev user,id=wan0,net=10.0.2.0/24 \
   -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
   -netdev socket,id=lan0,listen=127.0.0.1:1234 \
@@ -239,5 +237,5 @@ qemu-system-x86_64 \
 Once booted, the client VM will:
 1. Run a standard DHCP client on its interface, which receives an IP address (e.g. `192.168.1.100`), default gateway (`192.168.1.1`), and DNS resolver (`192.168.1.1`) from `rustyrouter`'s server.
 2. Direct DNS queries to `192.168.1.1` (forwarded to the upstream gateway `10.0.2.2` by `rustyrouter`).
-3. Send ICMP packets or TCP streams out to the Internet, which the kernel of `rustyrouter` NATs and forwards through `eth0`.
+3. Send ICMP packets or TCP streams out to the Internet, which the kernel of `rustyrouter` NATs and forwards through `wan`.
 
