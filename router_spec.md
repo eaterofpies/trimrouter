@@ -52,7 +52,7 @@ When running as PID 1:
 5. **Panic & Unrecoverable Error Handling**:
    - Registers a custom panic hook (`std::panic::set_hook`) to intercept Rust panics.
    - If a panic or unrecoverable error occurs, logs the traceback or error message directly to `stdout`.
-   - Programmatically triggers a system reboot using the `reboot` system call (via `nix::sys::reboot::reboot(RebootMode::RB_AUTOBOOT)`) to reboot the system rather than exiting (which would cause an unclean kernel panic).
+   - Halts the system and hangs indefinitely (sleeps in an infinite loop) rather than rebooting or exiting (exiting would cause an unclean kernel panic), allowing diagnostic inspection of the console state.
 6. **Logging Destination**:
    - Prints all logs and diagnostics directly to standard output/error (`stdout`/`stderr`). Since the kernel maps the console stream to `/dev/console`, the logs print directly into the host's QEMU monitor/serial console.
 7. **ACPI Power Button Monitor (evdev)**:

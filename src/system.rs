@@ -93,7 +93,10 @@ pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), String> {
 
     // Set kernel modprobe helper path to trigger lazy loading
     if let Err(e) = fs::write("/proc/sys/kernel/modprobe", "/sbin/modprobe") {
-        println!("[init] Warning: Failed to set /proc/sys/kernel/modprobe: {}", e);
+        println!(
+            "[init] Warning: Failed to set /proc/sys/kernel/modprobe: {}",
+            e
+        );
     } else {
         println!("[init] Configured kernel modprobe path to /sbin/modprobe.");
     }
@@ -116,14 +119,12 @@ pub fn register_panic_handler<S: SystemOps>(sys: Arc<S>) {
             eprintln!("Location: {}:{}:{}", loc.file(), loc.line(), loc.column());
         }
         eprintln!("====================================================");
-        eprintln!("[init] Triggering emergency reboot...");
+        eprintln!("[init] System halted. Hanging indefinitely on panic...");
 
-        let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
-
-        // Fail-safe infinite loop in case reboot hangs (only if we are PID 1)
+        // Hang indefinitely on panic instead of rebooting (only if we are PID 1)
         if sys.getpid() == Pid::from_raw(1) {
             loop {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_secs(3600));
             }
         }
     }));
@@ -233,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emergency_reboot_on_panic() {
+    fn test_hang_on_panic() {
         let mut sys = MockSystem::new();
         // Set PID to non-1 so it returns from panic hook without infinite sleeping
         sys.pid = Pid::from_raw(99);
@@ -248,6 +249,6 @@ mod tests {
         let _ = handle.join(); // This will return immediately now
 
         let reboot_called = sys.reboot_call.lock().unwrap();
-        assert_eq!(*reboot_called, Some(RebootMode::RB_AUTOBOOT));
+        assert_eq!(*reboot_called, None);
     }
 }
