@@ -62,42 +62,21 @@ fn find_module_file(name: &str) -> Option<PathBuf> {
     find_module_recursive(&modules_dir, &base_name)
 }
 
-fn decompress_module(data: &[u8], path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    match extension {
-        "xz" => {
-            let mut decompressed = Vec::new();
-            let mut cursor = std::io::Cursor::new(data);
-            lzma_rs::xz_decompress(&mut cursor, &mut decompressed)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            Ok(decompressed)
-        }
-        "gz" => {
-            use std::io::Read;
-            let mut decompressed = Vec::new();
-            let mut decoder = flate2::read::GzDecoder::new(data);
-            decoder.read_to_end(&mut decompressed)?;
-            Ok(decompressed)
-        }
-        "zst" => {
-            let mut decompressed = Vec::new();
-            let mut decoder = ruzstd::decoding::FrameDecoder::new();
-            decoder
-                .decode_all_to_vec(data, &mut decompressed)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            Ok(decompressed)
-        }
-        _ => Ok(data.to_vec()),
-    }
-}
+/// Flag to finit_module indicating that the file is compressed and the kernel should decompress it.
+const MODULE_INIT_COMPRESSED_FILE: u32 = 0x0004;
 
 fn load_module(path: &Path) -> Result<(), std::io::Error> {
     println!("[init] Loading kernel module: {:?}", path);
-    let raw_data = fs::read(path)?;
-    let decompressed_data = decompress_module(&raw_data, path)?;
-
+    let file = fs::File::open(path)?;
     let param = std::ffi::CString::new("").unwrap();
-    if let Err(e) = nix::kmod::init_module(&decompressed_data, &param)
+
+    let mut flags = nix::kmod::ModuleInitFlags::empty();
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    if extension == "xz" || extension == "gz" || extension == "zst" {
+        flags = nix::kmod::ModuleInitFlags::from_bits_retain(MODULE_INIT_COMPRESSED_FILE);
+    }
+
+    if let Err(e) = nix::kmod::finit_module(&file, &param, flags)
         && e != nix::errno::Errno::EEXIST
     {
         return Err(std::io::Error::other(e.to_string()));
