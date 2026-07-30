@@ -130,6 +130,24 @@ async fn run_dns_forwarder(
     let _ = cleanup_task.await;
 }
 
+fn dispatch_pending_query(
+    pending: PendingQuery,
+    from_addr: std::net::SocketAddr,
+    resp_buf: &[u8],
+    len: usize,
+    xid: u16,
+) {
+    if from_addr.ip() == std::net::IpAddr::V4(pending.upstream_ip) {
+        let _ = pending.tx.send(resp_buf[..len].to_vec());
+    } else {
+        eprintln!(
+            "[dns-forwarder] WARNING: Received DNS spoof attempt! IP {} mismatch for xid {}",
+            from_addr.ip(),
+            xid
+        );
+    }
+}
+
 async fn run_upstream_receiver(
     upstream_socket: Arc<tokio::net::UdpSocket>,
     pending_queries: PendingQueries,
@@ -168,15 +186,7 @@ async fn run_upstream_receiver(
         };
 
         if let Some(p) = pending {
-            if from_addr.ip() == std::net::IpAddr::V4(p.upstream_ip) {
-                let _ = p.tx.send(resp_buf[..len].to_vec());
-            } else {
-                eprintln!(
-                    "[dns-forwarder] WARNING: Received DNS spoof attempt! IP {} mismatch for xid {}",
-                    from_addr.ip(),
-                    xid
-                );
-            }
+            dispatch_pending_query(p, from_addr, &resp_buf, len, xid);
         }
     }
 }
@@ -207,6 +217,53 @@ async fn run_cache_cleanup(cache: SharedCache, mut shutdown_rx: tokio::sync::wat
     }
 }
 
+async fn process_next_query(
+    socket: &Arc<tokio::net::UdpSocket>,
+    upstream_socket: &Arc<tokio::net::UdpSocket>,
+    cache: &SharedCache,
+    pending_queries: &PendingQueries,
+    lease_state: &Arc<Mutex<WanLease>>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    buf: &mut [u8],
+) -> bool {
+    let recv_fut = socket.recv_from(buf);
+    let res = tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {
+            return false;
+        }
+        r = recv_fut => r,
+    };
+
+    let (len, src) = match res {
+        Ok(res) => res,
+        Err(e) => {
+            handle_query_loop_error(e, shutdown_rx).await;
+            return true;
+        }
+    };
+
+    let query = buf[..len].to_vec();
+    let socket_clone = socket.clone();
+    let cache_clone = cache.clone();
+    let lease_clone = lease_state.clone();
+    let upstream_sock_clone = upstream_socket.clone();
+    let pending_queries_clone = pending_queries.clone();
+
+    tokio::spawn(async move {
+        handle_dns_query(
+            query,
+            src,
+            socket_clone,
+            cache_clone,
+            lease_clone,
+            upstream_sock_clone,
+            pending_queries_clone,
+        )
+        .await;
+    });
+    true
+}
+
 async fn run_query_loop(
     socket: Arc<tokio::net::UdpSocket>,
     upstream_socket: Arc<tokio::net::UdpSocket>,
@@ -220,42 +277,18 @@ async fn run_query_loop(
         if *shutdown_rx.borrow() {
             break;
         }
-
-        let recv_fut = socket.recv_from(&mut buf);
-        let res = tokio::select! {
-            _ = wait_shutdown(&mut shutdown_rx) => {
-                break;
-            }
-            r = recv_fut => r,
-        };
-
-        let (len, src) = match res {
-            Ok(res) => res,
-            Err(e) => {
-                handle_query_loop_error(e, &mut shutdown_rx).await;
-                continue;
-            }
-        };
-
-        let query = buf[..len].to_vec();
-        let socket_clone = socket.clone();
-        let cache_clone = cache.clone();
-        let lease_clone = lease_state.clone();
-        let upstream_sock_clone = upstream_socket.clone();
-        let pending_queries_clone = pending_queries.clone();
-
-        tokio::spawn(async move {
-            handle_dns_query(
-                query,
-                src,
-                socket_clone,
-                cache_clone,
-                lease_clone,
-                upstream_sock_clone,
-                pending_queries_clone,
-            )
-            .await;
-        });
+        let proceed = process_next_query(
+            &socket,
+            &upstream_socket,
+            &cache,
+            &pending_queries,
+            &lease_state,
+            &mut shutdown_rx,
+            &mut buf,
+        ).await;
+        if !proceed {
+            break;
+        }
     }
 }
 

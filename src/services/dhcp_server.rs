@@ -263,43 +263,53 @@ async fn run_dhcp_server(
         if *shutdown_rx.borrow() {
             break;
         }
-
-        let setup_res = tokio::select! {
-            _ = wait_shutdown(&mut shutdown_rx) => {
-                break;
-            }
-            res = setup_server_socket(&lan_interface) => res,
-        };
-
-        let (mac, raw_fd, async_sock) = match setup_res {
-            Ok(res) => res,
-            Err(e) => {
-                handle_setup_error(e, &mut shutdown_rx).await;
-                continue;
-            }
-        };
-
-        let config = ServerConfig {
-            server_ip,
-            subnet_mask,
-            server_mac: mac,
-            net,
-        };
-
-        let loop_res = run_server_loop(&async_sock, &config, &mut leases, &mut shutdown_rx).await;
-
-        unsafe {
-            libc::close(raw_fd);
-        }
-
-        if loop_res.is_err() {
-            if handle_loop_error(&mut shutdown_rx).await.is_err() {
-                break;
-            }
-        } else {
+        if !run_server_iteration(&lan_interface, server_ip, subnet_mask, net, &mut leases, &mut shutdown_rx).await {
             break;
         }
     }
+}
+
+async fn run_server_iteration(
+    lan_interface: &str,
+    server_ip: std::net::Ipv4Addr,
+    subnet_mask: std::net::Ipv4Addr,
+    net: ipnet::Ipv4Net,
+    leases: &mut LeaseTable,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let setup_res = tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {
+            return false;
+        }
+        res = setup_server_socket(lan_interface) => res,
+    };
+
+    let (mac, raw_fd, async_sock) = match setup_res {
+        Ok(res) => res,
+        Err(e) => {
+            handle_setup_error(e, shutdown_rx).await;
+            return true;
+        }
+    };
+
+    let config = ServerConfig {
+        server_ip,
+        subnet_mask,
+        server_mac: mac,
+        net,
+    };
+
+    let loop_res = run_server_loop(&async_sock, &config, leases, shutdown_rx).await;
+
+    unsafe {
+        libc::close(raw_fd);
+    }
+
+    if loop_res.is_err() {
+        let is_ok = handle_loop_error(shutdown_rx).await.is_ok();
+        return is_ok;
+    }
+    false
 }
 
 async fn handle_setup_error(e: ServerError, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
@@ -324,6 +334,28 @@ async fn handle_loop_error(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>)
     }
 }
 
+async fn receive_next_packet(
+    async_sock: &AsyncFd<RawFd>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    buf: &mut [u8],
+) -> Result<Option<usize>, std::io::Error> {
+    let read_fut = read_raw_packet(async_sock, buf);
+    let res = tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {
+            return Ok(None);
+        }
+        r = read_fut => r,
+    };
+
+    match res {
+        Ok(n) => Ok(Some(n)),
+        Err(e) => {
+            eprintln!("[dhcp-server] Socket read error: {}. Recreating socket.", e);
+            Err(e)
+        }
+    }
+}
+
 async fn run_server_loop(
     async_sock: &AsyncFd<RawFd>,
     config: &ServerConfig,
@@ -336,20 +368,8 @@ async fn run_server_loop(
             return Ok(());
         }
 
-        let read_fut = read_raw_packet(async_sock, &mut buf);
-        let res = tokio::select! {
-            _ = wait_shutdown(shutdown_rx) => {
-                return Ok(());
-            }
-            r = read_fut => r,
-        };
-
-        let bytes_read = match res {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("[dhcp-server] Socket read error: {}. Recreating socket.", e);
-                return Err(e);
-            }
+        let Some(bytes_read) = receive_next_packet(async_sock, shutdown_rx, &mut buf).await? else {
+            return Ok(());
         };
 
         process_incoming_packet(bytes_read, &buf, async_sock, config, leases).await;

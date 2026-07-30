@@ -155,7 +155,23 @@ impl DhcpClientInternal {
             retry_delay_secs = calculate_next_delay(retry_delay_secs);
         }
     }
+}
 
+fn handle_ack_result(ack_res: ParseAckResult) -> Option<Result<DhcpAck, DhcpError>> {
+    match ack_res {
+        ParseAckResult::Ack(ack) => {
+            println!("[dhcp-client] Received DHCPACK for IP: {}", ack.ip);
+            Some(Ok(ack))
+        }
+        ParseAckResult::Nak => {
+            println!("[dhcp-client] Received DHCPNAK!");
+            Some(Err(DhcpError::Nak))
+        }
+        ParseAckResult::None => None,
+    }
+}
+
+impl DhcpClientInternal {
     async fn request_phase(&self, xid: u32, offer: DhcpOffer) -> Result<DhcpAck, DhcpError> {
         let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
 
@@ -170,18 +186,8 @@ impl DhcpClientInternal {
             .await;
             let timeout = get_jittered_duration(retry_delay_secs);
 
-            if let Some(ack_res) = self.wait_for_ack(xid, timeout).await? {
-                match ack_res {
-                    ParseAckResult::Ack(ack) => {
-                        println!("[dhcp-client] Received DHCPACK for IP: {}", ack.ip);
-                        return Ok(ack);
-                    }
-                    ParseAckResult::Nak => {
-                        println!("[dhcp-client] Received DHCPNAK!");
-                        return Err(DhcpError::Nak);
-                    }
-                    ParseAckResult::None => {}
-                }
+            if let Some(result) = self.wait_for_ack(xid, timeout).await?.and_then(handle_ack_result) {
+                return result;
             }
 
             retry_delay_secs = calculate_next_delay(retry_delay_secs);
@@ -538,6 +544,21 @@ impl Service for DhcpClient {
     }
 }
 
+async fn handle_mac_address_error(
+    wan_interface: &str,
+    e: &str,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    eprintln!(
+        "[dhcp-client] ERROR: Failed to get MAC address for {}: {}. Retrying in {}s...",
+        wan_interface, e, SOCKET_RESTART_DELAY_SECS
+    );
+    tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {}
+        _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => {}
+    }
+}
+
 async fn run_client_loop(
     wan_interface: String,
     lease_state: SharedWanLease,
@@ -556,14 +577,7 @@ async fn run_client_loop(
         let mac = match get_interface_mac(&wan_interface).await {
             Ok(m) => m,
             Err(e) => {
-                eprintln!(
-                    "[dhcp-client] ERROR: Failed to get MAC address for {}: {}. Retrying in {}s...",
-                    wan_interface, e, SOCKET_RESTART_DELAY_SECS
-                );
-                tokio::select! {
-                    _ = wait_shutdown(&mut shutdown_rx) => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => {}
-                }
+                handle_mac_address_error(&wan_interface, &e, &mut shutdown_rx).await;
                 continue;
             }
         };

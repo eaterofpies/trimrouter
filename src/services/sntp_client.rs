@@ -56,6 +56,44 @@ impl Service for SntpClient {
     }
 }
 
+async fn handle_sntp_iteration(
+    lease_state: &Arc<Mutex<WanLease>>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    current_retry_delay: &mut Duration,
+) -> bool {
+    if !wait_for_wan(lease_state, shutdown_rx).await {
+        return false;
+    }
+
+    let sync_res = tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {
+            return false;
+        }
+        res = sync_time() => res,
+    };
+
+    match sync_res {
+        Ok(time_now) => {
+            println!(
+                "[sntp-client] Successfully synchronized system time: {}",
+                time_now
+            );
+            *current_retry_delay = RETRY_INTERVAL;
+            sleep_or_shutdown(SYNC_INTERVAL, shutdown_rx).await
+        }
+        Err(e) => {
+            eprintln!(
+                "[sntp-client] Time synchronization failed: {}. Retrying in {}s...",
+                e,
+                current_retry_delay.as_secs()
+            );
+            let proceed = sleep_or_shutdown(*current_retry_delay, shutdown_rx).await;
+            *current_retry_delay = std::cmp::min(*current_retry_delay * 2, MAX_RETRY_INTERVAL);
+            proceed
+        }
+    }
+}
+
 async fn run_sntp_loop(
     lease_state: Arc<Mutex<WanLease>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -69,39 +107,8 @@ async fn run_sntp_loop(
             break;
         }
 
-        if !wait_for_wan(&lease_state, &mut shutdown_rx).await {
+        if !handle_sntp_iteration(&lease_state, &mut shutdown_rx, &mut current_retry_delay).await {
             break;
-        }
-
-        let sync_res = tokio::select! {
-            _ = wait_shutdown(&mut shutdown_rx) => {
-                break;
-            }
-            res = sync_time() => res,
-        };
-
-        match sync_res {
-            Ok(time_now) => {
-                println!(
-                    "[sntp-client] Successfully synchronized system time: {}",
-                    time_now
-                );
-                current_retry_delay = RETRY_INTERVAL;
-                if !sleep_or_shutdown(SYNC_INTERVAL, &mut shutdown_rx).await {
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "[sntp-client] Time synchronization failed: {}. Retrying in {}s...",
-                    e,
-                    current_retry_delay.as_secs()
-                );
-                if !sleep_or_shutdown(current_retry_delay, &mut shutdown_rx).await {
-                    break;
-                }
-                current_retry_delay = std::cmp::min(current_retry_delay * 2, MAX_RETRY_INTERVAL);
-            }
         }
     }
 }
@@ -156,7 +163,8 @@ async fn sync_time() -> Result<chrono::DateTime<chrono::Utc>, String> {
         .map_err(|e| format!("Failed to convert NTP datetime: {}", e))?;
 
     let duration = chrono_dt.signed_duration_since(chrono::DateTime::UNIX_EPOCH);
-    let timespec = nix::sys::time::TimeSpec::from(duration.to_std().unwrap());
+    let std_duration = duration.to_std().map_err(|e| format!("Invalid duration: {}", e))?;
+    let timespec = nix::sys::time::TimeSpec::from(std_duration);
     nix::time::clock_settime(nix::time::ClockId::CLOCK_REALTIME, timespec)
         .map_err(|e| format!("Failed to set system clock: {}", e))?;
 

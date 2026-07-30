@@ -90,6 +90,237 @@ async fn configure_interface(
     Ok(())
 }
 
+fn extract_link_attribute(
+    nla: rtnetlink::packet_route::link::LinkAttribute,
+    name: &mut Option<String>,
+    mac: &mut Option<Vec<u8>>,
+) {
+    match nla {
+        rtnetlink::packet_route::link::LinkAttribute::IfName(n) => *name = Some(n),
+        rtnetlink::packet_route::link::LinkAttribute::Address(addr) => *mac = Some(addr),
+        _ => {}
+    }
+}
+
+fn parse_link_info(
+    link: rtnetlink::packet_route::link::LinkMessage,
+) -> Option<(u32, String, Vec<u8>)> {
+    let index = link.header.index;
+    let mut name = None;
+    let mut mac = None;
+    for nla in link.attributes {
+        extract_link_attribute(nla, &mut name, &mut mac);
+    }
+    let n = name?;
+    let m = mac?;
+    Some((index, n, m))
+}
+
+fn process_link_message(
+    link: rtnetlink::packet_route::link::LinkMessage,
+    wan_bytes: &[u8],
+    lan_bytes: &[u8],
+    interfaces: &mut Vec<(u32, String, Vec<u8>)>,
+) -> (bool, bool) {
+    let mut found_wan = false;
+    let mut found_lan = false;
+    if let Some((index, n, m)) = parse_link_info(link) {
+        if m == wan_bytes[..] {
+            found_wan = true;
+        }
+        if m == lan_bytes[..] {
+            found_lan = true;
+        }
+        interfaces.push((index, n, m));
+    }
+    (found_wan, found_lan)
+}
+
+async fn collect_interfaces(
+    handle: &rtnetlink::Handle,
+    wan_bytes: &[u8],
+    lan_bytes: &[u8],
+    interfaces: &mut Vec<(u32, String, Vec<u8>)>,
+) -> Result<(bool, bool), rtnetlink::Error> {
+    use futures_util::TryStreamExt;
+    let mut links = handle.link().get().execute();
+    let mut found_wan = false;
+    let mut found_lan = false;
+
+    while let Some(link) = links.try_next().await? {
+        let (wan, lan) = process_link_message(link, wan_bytes, lan_bytes, interfaces);
+        found_wan |= wan;
+        found_lan |= lan;
+    }
+    Ok((found_wan, found_lan))
+}
+
+async fn rename_interface_to_wan(
+    interfaces: &[(u32, String, Vec<u8>)],
+    chosen_index: u32,
+    chosen_name: &str,
+    wan_mac: &str,
+    handle: &rtnetlink::Handle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(other) = interfaces
+        .iter()
+        .find(|(idx, name, _)| name == WAN_INTERFACE && *idx != chosen_index)
+    {
+        let temp_name = format!("{}_old_{}", WAN_INTERFACE, other.0);
+        println!(
+            "[network] Interface name collision: renaming existing interface {} (index {}) to {} to free up the name",
+            WAN_INTERFACE, other.0, temp_name
+        );
+        let msg_down = rtnetlink::LinkUnspec::new_with_index(other.0).down().build();
+        handle.link().change(msg_down).execute().await?;
+        let msg_name = rtnetlink::LinkUnspec::new_with_index(other.0)
+            .name(temp_name)
+            .build();
+        handle.link().change(msg_name).execute().await?;
+        let msg_up = rtnetlink::LinkUnspec::new_with_index(other.0).up().build();
+        handle.link().change(msg_up).execute().await?;
+    }
+
+    println!(
+        "[network] Renaming interface {} (index {}) to {} based on MAC {}",
+        chosen_name, chosen_index, WAN_INTERFACE, wan_mac
+    );
+    let msg_down = rtnetlink::LinkUnspec::new_with_index(chosen_index).down().build();
+    handle.link().change(msg_down).execute().await?;
+    let msg_name = rtnetlink::LinkUnspec::new_with_index(chosen_index)
+        .name(WAN_INTERFACE.to_string())
+        .build();
+    handle.link().change(msg_name).execute().await?;
+    let msg_up = rtnetlink::LinkUnspec::new_with_index(chosen_index).up().build();
+    handle.link().change(msg_up).execute().await?;
+    Ok(())
+}
+
+async fn resolve_and_rename_wan(
+    interfaces: &[(u32, String, Vec<u8>)],
+    wan_mac: &str,
+    handle: &rtnetlink::Handle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target_mac = MacAddr::from_str(wan_mac)?;
+    let target_bytes = target_mac.octets();
+
+    let mut candidates: Vec<_> = interfaces
+        .iter()
+        .filter(|(_, _, m)| m == &target_bytes[..])
+        .cloned()
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    candidates.sort_by_key(|c| c.0);
+    let chosen = match candidates.last() {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let chosen_index = chosen.0;
+    let chosen_name = &chosen.1;
+
+    if candidates.len() > 1 {
+        for old in &candidates[..candidates.len() - 1] {
+            eprintln!(
+                "[network] WARNING: Multiple interfaces found with MAC address {}! The newer interface {} (index {}) takes precedence over {} (index {}).",
+                wan_mac, chosen_name, chosen_index, old.1, old.0
+            );
+        }
+    }
+
+    if chosen_name != WAN_INTERFACE {
+        rename_interface_to_wan(interfaces, chosen_index, chosen_name, wan_mac, handle).await?;
+    }
+
+    Ok(())
+}
+
+async fn rename_interface_to_lan(
+    interfaces: &[(u32, String, Vec<u8>)],
+    chosen_index: u32,
+    chosen_name: &str,
+    lan_mac: &str,
+    handle: &rtnetlink::Handle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(other) = interfaces
+        .iter()
+        .find(|(idx, name, _)| name == LAN_INTERFACE && *idx != chosen_index)
+    {
+        let temp_name = format!("{}_old_{}", LAN_INTERFACE, other.0);
+        println!(
+            "[network] Interface name collision: renaming existing interface {} (index {}) to {} to free up the name",
+            LAN_INTERFACE, other.0, temp_name
+        );
+        let msg_down = rtnetlink::LinkUnspec::new_with_index(other.0).down().build();
+        handle.link().change(msg_down).execute().await?;
+        let msg_name = rtnetlink::LinkUnspec::new_with_index(other.0)
+            .name(temp_name)
+            .build();
+        handle.link().change(msg_name).execute().await?;
+        let msg_up = rtnetlink::LinkUnspec::new_with_index(other.0).up().build();
+        handle.link().change(msg_up).execute().await?;
+    }
+
+    println!(
+        "[network] Renaming interface {} (index {}) to {} based on MAC {}",
+        chosen_name, chosen_index, LAN_INTERFACE, lan_mac
+    );
+    let msg_down = rtnetlink::LinkUnspec::new_with_index(chosen_index).down().build();
+    handle.link().change(msg_down).execute().await?;
+    let msg_name = rtnetlink::LinkUnspec::new_with_index(chosen_index)
+        .name(LAN_INTERFACE.to_string())
+        .build();
+    handle.link().change(msg_name).execute().await?;
+    let msg_up = rtnetlink::LinkUnspec::new_with_index(chosen_index).up().build();
+    handle.link().change(msg_up).execute().await?;
+    Ok(())
+}
+
+async fn resolve_and_rename_lan(
+    interfaces: &[(u32, String, Vec<u8>)],
+    lan_mac: &str,
+    handle: &rtnetlink::Handle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target_mac = MacAddr::from_str(lan_mac)?;
+    let target_bytes = target_mac.octets();
+
+    let mut candidates: Vec<_> = interfaces
+        .iter()
+        .filter(|(_, _, m)| m == &target_bytes[..])
+        .cloned()
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    candidates.sort_by_key(|c| c.0);
+    let chosen = match candidates.last() {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let chosen_index = chosen.0;
+    let chosen_name = &chosen.1;
+
+    if candidates.len() > 1 {
+        for old in &candidates[..candidates.len() - 1] {
+            eprintln!(
+                "[network] WARNING: Multiple interfaces found with MAC address {}! The newer interface {} (index {}) takes precedence over {} (index {}).",
+                lan_mac, chosen_name, chosen_index, old.1, old.0
+            );
+        }
+    }
+
+    if chosen_name != LAN_INTERFACE {
+        rename_interface_to_lan(interfaces, chosen_index, chosen_name, lan_mac, handle).await?;
+    }
+
+    Ok(())
+}
+
 pub async fn resolve_and_rename_interfaces(
     wan_mac: &str,
     lan_mac: &str,
@@ -116,33 +347,8 @@ pub async fn resolve_and_rename_interfaces(
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
-        use futures_util::TryStreamExt;
-        let mut links = handle.link().get().execute();
-        let mut found_wan = false;
-        let mut found_lan = false;
         interfaces.clear();
-
-        while let Some(link) = links.try_next().await? {
-            let index = link.header.index;
-            let mut name = None;
-            let mut mac = None;
-            for nla in link.attributes {
-                match nla {
-                    rtnetlink::packet_route::link::LinkAttribute::IfName(n) => name = Some(n),
-                    rtnetlink::packet_route::link::LinkAttribute::Address(addr) => mac = Some(addr),
-                    _ => {}
-                }
-            }
-            if let (Some(n), Some(m)) = (name, mac) {
-                if m == wan_bytes[..] {
-                    found_wan = true;
-                }
-                if m == lan_bytes[..] {
-                    found_lan = true;
-                }
-                interfaces.push((index, n, m));
-            }
-        }
+        let (found_wan, found_lan) = collect_interfaces(&handle, &wan_bytes[..], &lan_bytes[..], &mut interfaces).await?;
 
         if (found_wan && found_lan) || start_time.elapsed() >= timeout {
             break;
@@ -155,146 +361,10 @@ pub async fn resolve_and_rename_interfaces(
     tokio::spawn(connection);
 
     // 2. Resolve WAN
-    {
-        let target_mac = match MacAddr::from_str(wan_mac) {
-            Ok(m) => m,
-            Err(_) => return Err(format!("Invalid MAC address format: {}", wan_mac).into()),
-        };
-        let target_bytes = target_mac.octets();
-
-        let mut candidates: Vec<_> = interfaces
-            .iter()
-            .filter(|(_, _, m)| m == &target_bytes[..])
-            .cloned()
-            .collect();
-
-        if !candidates.is_empty() {
-            candidates.sort_by_key(|c| c.0);
-            let chosen = candidates.last().unwrap();
-            let chosen_index = chosen.0;
-            let chosen_name = &chosen.1;
-
-            if candidates.len() > 1 {
-                for old in &candidates[..candidates.len() - 1] {
-                    eprintln!(
-                        "[network] WARNING: Multiple interfaces found with MAC address {}! The newer interface {} (index {}) takes precedence over {} (index {}).",
-                        wan_mac, chosen_name, chosen_index, old.1, old.0
-                    );
-                }
-            }
-
-            if chosen_name != WAN_INTERFACE {
-                if let Some(other) = interfaces
-                    .iter()
-                    .find(|(idx, name, _)| name == WAN_INTERFACE && *idx != chosen_index)
-                {
-                    let temp_name = format!("{}_old_{}", WAN_INTERFACE, other.0);
-                    println!(
-                        "[network] Interface name collision: renaming existing interface {} (index {}) to {} to free up the name",
-                        WAN_INTERFACE, other.0, temp_name
-                    );
-                    let msg_down = rtnetlink::LinkUnspec::new_with_index(other.0)
-                        .down()
-                        .build();
-                    let _ = handle.link().change(msg_down).execute().await;
-                    let msg_name = rtnetlink::LinkUnspec::new_with_index(other.0)
-                        .name(temp_name)
-                        .build();
-                    let _ = handle.link().change(msg_name).execute().await;
-                    let msg_up = rtnetlink::LinkUnspec::new_with_index(other.0).up().build();
-                    let _ = handle.link().change(msg_up).execute().await;
-                }
-
-                println!(
-                    "[network] Renaming interface {} (index {}) to {} based on MAC {}",
-                    chosen_name, chosen_index, WAN_INTERFACE, wan_mac
-                );
-                let msg_down = rtnetlink::LinkUnspec::new_with_index(chosen_index)
-                    .down()
-                    .build();
-                handle.link().change(msg_down).execute().await?;
-                let msg_name = rtnetlink::LinkUnspec::new_with_index(chosen_index)
-                    .name(WAN_INTERFACE.to_string())
-                    .build();
-                handle.link().change(msg_name).execute().await?;
-                let msg_up = rtnetlink::LinkUnspec::new_with_index(chosen_index)
-                    .up()
-                    .build();
-                handle.link().change(msg_up).execute().await?;
-            }
-        }
-    }
+    resolve_and_rename_wan(&interfaces, wan_mac, &handle).await?;
 
     // 3. Resolve LAN
-    {
-        let target_mac = match MacAddr::from_str(lan_mac) {
-            Ok(m) => m,
-            Err(_) => return Err(format!("Invalid MAC address format: {}", lan_mac).into()),
-        };
-        let target_bytes = target_mac.octets();
-
-        let mut candidates: Vec<_> = interfaces
-            .iter()
-            .filter(|(_, _, m)| m == &target_bytes[..])
-            .cloned()
-            .collect();
-
-        if !candidates.is_empty() {
-            candidates.sort_by_key(|c| c.0);
-            let chosen = candidates.last().unwrap();
-            let chosen_index = chosen.0;
-            let chosen_name = &chosen.1;
-
-            if candidates.len() > 1 {
-                for old in &candidates[..candidates.len() - 1] {
-                    eprintln!(
-                        "[network] WARNING: Multiple interfaces found with MAC address {}! The newer interface {} (index {}) takes precedence over {} (index {}).",
-                        lan_mac, chosen_name, chosen_index, old.1, old.0
-                    );
-                }
-            }
-
-            if chosen_name != LAN_INTERFACE {
-                if let Some(other) = interfaces
-                    .iter()
-                    .find(|(idx, name, _)| name == LAN_INTERFACE && *idx != chosen_index)
-                {
-                    let temp_name = format!("{}_old_{}", LAN_INTERFACE, other.0);
-                    println!(
-                        "[network] Interface name collision: renaming existing interface {} (index {}) to {} to free up the name",
-                        LAN_INTERFACE, other.0, temp_name
-                    );
-                    let msg_down = rtnetlink::LinkUnspec::new_with_index(other.0)
-                        .down()
-                        .build();
-                    let _ = handle.link().change(msg_down).execute().await;
-                    let msg_name = rtnetlink::LinkUnspec::new_with_index(other.0)
-                        .name(temp_name)
-                        .build();
-                    let _ = handle.link().change(msg_name).execute().await;
-                    let msg_up = rtnetlink::LinkUnspec::new_with_index(other.0).up().build();
-                    let _ = handle.link().change(msg_up).execute().await;
-                }
-
-                println!(
-                    "[network] Renaming interface {} (index {}) to {} based on MAC {}",
-                    chosen_name, chosen_index, LAN_INTERFACE, lan_mac
-                );
-                let msg_down = rtnetlink::LinkUnspec::new_with_index(chosen_index)
-                    .down()
-                    .build();
-                handle.link().change(msg_down).execute().await?;
-                let msg_name = rtnetlink::LinkUnspec::new_with_index(chosen_index)
-                    .name(LAN_INTERFACE.to_string())
-                    .build();
-                handle.link().change(msg_name).execute().await?;
-                let msg_up = rtnetlink::LinkUnspec::new_with_index(chosen_index)
-                    .up()
-                    .build();
-                handle.link().change(msg_up).execute().await?;
-            }
-        }
-    }
+    resolve_and_rename_lan(&interfaces, lan_mac, &handle).await?;
 
     Ok(())
 }

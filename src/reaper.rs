@@ -6,6 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Duration, sleep};
 
+async fn fallback_polling_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
+    while !shutdown_flag.load(Ordering::Relaxed) {
+        reap_zombies(sys.as_ref());
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 pub async fn start_orphan_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     println!("[reaper] Starting orphan process reaper task...");
 
@@ -16,10 +23,7 @@ pub async fn start_orphan_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<A
                 "[reaper] Error creating SIGCHLD stream: {}. Falling back to polling.",
                 e
             );
-            while !shutdown_flag.load(Ordering::Relaxed) {
-                reap_zombies(sys.as_ref());
-                sleep(Duration::from_millis(500)).await;
-            }
+            fallback_polling_reaper(sys, shutdown_flag).await;
             return;
         }
     };
@@ -36,34 +40,36 @@ pub async fn start_orphan_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<A
     }
 }
 
+fn try_reap_zombie<S: SystemOps>(sys: &S) -> bool {
+    match sys.waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::Exited(pid, code)) => {
+            println!(
+                "[reaper] Reaped child process (PID {}) which exited with status {}",
+                pid, code
+            );
+            true
+        }
+        Ok(WaitStatus::Signaled(pid, sig, _)) => {
+            println!(
+                "[reaper] Reaped child process (PID {}) which terminated with signal {}",
+                pid, sig
+            );
+            true
+        }
+        Ok(WaitStatus::StillAlive) => false,
+        Err(nix::Error::ECHILD) => false,
+        Err(e) => {
+            eprintln!("[reaper] waitpid error: {}", e);
+            false
+        }
+        _ => false,
+    }
+}
+
 pub fn reap_zombies<S: SystemOps>(sys: &S) {
     loop {
-        match sys.waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(pid, code)) => {
-                println!(
-                    "[reaper] Reaped child process (PID {}) which exited with status {}",
-                    pid, code
-                );
-            }
-            Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                println!(
-                    "[reaper] Reaped child process (PID {}) which terminated with signal {}",
-                    pid, sig
-                );
-            }
-            Ok(WaitStatus::StillAlive) => {
-                break;
-            }
-            Err(nix::Error::ECHILD) => {
-                break;
-            }
-            Err(e) => {
-                eprintln!("[reaper] waitpid error: {}", e);
-                break;
-            }
-            _ => {
-                break;
-            }
+        if !try_reap_zombie(sys) {
+            break;
         }
     }
 }

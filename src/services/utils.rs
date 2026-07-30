@@ -18,6 +18,22 @@ pub type SharedWanLease = Arc<Mutex<WanLease>>;
 // =========================================================================
 // Helper Functions for Raw Sockets
 // =========================================================================
+fn find_mac_address_attribute(
+    attributes: Vec<rtnetlink::packet_route::link::LinkAttribute>,
+) -> Option<pnet::util::MacAddr> {
+    for attr in attributes {
+        if let rtnetlink::packet_route::link::LinkAttribute::Address(mac_vec) = attr {
+            if mac_vec.len() != 6 {
+                continue;
+            }
+            return Some(pnet::util::MacAddr(
+                mac_vec[0], mac_vec[1], mac_vec[2], mac_vec[3], mac_vec[4], mac_vec[5],
+            ));
+        }
+    }
+    None
+}
+
 pub async fn get_interface_mac(ifname: &str) -> Result<pnet::util::MacAddr, String> {
     let (connection, handle, _) = rtnetlink::new_connection()
         .map_err(|e| format!("Failed to open netlink connection: {}", e))?;
@@ -31,22 +47,8 @@ pub async fn get_interface_mac(ifname: &str) -> Result<pnet::util::MacAddr, Stri
         Err(e) => return Err(format!("Netlink request failed: {}", e)),
     };
 
-    for attr in link.attributes {
-        let mac_vec = match attr {
-            rtnetlink::packet_route::link::LinkAttribute::Address(v) => v,
-            _ => continue,
-        };
-        if mac_vec.len() == 6 {
-            return Ok(pnet::util::MacAddr(
-                mac_vec[0], mac_vec[1], mac_vec[2], mac_vec[3], mac_vec[4], mac_vec[5],
-            ));
-        }
-    }
-
-    Err(format!(
-        "No hardware address attribute found for interface {}",
-        ifname
-    ))
+    find_mac_address_attribute(link.attributes)
+        .ok_or_else(|| format!("No hardware address attribute found for interface {}", ifname))
 }
 
 pub fn open_raw_socket(ifname: &str) -> Result<RawFd, String> {
@@ -212,6 +214,15 @@ const LOCALHOST: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const DNS_PORT: u16 = 53;
 const LOCAL_DNS_BIND: &str = "127.0.0.1:0";
 
+fn find_first_a_record(answers: Vec<dns_parser::ResourceRecord<'_>>) -> Option<std::net::Ipv4Addr> {
+    for answer in answers {
+        if let dns_parser::RData::A(ip) = answer.data {
+            return Some(ip.0);
+        }
+    }
+    None
+}
+
 pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, String> {
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
@@ -267,15 +278,8 @@ pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, Stri
         return Err("Transaction ID mismatch".to_string());
     }
 
-    let mut resolved_ip = None;
-    for answer in packet.answers {
-        if let dns_parser::RData::A(ip) = answer.data {
-            resolved_ip = Some(ip.0);
-            break;
-        }
-    }
-
-    resolved_ip.ok_or_else(|| format!("No A record resolved for {}", host))
+    find_first_a_record(packet.answers)
+        .ok_or_else(|| format!("No A record resolved for {}", host))
 }
 
 pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {

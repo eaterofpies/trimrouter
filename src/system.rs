@@ -104,29 +104,36 @@ pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), String> {
     Ok(())
 }
 
+fn log_panic_info(info: &std::panic::PanicHookInfo<'_>) {
+    eprintln!("====================================================");
+    eprintln!("CRITICAL: RUSTYROUTER PANICKED!");
+    if let Some(s) = info.payload().downcast_ref::<&str>() {
+        eprintln!("Panic Cause: {}", s);
+    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+        eprintln!("Panic Cause: {}", s);
+    } else {
+        eprintln!("Panic Cause: Unknown");
+    }
+    if let Some(loc) = info.location() {
+        eprintln!("Location: {}:{}:{}", loc.file(), loc.line(), loc.column());
+    }
+    eprintln!("====================================================");
+    eprintln!("[init] System halted. Hanging indefinitely on panic...");
+}
+
+fn halt_on_panic<S: SystemOps>(sys: &S) {
+    if sys.getpid() != Pid::from_raw(1) {
+        return;
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 pub fn register_panic_handler<S: SystemOps>(sys: Arc<S>) {
     panic::set_hook(Box::new(move |info| {
-        eprintln!("====================================================");
-        eprintln!("CRITICAL: RUSTYROUTER PANICKED!");
-        if let Some(s) = info.payload().downcast_ref::<&str>() {
-            eprintln!("Panic Cause: {}", s);
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            eprintln!("Panic Cause: {}", s);
-        } else {
-            eprintln!("Panic Cause: Unknown");
-        }
-        if let Some(loc) = info.location() {
-            eprintln!("Location: {}:{}:{}", loc.file(), loc.line(), loc.column());
-        }
-        eprintln!("====================================================");
-        eprintln!("[init] System halted. Hanging indefinitely on panic...");
-
-        // Hang indefinitely on panic instead of rebooting (only if we are PID 1)
-        if sys.getpid() == Pid::from_raw(1) {
-            loop {
-                std::thread::sleep(Duration::from_secs(3600));
-            }
-        }
+        log_panic_info(info);
+        halt_on_panic(sys.as_ref());
     }));
 }
 
