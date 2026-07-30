@@ -623,6 +623,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kobject-uevent"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f0d6a1db283ff342c373c82788157bb28293bbb3f41ceee9fd2c4d3f0d7780"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.188"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1161,7 +1170,9 @@ dependencies = [
  "evdev",
  "futures-util",
  "ipnet",
+ "kobject-uevent",
  "libc",
+ "netlink-sys",
  "nix 0.31.3",
  "pnet",
  "rand",

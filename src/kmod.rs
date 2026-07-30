@@ -289,7 +289,6 @@ pub fn load_required_modules() {
     // - nft_chain_nat & nft_ct: Kernel netlink API does not trigger modprobe autoloading for NAT base
     //   chains or connection tracking state hooks. They must be loaded beforehand.
     let modules = [
-        "virtio_net",
         "virtio_pci",
         "virtio_mmio",
         "nft_chain_nat",
@@ -415,6 +414,48 @@ pub fn run_as_modprobe(args: Vec<String>) -> Result<(), std::io::Error> {
     println!("[modprobe] Request to load module: {}", raw_name);
     load_module_with_dependencies(&raw_name);
     Ok(())
+}
+
+pub fn start_uevent_listener() {
+    std::thread::spawn(move || {
+        if let Err(e) = run_uevent_listener() {
+            eprintln!("[uevent] Error in uevent listener: {}", e);
+        }
+    });
+}
+
+fn handle_uevent(uevent: kobject_uevent::UEvent) {
+    use kobject_uevent::ActionType;
+    if uevent.action == ActionType::Add
+        && let Some(modalias) = uevent.env.get("MODALIAS")
+    {
+        println!("[uevent] Discovered device with modalias: {}", modalias);
+        load_module_with_dependencies(modalias);
+    }
+}
+
+fn run_uevent_listener() -> Result<(), Box<dyn std::error::Error>> {
+    use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_KOBJECT_UEVENT};
+    use kobject_uevent::UEvent;
+
+    let mut socket = Socket::new(NETLINK_KOBJECT_UEVENT)?;
+    let addr = SocketAddr::new(0, 1); // Group 1 is the standard multicast group for uevents
+    socket.bind(&addr)?;
+
+    println!("[uevent] Netlink uevent listener started successfully.");
+
+    let mut buf = [0u8; 8192];
+    loop {
+        let mut slice = &mut buf[..];
+        let n = socket.recv(&mut slice, 0)?;
+        match UEvent::from_netlink_packet(&buf[..n]) {
+            Ok(uevent) => handle_uevent(uevent),
+            Err(e) => {
+                // Malformed or non-UTF8 packets can occasionally arrive; log a warning but keep running
+                eprintln!("[uevent] Warning: Failed to parse uevent packet: {}", e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

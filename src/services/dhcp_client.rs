@@ -548,25 +548,29 @@ async fn run_client_loop(
         wan_interface
     );
 
-    let mac = match get_interface_mac(&wan_interface).await {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!(
-                "[dhcp-client] ERROR: Failed to get MAC address for {}: {}",
-                wan_interface, e
-            );
-            return;
-        }
-    };
-    println!(
-        "[dhcp-client] Interface {} MAC address: {}",
-        wan_interface, mac
-    );
-
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
+
+        let mac = match get_interface_mac(&wan_interface).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "[dhcp-client] ERROR: Failed to get MAC address for {}: {}. Retrying in {}s...",
+                    wan_interface, e, SOCKET_RESTART_DELAY_SECS
+                );
+                tokio::select! {
+                    _ = wait_shutdown(&mut shutdown_rx) => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => {}
+                }
+                continue;
+            }
+        };
+        println!(
+            "[dhcp-client] Interface {} MAC address: {}",
+            wan_interface, mac
+        );
 
         let socket = match make_client_socket(&wan_interface) {
             Ok(s) => s,

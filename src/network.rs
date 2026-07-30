@@ -94,28 +94,65 @@ pub async fn resolve_and_rename_interfaces(
     wan_mac: &str,
     lan_mac: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (connection, handle, _) = rtnetlink::new_connection()?;
-    tokio::spawn(connection);
+    let target_wan_mac = MacAddr::from_str(wan_mac)
+        .map_err(|_| format!("Invalid WAN MAC address format: {}", wan_mac))?;
+    let target_lan_mac = MacAddr::from_str(lan_mac)
+        .map_err(|_| format!("Invalid LAN MAC address format: {}", lan_mac))?;
 
-    // 1. Gather all interfaces
-    use futures_util::TryStreamExt;
-    let mut links = handle.link().get().execute();
+    let wan_bytes = target_wan_mac.octets();
+    let lan_bytes = target_lan_mac.octets();
+
+    println!(
+        "[network] Waiting for interfaces to appear via MAC addresses (WAN: {}, LAN: {})...",
+        wan_mac, lan_mac
+    );
+
+    let start_time = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(10);
+
     let mut interfaces = Vec::new();
-    while let Some(link) = links.try_next().await? {
-        let index = link.header.index;
-        let mut name = None;
-        let mut mac = None;
-        for nla in link.attributes {
-            match nla {
-                rtnetlink::packet_route::link::LinkAttribute::IfName(n) => name = Some(n),
-                rtnetlink::packet_route::link::LinkAttribute::Address(addr) => mac = Some(addr),
-                _ => {}
+
+    loop {
+        let (connection, handle, _) = rtnetlink::new_connection()?;
+        tokio::spawn(connection);
+
+        use futures_util::TryStreamExt;
+        let mut links = handle.link().get().execute();
+        let mut found_wan = false;
+        let mut found_lan = false;
+        interfaces.clear();
+
+        while let Some(link) = links.try_next().await? {
+            let index = link.header.index;
+            let mut name = None;
+            let mut mac = None;
+            for nla in link.attributes {
+                match nla {
+                    rtnetlink::packet_route::link::LinkAttribute::IfName(n) => name = Some(n),
+                    rtnetlink::packet_route::link::LinkAttribute::Address(addr) => mac = Some(addr),
+                    _ => {}
+                }
+            }
+            if let (Some(n), Some(m)) = (name, mac) {
+                if m == wan_bytes[..] {
+                    found_wan = true;
+                }
+                if m == lan_bytes[..] {
+                    found_lan = true;
+                }
+                interfaces.push((index, n, m));
             }
         }
-        if let (Some(n), Some(m)) = (name, mac) {
-            interfaces.push((index, n, m));
+
+        if (found_wan && found_lan) || start_time.elapsed() >= timeout {
+            break;
         }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
 
     // 2. Resolve WAN
     {
@@ -261,3 +298,98 @@ pub async fn resolve_and_rename_interfaces(
 
     Ok(())
 }
+
+pub async fn ensure_interface_up_and_configured(
+    name: &str,
+    ip_cidr: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
+
+    use futures_util::TryStreamExt;
+    let mut links = handle.link().get().match_name(name.to_string()).execute();
+    let link = match links.try_next().await {
+        Ok(Some(l)) => l,
+        Ok(None) => return Ok(false), // Link does not exist yet (e.g. unplugged)
+        Err(e) => return Err(e.into()),
+    };
+    let index = link.header.index;
+
+    // Check if the link is UP and already has the correct IP address
+    let flags = link.header.flags;
+    let is_up = flags.contains(rtnetlink::packet_route::link::LinkFlags::Up);
+
+    let parts: Vec<&str> = ip_cidr.split('/').collect();
+    let ip_str = parts[0];
+    let expected_ip = std::net::IpAddr::from_str(ip_str)?;
+    let expected_prefix = if parts.len() > 1 { parts[1].parse::<u8>()? } else { 24 };
+
+    // Check if the address is already assigned
+    let mut already_configured = false;
+    let mut addrs = handle.address().get().execute();
+    while let Some(addr_msg) = addrs.try_next().await? {
+        if addr_msg.header.index == index {
+            for attr in addr_msg.attributes {
+                if let rtnetlink::packet_route::address::AddressAttribute::Local(ip) = attr
+                    && ip == expected_ip
+                    && addr_msg.header.prefix_len == expected_prefix
+                {
+                    already_configured = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if is_up && already_configured {
+        return Ok(true); // Already fully configured and UP
+    }
+
+    // Set link state to UP
+    let message = rtnetlink::LinkUnspec::new_with_index(index).up().build();
+    handle.link().change(message).execute().await?;
+
+    // Attempt to assign the address. If it's already assigned (EEXIST), ignore the error.
+    match handle.address().add(index, expected_ip, expected_prefix).execute().await {
+        Ok(_) => println!("[network] Successfully assigned {} to {}", ip_cidr, name),
+        Err(rtnetlink::Error::NetlinkError(msg)) if msg.code.map(|c| c.get()) == Some(-17) => {
+            // Address already exists (EEXIST), ignore silently
+        }
+        Err(e) => {
+            println!(
+                "[network] Address assignment message for {} ({}): {}",
+                name, ip_cidr, e
+            );
+        }
+    }
+
+    Ok(true)
+}
+
+pub async fn ensure_interface_up(
+    name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
+
+    use futures_util::TryStreamExt;
+    let mut links = handle.link().get().match_name(name.to_string()).execute();
+    let link = match links.try_next().await {
+        Ok(Some(l)) => l,
+        Ok(None) => return Ok(false), // Link does not exist yet (e.g. unplugged)
+        Err(e) => return Err(e.into()),
+    };
+    let index = link.header.index;
+    let flags = link.header.flags;
+    let is_up = flags.contains(rtnetlink::packet_route::link::LinkFlags::Up);
+
+    if is_up {
+        return Ok(true);
+    }
+
+    let message = rtnetlink::LinkUnspec::new_with_index(index).up().build();
+    handle.link().change(message).execute().await?;
+    println!("[network] Successfully set interface {} link state to UP", name);
+    Ok(true)
+}
+

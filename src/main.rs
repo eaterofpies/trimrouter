@@ -103,6 +103,9 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     // 1. Register Panic Hook (Emergency Reboot)
     register_panic_handler(sys.clone());
 
+    // Spawn netlink uevent listener to handle module autoloading for hardware discovery
+    kmod::start_uevent_listener();
+
     // 2. Mount Filesystems if running as PID 1
     if sys.getpid() == Pid::from_raw(1) {
         if let Err(e) = mount_virtual_filesystems(sys.as_ref()) {
@@ -146,6 +149,13 @@ async fn run_as_init(sys: Arc<RealSystem>) {
             );
         }
 
+        // Spawn background watchdog tasks to monitor and configure LAN/WAN interfaces if added/re-added (e.g. hotplug)
+        let lan_iface_monitor = network::LAN_INTERFACE.to_string();
+        let lan_ip_monitor = config.lan_ip.clone();
+        tokio::spawn(monitor_lan_watchdog(lan_iface_monitor, lan_ip_monitor));
+
+        let wan_iface_monitor = network::WAN_INTERFACE.to_string();
+        tokio::spawn(monitor_wan_watchdog(wan_iface_monitor));
         if let Err(e) =
             netfilter::configure_firewall(network::WAN_INTERFACE, network::LAN_INTERFACE)
         {
@@ -215,3 +225,18 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     let _ = dns_forwarder.stop().await;
     let _ = sntp_client.stop().await;
 }
+
+async fn monitor_lan_watchdog(iface: String, ip: String) {
+    loop {
+        let _ = network::ensure_interface_up_and_configured(&iface, &ip).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+async fn monitor_wan_watchdog(iface: String) {
+    loop {
+        let _ = network::ensure_interface_up(&iface).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
