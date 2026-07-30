@@ -1,6 +1,6 @@
 ---
 name: rust-guidelines
-description: Coding standards and guidelines for writing clean, flat, and idiomatic Rust code in this project, including package constants, no magic numbers, flat nesting, and small functions.
+description: Coding standards and guidelines for writing clean, flat, and idiomatic Rust code in this project, including package constants, no magic numbers, flat nesting, small functions, and aggressive code deduplication.
 ---
 
 # Rust Coding Guidelines Skill
@@ -20,6 +20,7 @@ This skill provides code style and design standards for writing and modifying Ru
 
 ## 4. Indentation & Indentation Layer Limits
 * **Strict nesting limit**: Indentation must be kept flat (ideally a maximum of 2 layers).
+* **Count closures and spawned tasks**: Spawned tasks (e.g., `tokio::spawn(async move { ... })`), async blocks, and closures count toward the visual indentation nesting limit. Do not nest loops, matching blocks, or complex logic directly inside inline closures; extract them into dedicated top-level functions or methods instead.
 * Eliminate arbitrary nested scope blocks.
 * Refactor deep matching blocks, socket read/write setups, and complex state changes by extracting them into dedicated, flat functions.
 
@@ -32,3 +33,8 @@ This skill provides code style and design standards for writing and modifying Ru
 * **Avoid unconditional `unwrap()` or `expect()` calls** in production code, as they trigger abrupt panics. Prefer bubbling up errors using `Result` or `Option` mapping.
 * **Wrap errors in custom error types** (e.g., custom error enums or `thiserror`-like types) where appropriate. This aids calling code with precise identification, categorization, and domain-specific error handling.
 * Critical initialization and configuration errors (such as network interface configuration, packet parsing, or file mounting failures) must cause program failure or transition to a safe panic recovery reboot state rather than continuing in an undefined/broken state.
+
+## 7. Aggressive Code Deduplication
+* **Aggressively deduplicate code**. Avoid copy-pasting helper functions, boilerplate code, or duplicate logic patterns across different modules.
+* Consolidate common behaviors (e.g., asynchronous task wait/shutdown logic, packet processing utility patterns, or socket configuration routines) into shared modules (such as `utils`) or common traits instead of repeating them.
+

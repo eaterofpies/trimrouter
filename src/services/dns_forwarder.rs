@@ -1,4 +1,4 @@
-use super::utils::WanLease;
+use super::utils::{WanLease, wait_shutdown};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -37,101 +37,202 @@ struct PendingQuery {
 type SharedCache = Arc<Mutex<HashMap<Vec<u8>, CacheEntry>>>;
 type PendingQueries = Arc<Mutex<HashMap<u16, PendingQuery>>>;
 
-pub async fn start_dns_forwarder(lease_state: Arc<Mutex<WanLease>>) {
-    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), DNS_PORT);
-    let socket = match tokio::net::UdpSocket::bind(addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "[dns-forwarder] Failed to bind to 0.0.0.0:{}: {}. Retrying in 5s...",
-                DNS_PORT, e
-            );
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            return;
+use super::{Service, ServiceError};
+
+pub struct DnsForwarder {
+    lease_state: Arc<Mutex<WanLease>>,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DnsForwarder {
+    pub fn new(lease_state: Arc<Mutex<WanLease>>) -> Self {
+        Self {
+            lease_state,
+            shutdown_tx: None,
+            task_handle: None,
         }
-    };
-    let socket = Arc::new(socket);
+    }
+}
+
+
+impl Service for DnsForwarder {
+    async fn start(&mut self) -> Result<(), ServiceError> {
+        if self.task_handle.is_some() {
+            return Err(ServiceError::AlreadyRunning);
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.shutdown_tx = Some(shutdown_tx);
+
+        let lease_state = self.lease_state.clone();
+
+        let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), DNS_PORT);
+        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        let socket = Arc::new(socket);
+
+        // Bind a single, long-lived client socket for all outgoing upstream DNS queries.
+        let upstream_socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        let upstream_socket = Arc::new(upstream_socket);
+
+        let handle = tokio::spawn(async move {
+            run_dns_forwarder(socket, upstream_socket, lease_state, shutdown_rx).await;
+        });
+
+        self.task_handle = Some(handle);
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<(), ServiceError> {
+        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
+        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
+
+        let _ = tx.send(true);
+        let _ = handle.await;
+        Ok(())
+    }
+}
+
+async fn run_dns_forwarder(
+    socket: Arc<tokio::net::UdpSocket>,
+    upstream_socket: Arc<tokio::net::UdpSocket>,
+    lease_state: Arc<Mutex<WanLease>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     println!("[dns-forwarder] Listening on 0.0.0.0:{}...", DNS_PORT);
 
     let cache: SharedCache = Arc::new(Mutex::new(HashMap::new()));
-
-    // Bind a single, long-lived client socket for all outgoing upstream DNS queries.
-    let upstream_socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!(
-                "[dns-forwarder] Failed to bind upstream socket: {}. Aborting.",
-                e
-            );
-            return;
-        }
-    };
-
     let pending_queries: PendingQueries = Arc::new(Mutex::new(HashMap::new()));
 
     // Spawn the background receiver task for upstream replies.
-    // This task reads continuously from the shared socket, parses the 16-bit
-    // DNS transaction ID (xid), and dispatches the response to the corresponding
-    // query task after verifying the sender's IP address.
-    let upstream_socket_recv = upstream_socket.clone();
-    let pending_queries_recv = pending_queries.clone();
-    tokio::spawn(async move {
-        let mut resp_buf = [0u8; RECV_BUF_SIZE];
-        loop {
-            let (len, from_addr) = match upstream_socket_recv.recv_from(&mut resp_buf).await {
-                Ok(res) => res,
-                Err(e) => {
-                    eprintln!("[dns-forwarder] Upstream socket read error: {}", e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-            if len < DNS_HEADER_SIZE {
-                continue;
-            }
-            let xid = u16::from_be_bytes([resp_buf[0], resp_buf[1]]);
-
-            let pending = {
-                let mut lock = pending_queries_recv.lock().unwrap();
-                lock.remove(&xid)
-            };
-
-            if let Some(p) = pending {
-                if from_addr.ip() == std::net::IpAddr::V4(p.upstream_ip) {
-                    let _ = p.tx.send(resp_buf[..len].to_vec());
-                } else {
-                    eprintln!(
-                        "[dns-forwarder] WARNING: Received DNS spoof attempt! IP {} mismatch for xid {}",
-                        from_addr.ip(),
-                        xid
-                    );
-                }
-            }
-        }
-    });
+    let upstream_task = tokio::spawn(run_upstream_receiver(
+        upstream_socket.clone(),
+        pending_queries.clone(),
+        shutdown_rx.clone(),
+    ));
 
     // Spawn periodic cleanup task to prune expired cache entries
-    let cache_cleanup = cache.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(CLEANUP_INTERVAL).await;
-            let mut lock = cache_cleanup.lock().unwrap();
-            let now = Instant::now();
-            lock.retain(|_, entry| entry.expiry > now);
-        }
-    });
+    let cleanup_task = tokio::spawn(run_cache_cleanup(cache.clone(), shutdown_rx.clone()));
 
-    let mut buf = [0u8; RECV_BUF_SIZE];
+    // Run the main query forwarder loop
+    run_query_loop(
+        socket,
+        upstream_socket,
+        cache,
+        pending_queries,
+        lease_state,
+        shutdown_rx,
+    )
+    .await;
 
+    // Await child tasks to exit
+    let _ = upstream_task.await;
+    let _ = cleanup_task.await;
+}
+
+async fn run_upstream_receiver(
+    upstream_socket: Arc<tokio::net::UdpSocket>,
+    pending_queries: PendingQueries,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut resp_buf = [0u8; RECV_BUF_SIZE];
     loop {
-        let (len, src) = match socket.recv_from(&mut buf).await {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let recv_fut = upstream_socket.recv_from(&mut resp_buf);
+        let res = tokio::select! {
+            _ = wait_shutdown(&mut shutdown_rx) => {
+                break;
+            }
+            r = recv_fut => r,
+        };
+
+        let (len, from_addr) = match res {
             Ok(res) => res,
             Err(e) => {
+                handle_upstream_error(e, &mut shutdown_rx).await;
+                continue;
+            }
+        };
+
+        if len < DNS_HEADER_SIZE {
+            continue;
+        }
+        let xid = u16::from_be_bytes([resp_buf[0], resp_buf[1]]);
+
+        let pending = {
+            let mut lock = pending_queries.lock().unwrap();
+            lock.remove(&xid)
+        };
+
+        if let Some(p) = pending {
+            if from_addr.ip() == std::net::IpAddr::V4(p.upstream_ip) {
+                let _ = p.tx.send(resp_buf[..len].to_vec());
+            } else {
                 eprintln!(
-                    "[dns-forwarder] Socket receive error: {}. Retrying in 1s...",
-                    e
+                    "[dns-forwarder] WARNING: Received DNS spoof attempt! IP {} mismatch for xid {}",
+                    from_addr.ip(),
+                    xid
                 );
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn handle_upstream_error(e: std::io::Error, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    eprintln!("[dns-forwarder] Upstream socket read error: {}", e);
+    tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {}
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+}
+
+async fn run_cache_cleanup(cache: SharedCache, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        tokio::select! {
+            _ = wait_shutdown(&mut shutdown_rx) => {
+                break;
+            }
+            _ = tokio::time::sleep(CLEANUP_INTERVAL) => {
+                let mut lock = cache.lock().unwrap();
+                let now = Instant::now();
+                lock.retain(|_, entry| entry.expiry > now);
+            }
+        }
+    }
+}
+
+async fn run_query_loop(
+    socket: Arc<tokio::net::UdpSocket>,
+    upstream_socket: Arc<tokio::net::UdpSocket>,
+    cache: SharedCache,
+    pending_queries: PendingQueries,
+    lease_state: Arc<Mutex<WanLease>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut buf = [0u8; RECV_BUF_SIZE];
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let recv_fut = socket.recv_from(&mut buf);
+        let res = tokio::select! {
+            _ = wait_shutdown(&mut shutdown_rx) => {
+                break;
+            }
+            r = recv_fut => r,
+        };
+
+        let (len, src) = match res {
+            Ok(res) => res,
+            Err(e) => {
+                handle_query_loop_error(e, &mut shutdown_rx).await;
                 continue;
             }
         };
@@ -157,6 +258,18 @@ pub async fn start_dns_forwarder(lease_state: Arc<Mutex<WanLease>>) {
         });
     }
 }
+
+async fn handle_query_loop_error(e: std::io::Error, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    eprintln!(
+        "[dns-forwarder] Socket receive error: {}. Retrying in 1s...",
+        e
+    );
+    tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {}
+        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+    }
+}
+
 
 async fn handle_dns_query(
     query: Vec<u8>,

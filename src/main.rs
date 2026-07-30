@@ -181,34 +181,37 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     // Shared state for the DHCP lease obtained on WAN
     let lease_state = Arc::new(std::sync::Mutex::new(services::WanLease::default()));
 
-    // Spawn DHCP WAN Client
-    let client_wan = network::WAN_INTERFACE.to_string();
-    let client_lease = lease_state.clone();
-    tokio::spawn(async move {
-        services::start_dhcp_client(client_wan, client_lease).await;
-    });
+    use services::Service;
 
-    // Spawn DHCP LAN Server
-    let server_lan = network::LAN_INTERFACE.to_string();
-    let server_lan_ip = config.lan_ip.clone();
-    tokio::spawn(async move {
-        services::start_dhcp_server(server_lan, server_lan_ip).await;
-    });
+    // Instantiate services
+    let mut dhcp_client = services::DhcpClient::new(network::WAN_INTERFACE.to_string(), lease_state.clone());
+    let mut dhcp_server = services::DhcpServer::new(network::LAN_INTERFACE.to_string(), config.lan_ip.clone());
+    let mut dns_forwarder = services::DnsForwarder::new(lease_state.clone());
+    let mut sntp_client = services::SntpClient::new(lease_state.clone());
 
-    // Spawn DNS Forwarder
-    let dns_lease = lease_state.clone();
-    tokio::spawn(async move {
-        services::start_dns_forwarder(dns_lease).await;
-    });
-
-    // Spawn SNTP Client
-    let sntp_lease = lease_state.clone();
-    tokio::spawn(async move {
-        services::start_sntp_client(sntp_lease).await;
-    });
+    // Start services using Service trait
+    if let Err(e) = dhcp_client.start().await {
+        eprintln!("[init] Failed to start WAN DHCP client: {}", e);
+    }
+    if let Err(e) = dhcp_server.start().await {
+        eprintln!("[init] Failed to start LAN DHCP server: {}", e);
+    }
+    if let Err(e) = dns_forwarder.start().await {
+        eprintln!("[init] Failed to start DNS forwarder: {}", e);
+    }
+    if let Err(e) = sntp_client.start().await {
+        eprintln!("[init] Failed to start SNTP client: {}", e);
+    }
 
     println!("[init] System startup completed successfully. Entering main event loop.");
 
     // Keep the main thread alive waiting for the signal handler to finish
     let _ = sig_handle.await;
+
+    // Perform clean shutdown of services on exit
+    println!("[init] Stopping services...");
+    let _ = dhcp_client.stop().await;
+    let _ = dhcp_server.stop().await;
+    let _ = dns_forwarder.stop().await;
+    let _ = sntp_client.stop().await;
 }

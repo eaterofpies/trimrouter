@@ -1,4 +1,4 @@
-use super::utils::{SharedWanLease, WanLease, get_interface_mac};
+use super::utils::{SharedWanLease, WanLease, get_interface_mac, wait_shutdown};
 use futures_util::TryStreamExt;
 use nix::sys::socket::{setsockopt, sockopt};
 use pnet::util::MacAddr;
@@ -73,15 +73,14 @@ enum ParseAckResult {
     Nak,
     None,
 }
-
-struct DhcpClient {
+struct DhcpClientInternal {
     socket: UdpSocket,
     mac: MacAddr,
     lease_state: SharedWanLease,
     wan_interface: String,
 }
 
-impl DhcpClient {
+impl DhcpClientInternal {
     fn new(
         socket: UdpSocket,
         mac: MacAddr,
@@ -96,47 +95,46 @@ impl DhcpClient {
         }
     }
 
-    async fn run(&self) {
+    async fn run(&self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
         loop {
-            // 1. Discovering Phase: Send DISCOVER, await OFFER
-            let (xid, offer) = match self.discover_phase().await {
-                Ok(res) => res,
-                Err(e) => {
-                    println!(
-                        "[dhcp-client] Discover phase failed: {}. Retrying in {}s...",
-                        e, SOCKET_RESTART_DELAY_SECS
-                    );
-                    self.deconfigure().await;
-                    tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS))
-                        .await;
-                    continue;
-                }
-            };
+            if *shutdown_rx.borrow() {
+                self.deconfigure().await;
+                break;
+            }
 
-            // 2. Requesting Phase: Send REQUEST, await ACK
-            let ack = match self.request_phase(xid, offer).await {
-                Ok(res) => res,
-                Err(e) => {
-                    println!(
-                        "[dhcp-client] Request phase failed: {}. Restarting negotiation in {}s...",
-                        e, SOCKET_RESTART_DELAY_SECS
-                    );
+            tokio::select! {
+                _ = wait_shutdown(&mut shutdown_rx) => {
                     self.deconfigure().await;
-                    tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS))
-                        .await;
-                    continue;
+                    break;
                 }
-            };
-
-            // 3. Bound Phase: Configure IP, wait, and periodically renew
-            if let Err(e) = self.bound_phase(ack).await {
-                println!(
-                    "[dhcp-client] Bound phase exited: {}. Restarting negotiation...",
-                    e
-                );
+                phase_res = self.execute_phases() => {
+                    if let Err(e) = phase_res {
+                        self.handle_phase_failure(e, &mut shutdown_rx).await;
+                    }
+                }
             }
         }
     }
+
+    async fn execute_phases(&self) -> Result<(), DhcpError> {
+        let (xid, offer) = self.discover_phase().await?;
+        let ack = self.request_phase(xid, offer).await?;
+        self.bound_phase(ack).await?;
+        Ok(())
+    }
+
+    async fn handle_phase_failure(&self, e: DhcpError, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+        println!(
+            "[dhcp-client] Phase failed: {}. Retrying in {}s...",
+            e, SOCKET_RESTART_DELAY_SECS
+        );
+        self.deconfigure().await;
+        tokio::select! {
+            _ = wait_shutdown(shutdown_rx) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => {}
+        }
+    }
+
 
     async fn discover_phase(&self) -> Result<(u32, DhcpOffer), DhcpError> {
         let xid = rand::random::<u32>();
@@ -491,7 +489,60 @@ impl DhcpClient {
 // =========================================================================
 // DHCP Client (WAN) - helper functions
 // =========================================================================
-pub async fn start_dhcp_client(wan_interface: String, lease_state: SharedWanLease) {
+use super::{Service, ServiceError};
+
+pub struct DhcpClient {
+    wan_interface: String,
+    lease_state: SharedWanLease,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DhcpClient {
+    pub fn new(wan_interface: String, lease_state: SharedWanLease) -> Self {
+        Self {
+            wan_interface,
+            lease_state,
+            shutdown_tx: None,
+            task_handle: None,
+        }
+    }
+}
+impl Service for DhcpClient {
+    async fn start(&mut self) -> Result<(), ServiceError> {
+        if self.task_handle.is_some() {
+            return Err(ServiceError::AlreadyRunning);
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.shutdown_tx = Some(shutdown_tx);
+
+        let wan_interface = self.wan_interface.clone();
+        let lease_state = self.lease_state.clone();
+
+        let handle = tokio::spawn(async move {
+            run_client_loop(wan_interface, lease_state, shutdown_rx).await;
+        });
+
+        self.task_handle = Some(handle);
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<(), ServiceError> {
+        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
+        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
+
+        let _ = tx.send(true);
+        let _ = handle.await;
+        Ok(())
+    }
+}
+
+async fn run_client_loop(
+    wan_interface: String,
+    lease_state: SharedWanLease,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     println!(
         "[dhcp-client] Starting WAN DHCP client on {}...",
         wan_interface
@@ -513,26 +564,54 @@ pub async fn start_dhcp_client(wan_interface: String, lease_state: SharedWanLeas
     );
 
     loop {
-        // Create standard UDP socket (completely standard socket, no raw socket at all!)
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
         let socket = match make_client_socket(&wan_interface) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!(
-                    "[dhcp-client] ERROR: Failed to create client socket: {}. Retrying in {}s...",
-                    e, SOCKET_RESTART_DELAY_SECS
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)).await;
+                handle_socket_creation_error(e, &mut shutdown_rx).await;
                 continue;
             }
         };
 
-        let client = DhcpClient::new(socket, mac, lease_state.clone(), wan_interface.clone());
-        client.run().await;
-        println!(
-            "[dhcp-client] Socket closed or client loop exited. Restarting in {}s...",
-            SOCKET_RESTART_DELAY_SECS
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)).await;
+        let client = DhcpClientInternal::new(socket, mac, lease_state.clone(), wan_interface.clone());
+        
+        let mut shutdown_rx_clone = shutdown_rx.clone();
+        let shutdown_rx_for_run = shutdown_rx.clone();
+        
+        tokio::select! {
+            _ = wait_shutdown(&mut shutdown_rx_clone) => {
+                client.deconfigure().await;
+                break;
+            }
+            _ = client.run(shutdown_rx_for_run) => {
+                handle_run_exit(&mut shutdown_rx).await;
+            }
+        }
+    }
+}
+
+async fn handle_socket_creation_error(e: std::io::Error, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    eprintln!(
+        "[dhcp-client] ERROR: Failed to create client socket: {}. Retrying in {}s...",
+        e, SOCKET_RESTART_DELAY_SECS
+    );
+    tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {}
+        _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => {}
+    }
+}
+
+async fn handle_run_exit(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    println!(
+        "[dhcp-client] Socket closed or client loop exited. Restarting in {}s...",
+        SOCKET_RESTART_DELAY_SECS
+    );
+    tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {}
+        _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => {}
     }
 }
 

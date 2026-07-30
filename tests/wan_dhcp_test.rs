@@ -191,36 +191,53 @@ async fn run_all_steps(env: &mut TestEnv, passed: &mut usize, failed: &mut usize
 #[tokio::main]
 async fn main() {
     std::println!("\nrunning 4 test steps");
-    let mut env = startup_stage().await;
 
-    let mut passed = 0;
-    let mut failed = 0;
+    // Global timeout of 180 seconds for the entire test run
+    let test_timeout = std::time::Duration::from_secs(180);
+    let result = tokio::time::timeout(test_timeout, async {
+        let mut env = startup_stage().await;
 
-    let start_time = std::time::Instant::now();
+        let mut passed = 0;
+        let mut failed = 0;
 
-    run_all_steps(&mut env, &mut passed, &mut failed).await;
+        let start_time = std::time::Instant::now();
 
-    // Tear down VM cleanly
-    std::println!("\n=== Cleaning up QEMU VM... ===");
-    // Sockets and QEMU processes are cleaned up automatically when env goes out of scope.
+        run_all_steps(&mut env, &mut passed, &mut failed).await;
+        (env, passed, failed, start_time)
+    }).await;
 
-    let elapsed = start_time.elapsed();
-    if failed > 0 {
-        std::println!(
-            "\ntest result: FAILED. {} passed; {} failed; finished in {:.2?}\n",
-            passed,
-            failed,
-            elapsed
-        );
-        std::process::exit(101);
-    } else {
-        std::println!(
-            "\ntest result: ok. {} passed; {} failed; finished in {:.2?}\n",
-            passed,
-            failed,
-            elapsed
-        );
-        std::process::exit(0);
+    match result {
+        Ok((_env, passed, failed, start_time)) => {
+            // Tear down VM cleanly
+            std::println!("\n=== Cleaning up QEMU VM... ===");
+            // Sockets and QEMU processes are cleaned up automatically when env goes out of scope.
+
+            let elapsed = start_time.elapsed();
+            if failed > 0 {
+                std::println!(
+                    "\ntest result: FAILED. {} passed; {} failed; finished in {:.2?}\n",
+                    passed,
+                    failed,
+                    elapsed
+                );
+                std::process::exit(101);
+            } else {
+                std::println!(
+                    "\ntest result: ok. {} passed; {} failed; finished in {:.2?}\n",
+                    passed,
+                    failed,
+                    elapsed
+                );
+                std::process::exit(0);
+            }
+        }
+        Err(_) => {
+            std::println!(
+                "\ntest result: FAILED (TIMEOUT - Integration test exceeded {}s limit)\n",
+                test_timeout.as_secs()
+            );
+            std::process::exit(102);
+        }
     }
 }
 

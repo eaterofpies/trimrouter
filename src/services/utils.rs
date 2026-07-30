@@ -277,3 +277,15 @@ pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, Stri
 
     resolved_ip.ok_or_else(|| format!("No A record resolved for {}", host))
 }
+
+pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+    }
+}
+

@@ -1,5 +1,6 @@
 use super::utils::{
     get_interface_mac, open_raw_socket, parse_dhcp_payload, read_raw_packet, send_raw_packet,
+    wait_shutdown,
 };
 use crate::packet::build_raw_packet;
 use pnet::packet::ethernet::EthernetPacket;
@@ -170,26 +171,82 @@ async fn setup_server_socket(
     Ok((mac, raw_fd, async_sock))
 }
 
-pub async fn start_dhcp_server(lan_interface: String, lan_ip: String) {
+use super::{Service, ServiceError};
+
+pub struct DhcpServer {
+    lan_interface: String,
+    lan_ip: String,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DhcpServer {
+    pub fn new(lan_interface: String, lan_ip: String) -> Self {
+        Self {
+            lan_interface,
+            lan_ip,
+            shutdown_tx: None,
+            task_handle: None,
+        }
+    }
+}
+
+impl Service for DhcpServer {
+    async fn start(&mut self) -> Result<(), ServiceError> {
+        if self.task_handle.is_some() {
+            return Err(ServiceError::AlreadyRunning);
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.shutdown_tx = Some(shutdown_tx);
+
+        let lan_interface = self.lan_interface.clone();
+        let lan_ip = self.lan_ip.clone();
+
+        // Parse LAN configuration IP net first to fail early
+        let net: ipnet::Ipv4Net = lan_ip.parse().map_err(|e| {
+            ServiceError::FailedToStart(format!("Invalid LAN IP configuration '{}': {}", lan_ip, e))
+        })?;
+
+        let server_ip = net.addr();
+        let subnet_mask = net.netmask();
+
+        let handle = tokio::spawn(async move {
+            run_dhcp_server(
+                lan_interface,
+                server_ip,
+                subnet_mask,
+                net,
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        self.task_handle = Some(handle);
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<(), ServiceError> {
+        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
+        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
+
+        let _ = tx.send(true);
+        let _ = handle.await;
+        Ok(())
+    }
+}
+
+async fn run_dhcp_server(
+    lan_interface: String,
+    server_ip: std::net::Ipv4Addr,
+    subnet_mask: std::net::Ipv4Addr,
+    net: ipnet::Ipv4Net,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     println!(
         "[dhcp-server] Starting LAN DHCP server on {}...",
         lan_interface
     );
-
-    // Invalid LAN config is a hard failure — do not silently fall back to a default.
-    let net: ipnet::Ipv4Net = match lan_ip.parse() {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!(
-                "[dhcp-server] ERROR: Invalid LAN IP configuration '{}': {}. Aborting.",
-                lan_ip, e
-            );
-            return;
-        }
-    };
-
-    let server_ip = net.addr();
-    let subnet_mask = net.netmask();
 
     let mut hosts = net.hosts();
     let start_ip = hosts.next();
@@ -203,14 +260,21 @@ pub async fn start_dhcp_server(lan_interface: String, lan_ip: String) {
     let mut leases = LeaseTable::new();
 
     loop {
-        let (mac, raw_fd, async_sock) = match setup_server_socket(&lan_interface).await {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let setup_res = tokio::select! {
+            _ = wait_shutdown(&mut shutdown_rx) => {
+                break;
+            }
+            res = setup_server_socket(&lan_interface) => res,
+        };
+
+        let (mac, raw_fd, async_sock) = match setup_res {
             Ok(res) => res,
             Err(e) => {
-                eprintln!(
-                    "[dhcp-server] ERROR: {}. Retrying in {}s...",
-                    e, SERVER_RESTART_DELAY_SECS
-                );
-                tokio::time::sleep(Duration::from_secs(SERVER_RESTART_DELAY_SECS)).await;
+                handle_setup_error(e, &mut shutdown_rx).await;
                 continue;
             }
         };
@@ -222,16 +286,41 @@ pub async fn start_dhcp_server(lan_interface: String, lan_ip: String) {
             net,
         };
 
-        run_server_loop(&async_sock, &config, &mut leases).await;
+        let loop_res = run_server_loop(&async_sock, &config, &mut leases, &mut shutdown_rx).await;
 
         unsafe {
             libc::close(raw_fd);
         }
-        println!(
-            "[dhcp-server] Socket closed. Restarting server loop in {}s...",
-            SERVER_RESTART_DELAY_SECS
-        );
-        tokio::time::sleep(Duration::from_secs(SERVER_RESTART_DELAY_SECS)).await;
+
+        if loop_res.is_err() {
+            if handle_loop_error(&mut shutdown_rx).await.is_err() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+async fn handle_setup_error(e: ServerError, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    eprintln!(
+        "[dhcp-server] ERROR: {}. Retrying in {}s...",
+        e, SERVER_RESTART_DELAY_SECS
+    );
+    tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => {}
+        _ = tokio::time::sleep(Duration::from_secs(SERVER_RESTART_DELAY_SECS)) => {}
+    }
+}
+
+async fn handle_loop_error(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) -> Result<(), ()> {
+    println!(
+        "[dhcp-server] Socket closed. Restarting server loop in {}s...",
+        SERVER_RESTART_DELAY_SECS
+    );
+    tokio::select! {
+        _ = wait_shutdown(shutdown_rx) => Err(()),
+        _ = tokio::time::sleep(Duration::from_secs(SERVER_RESTART_DELAY_SECS)) => Ok(()),
     }
 }
 
@@ -239,14 +328,27 @@ async fn run_server_loop(
     async_sock: &AsyncFd<RawFd>,
     config: &ServerConfig,
     leases: &mut LeaseTable,
-) {
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 2048];
     loop {
-        let bytes_read = match read_raw_packet(async_sock, &mut buf).await {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
+        let read_fut = read_raw_packet(async_sock, &mut buf);
+        let res = tokio::select! {
+            _ = wait_shutdown(shutdown_rx) => {
+                return Ok(());
+            }
+            r = read_fut => r,
+        };
+
+        let bytes_read = match res {
             Ok(n) => n,
             Err(e) => {
                 eprintln!("[dhcp-server] Socket read error: {}. Recreating socket.", e);
-                break;
+                return Err(e);
             }
         };
 
