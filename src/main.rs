@@ -26,7 +26,6 @@ mod signal;
 mod system;
 
 use config::RouterConfig;
-use nix::sys::reboot::RebootMode;
 use nix::unistd::Pid;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -110,9 +109,7 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     // 2. Mount Filesystems if running as PID 1
     if sys.getpid() == Pid::from_raw(1) {
         if let Err(e) = mount_virtual_filesystems(sys.as_ref()) {
-            eprintln!("[init] FATAL: {}", e);
-            let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
-            return;
+            panic!("FATAL: Failed to mount virtual filesystems: {}", e);
         }
         kmod::load_required_modules();
     } else {
@@ -124,6 +121,11 @@ async fn run_as_init(sys: Arc<RealSystem>) {
 
     // 3. Load Configuration
     let config = RouterConfig::parse(sys.as_ref());
+    let delay_val = match config.reboot_delay {
+        None => -1,
+        Some(d) => d as i32,
+    };
+    system::REBOOT_DELAY.store(delay_val, std::sync::atomic::Ordering::Relaxed);
     println!("[init] Configuration loaded: {:?}", config);
 
     // 4. Configure Network (Loopback only)
@@ -135,9 +137,7 @@ async fn run_as_init(sys: Arc<RealSystem>) {
         if let Err(e) =
             netfilter::configure_firewall(network::WAN_INTERFACE, network::LAN_INTERFACE)
         {
-            eprintln!("[init] FATAL: Failed to configure firewall: {}", e);
-            let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
-            return;
+            panic!("FATAL: Failed to configure firewall: {}", e);
         }
     }
 

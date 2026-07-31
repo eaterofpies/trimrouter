@@ -104,6 +104,11 @@ pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), String> {
     Ok(())
 }
 
+use std::sync::atomic::AtomicI32;
+
+// -1 = infinite (default), >=0 = delay in seconds
+pub static REBOOT_DELAY: AtomicI32 = AtomicI32::new(-1);
+
 fn log_panic_info(info: &std::panic::PanicHookInfo<'_>) {
     eprintln!("====================================================");
     eprintln!("CRITICAL: RUSTYROUTER PANICKED!");
@@ -118,15 +123,24 @@ fn log_panic_info(info: &std::panic::PanicHookInfo<'_>) {
         eprintln!("Location: {}:{}:{}", loc.file(), loc.line(), loc.column());
     }
     eprintln!("====================================================");
-    eprintln!("[init] System halted. Hanging indefinitely on panic...");
 }
 
 fn halt_on_panic<S: SystemOps>(sys: &S) {
     if sys.getpid() != Pid::from_raw(1) {
         return;
     }
-    loop {
-        std::thread::sleep(Duration::from_secs(3600));
+    let delay = REBOOT_DELAY.load(std::sync::atomic::Ordering::Relaxed);
+
+    if delay >= 0 {
+        eprintln!("[init] Rebooting in {} seconds...", delay);
+        std::thread::sleep(Duration::from_secs(delay as u64));
+        eprintln!("[init] Rebooting system now...");
+        let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
+    } else {
+        eprintln!("[init] System halted. Hanging indefinitely on panic...");
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
     }
 }
 
