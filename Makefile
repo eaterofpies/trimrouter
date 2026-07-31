@@ -47,11 +47,11 @@ target/$(RUST_TARGET_$(1))/release/rustyrouter: Cargo.toml Cargo.lock $(SRCS)
 	@RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld" cargo build --release --target $(RUST_TARGET_$(1))
 
 # Rule for downloading and extracting Debian cloud kernel for tests
-target/$(1)/test_boot/.kernel_extracted:
+target/$(1)/test_boot/.kernel_extracted: scripts/extract_kernel.sh
 	@./scripts/extract_kernel.sh $(1)
 
 # Rule for building the target initramfs cpio archive
-target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/rustyrouter target/$(1)/test_boot/.kernel_extracted
+target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/rustyrouter target/$(1)/test_boot/.kernel_extracted scripts/build_initramfs.sh
 	@./scripts/build_initramfs.sh $(1)
 endef
 

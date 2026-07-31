@@ -15,14 +15,14 @@ case "$ARCH" in
         RUST_TARGET="aarch64-unknown-linux-musl"
         DEB_ARCH="arm64"
         KERNEL_FILE="kernel8.img"
-        CONFIG_TXT="kernel=kernel8.img\narm_64bit=1\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=2"
+        CONFIG_TXT="kernel=kernel8.img\narm_64bit=1\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=0"
         DTBS="bcm2710-rpi-zero-2-w.dtb bcm2710-rpi-3-b-plus.dtb"
         ;;
     armhf)
         RUST_TARGET="arm-unknown-linux-musleabihf"
         DEB_ARCH="armhf"
         KERNEL_FILE="kernel.img"
-        CONFIG_TXT="kernel=kernel.img\narm_64bit=0\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=2"
+        CONFIG_TXT="kernel=kernel.img\narm_64bit=0\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=0"
         DTBS="bcm2708-rpi-zero-w.dtb"
         ;;
     *)
