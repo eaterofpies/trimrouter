@@ -59,7 +59,8 @@ if [ -n "$KVER" ]; then
     if [ -d "${TEST_BOOT}/lib/modules/${KVER}/kernel/drivers/net/usb" ]; then
         echo "[build] Staging all USB network drivers and their dependencies..."
         find "${TEST_BOOT}/lib/modules/${KVER}/kernel/drivers/net/usb" -name "*.ko" -o -name "*.ko.*" | while read -r ko; do
-            paths=$(modprobe -d "${CURDIR}/${TEST_BOOT}" -S "$KVER" --show-depends "$ko" 2>/dev/null | awk '/^insmod/ {print $2}')
+            mod_name=$(basename "$ko" | cut -d. -f1)
+            paths=$(modprobe -d "${CURDIR}/${TEST_BOOT}" -S "$KVER" --show-depends "$mod_name" 2>/dev/null | awk '/^insmod/ {print $2}')
             for path in ${paths}; do
                 rel_path=${path#"${CURDIR}/${TEST_BOOT}/lib/modules/${KVER}/"}
                 mkdir -p "${STAGING}/lib/modules/${KVER}/$(dirname "${rel_path}")"
@@ -71,6 +72,23 @@ if [ -n "$KVER" ]; then
     echo "[build] Staging modules.dep and modules.alias for guest loading..."
     cp "${TEST_BOOT}/lib/modules/${KVER}/modules.dep" "${STAGING}/lib/modules/${KVER}/" 2>/dev/null || true
     cp "${TEST_BOOT}/lib/modules/${KVER}/modules.alias" "${STAGING}/lib/modules/${KVER}/" 2>/dev/null || true
+
+    # Decompress staged modules on host
+    echo "[build] Decompressing staged kernel modules on host for ${KVER}..."
+    find "$STAGING/lib/modules/${KVER}" -type f \( -name "*.ko.xz" -o -name "*.ko.gz" -o -name "*.ko.zst" \) | while read -r comp_ko; do
+        if [[ "$comp_ko" == *.xz ]]; then
+            xz -d "$comp_ko" 2>/dev/null || true
+        elif [[ "$comp_ko" == *.gz ]]; then
+            gzip -d "$comp_ko" 2>/dev/null || true
+        elif [[ "$comp_ko" == *.zst ]]; then
+            zstd -d --rm "$comp_ko" 2>/dev/null || true
+        fi
+    done
+
+    # Strip decompression extensions from modules.dep
+    if [ -f "$STAGING/lib/modules/${KVER}/modules.dep" ]; then
+        sed -i 's/\.ko\.xz/.ko/g; s/\.ko\.gz/.ko/g; s/\.ko\.zst/.ko/g' "$STAGING/lib/modules/${KVER}/modules.dep"
+    fi
 fi
 
 mkdir -p "${STAGING}/sbin"

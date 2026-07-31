@@ -102,6 +102,41 @@ find "${RPI_DEB_DIR}/lib/modules" -mindepth 1 -maxdepth 1 -type d | while read -
         mkdir -p "$RPI_STAGING/lib/modules/${rel_name}/kernel/net/ipv6"
         cp -r "$mod_dir/kernel/net/ipv6"/* "$RPI_STAGING/lib/modules/${rel_name}/kernel/net/ipv6/" 2>/dev/null || true
     fi
+
+    # Stage USB network drivers and their dependencies
+    if [ -d "${RPI_DEB_DIR}/lib/modules/${rel_name}/kernel/drivers/net/usb" ]; then
+        echo "[build-rpi] Staging USB network drivers and dependencies for ${rel_name}..."
+        find "${RPI_DEB_DIR}/lib/modules/${rel_name}/kernel/drivers/net/usb" -name "*.ko" -o -name "*.ko.*" | while read -r ko; do
+            mod_name=$(basename "$ko" | cut -d. -f1)
+            paths=$(modprobe -d "${CURDIR}/${RPI_DEB_DIR}" -S "${rel_name}" --show-depends "$mod_name" 2>/dev/null | awk '/^insmod/ {print $2}')
+            for path in ${paths}; do
+                rel_path=${path#"${CURDIR}/${RPI_DEB_DIR}/lib/modules/${rel_name}/"}
+                mkdir -p "$RPI_STAGING/lib/modules/${rel_name}/$(dirname "${rel_path}")"
+                cp "$path" "$RPI_STAGING/lib/modules/${rel_name}/${rel_path}" 2>/dev/null || true
+            done
+        done
+    fi
+    
+    # Stage modules.dep and modules.alias
+    cp "${RPI_DEB_DIR}/lib/modules/${rel_name}/modules.dep" "$RPI_STAGING/lib/modules/${rel_name}/" 2>/dev/null || true
+    cp "${RPI_DEB_DIR}/lib/modules/${rel_name}/modules.alias" "$RPI_STAGING/lib/modules/${rel_name}/" 2>/dev/null || true
+
+    # Decompress staged modules on host
+    echo "[build-rpi] Decompressing staged kernel modules on host for ${rel_name}..."
+    find "$RPI_STAGING/lib/modules/${rel_name}" -type f \( -name "*.ko.xz" -o -name "*.ko.gz" -o -name "*.ko.zst" \) | while read -r comp_ko; do
+        if [[ "$comp_ko" == *.xz ]]; then
+            xz -d "$comp_ko" 2>/dev/null || true
+        elif [[ "$comp_ko" == *.gz ]]; then
+            gzip -d "$comp_ko" 2>/dev/null || true
+        elif [[ "$comp_ko" == *.zst ]]; then
+            zstd -d --rm "$comp_ko" 2>/dev/null || true
+        fi
+    done
+
+    # Strip decompression extensions from modules.dep
+    if [ -f "$RPI_STAGING/lib/modules/${rel_name}/modules.dep" ]; then
+        sed -i 's/\.ko\.xz/.ko/g; s/\.ko\.gz/.ko/g; s/\.ko\.zst/.ko/g' "$RPI_STAGING/lib/modules/${rel_name}/modules.dep"
+    fi
 done
 
 echo "[build-rpi] Packaging Pi initramfs into ${RPI_INITRAMFS}..."
