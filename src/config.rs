@@ -53,17 +53,21 @@ fn parse_cmdline<S: SystemOps>(sys: &S) -> (Option<String>, Option<String>, Opti
 impl RouterConfig {
     pub fn parse<S: SystemOps>(sys: &S) -> Self {
         let (lan_ip_env, wan_mac_env, lan_mac_env) = parse_env();
-        let (lan_ip_cmd, wan_mac_cmd, lan_mac_cmd) = if lan_ip_env.is_none() && wan_mac_env.is_none() && lan_mac_env.is_none() {
-            parse_cmdline(sys)
-        } else {
-            (None, None, None)
-        };
+        let (lan_ip_cmd, wan_mac_cmd, lan_mac_cmd) =
+            if lan_ip_env.is_none() && wan_mac_env.is_none() && lan_mac_env.is_none() {
+                parse_cmdline(sys)
+            } else {
+                (None, None, None)
+            };
 
-        let wan_mac = wan_mac_env.or(wan_mac_cmd)
+        let wan_mac = wan_mac_env
+            .or(wan_mac_cmd)
             .expect("rustyrouter.wan_mac configuration parameter is required");
-        let lan_mac = lan_mac_env.or(lan_mac_cmd)
+        let lan_mac = lan_mac_env
+            .or(lan_mac_cmd)
             .expect("rustyrouter.lan_mac configuration parameter is required");
-        let lan_ip = lan_ip_env.or(lan_ip_cmd)
+        let lan_ip = lan_ip_env
+            .or(lan_ip_cmd)
             .unwrap_or_else(|| "192.168.1.1/24".to_string());
 
         RouterConfig {

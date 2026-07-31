@@ -47,8 +47,12 @@ pub async fn get_interface_mac(ifname: &str) -> Result<pnet::util::MacAddr, Stri
         Err(e) => return Err(format!("Netlink request failed: {}", e)),
     };
 
-    find_mac_address_attribute(link.attributes)
-        .ok_or_else(|| format!("No hardware address attribute found for interface {}", ifname))
+    find_mac_address_attribute(link.attributes).ok_or_else(|| {
+        format!(
+            "No hardware address attribute found for interface {}",
+            ifname
+        )
+    })
 }
 
 pub fn open_raw_socket(ifname: &str) -> Result<RawFd, String> {
@@ -278,8 +282,7 @@ pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, Stri
         return Err("Transaction ID mismatch".to_string());
     }
 
-    find_first_a_record(packet.answers)
-        .ok_or_else(|| format!("No A record resolved for {}", host))
+    find_first_a_record(packet.answers).ok_or_else(|| format!("No A record resolved for {}", host))
 }
 
 pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
@@ -292,4 +295,3 @@ pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>)
         }
     }
 }
-

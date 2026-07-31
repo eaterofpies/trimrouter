@@ -212,14 +212,7 @@ impl Service for DhcpServer {
         let subnet_mask = net.netmask();
 
         let handle = tokio::spawn(async move {
-            run_dhcp_server(
-                lan_interface,
-                server_ip,
-                subnet_mask,
-                net,
-                shutdown_rx,
-            )
-            .await;
+            run_dhcp_server(lan_interface, server_ip, subnet_mask, net, shutdown_rx).await;
         });
 
         self.task_handle = Some(handle);
@@ -263,7 +256,16 @@ async fn run_dhcp_server(
         if *shutdown_rx.borrow() {
             break;
         }
-        if !run_server_iteration(&lan_interface, server_ip, subnet_mask, net, &mut leases, &mut shutdown_rx).await {
+        if !run_server_iteration(
+            &lan_interface,
+            server_ip,
+            subnet_mask,
+            net,
+            &mut leases,
+            &mut shutdown_rx,
+        )
+        .await
+        {
             break;
         }
     }

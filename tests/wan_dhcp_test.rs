@@ -204,7 +204,8 @@ async fn main() {
 
         run_all_steps(&mut env, &mut passed, &mut failed).await;
         (env, passed, failed, start_time)
-    }).await;
+    })
+    .await;
 
     match result {
         Ok((_env, passed, failed, start_time)) => {
@@ -415,7 +416,7 @@ async fn startup_stage() -> TestEnv {
     let lan_stream = lan_stream.expect("Failed to connect to QEMU LAN unix socket");
     let mut lan_client = UnixStreamMock::new(lan_stream);
 
-    // DHCP DISCOVER
+    // DHCP DISCOVER (with retries for carrier transition)
     let discover_payload = build_dhcp_discover_lan(0x5678, LAN_CLIENT_MAC);
     let discover_frame = packet::build_raw_packet(
         LAN_CLIENT_MAC,
@@ -426,18 +427,20 @@ async fn startup_stage() -> TestEnv {
         67,
         &discover_payload,
     );
-    lan_client
-        .send_frame(&discover_frame)
-        .await
-        .expect("Failed to send LAN DHCPDISCOVER");
 
-    // DHCPOFFER
-    let dhcp_offer = lan_client
-        .recv_dhcp_packet()
-        .await
-        .expect("Failed to receive DHCPOFFER");
-    assert_eq!(dhcp_offer.xid(), 0x5678);
-    let offered_ip = dhcp_offer.yiaddr();
+    let mut offered_ip = None;
+    let start_dhcp = std::time::Instant::now();
+    while start_dhcp.elapsed() < Duration::from_secs(10) {
+        let _ = lan_client.send_frame(&discover_frame).await;
+        if let Ok(Ok(dhcp_offer)) =
+            tokio::time::timeout(Duration::from_millis(500), lan_client.recv_dhcp_packet()).await
+            && dhcp_offer.xid() == 0x5678
+        {
+            offered_ip = Some(dhcp_offer.yiaddr());
+            break;
+        }
+    }
+    let offered_ip = offered_ip.expect("Failed to receive DHCPOFFER after retries");
     println!("[test-env] LAN Offered IP: {}", offered_ip);
 
     // DHCPREQUEST

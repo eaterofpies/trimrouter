@@ -27,7 +27,6 @@ impl SntpClient {
     }
 }
 
-
 impl Service for SntpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
         if self.task_handle.is_some() {
@@ -163,7 +162,9 @@ async fn sync_time() -> Result<chrono::DateTime<chrono::Utc>, String> {
         .map_err(|e| format!("Failed to convert NTP datetime: {}", e))?;
 
     let duration = chrono_dt.signed_duration_since(chrono::DateTime::UNIX_EPOCH);
-    let std_duration = duration.to_std().map_err(|e| format!("Invalid duration: {}", e))?;
+    let std_duration = duration
+        .to_std()
+        .map_err(|e| format!("Invalid duration: {}", e))?;
     let timespec = nix::sys::time::TimeSpec::from(std_duration);
     nix::time::clock_settime(nix::time::ClockId::CLOCK_REALTIME, timespec)
         .map_err(|e| format!("Failed to set system clock: {}", e))?;

@@ -15,6 +15,7 @@ macro_rules! eprintln {
 }
 
 mod config;
+mod interface;
 mod kmod;
 mod netfilter;
 mod network;
@@ -125,37 +126,12 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     let config = RouterConfig::parse(sys.as_ref());
     println!("[init] Configuration loaded: {:?}", config);
 
-    // 4. Configure Network Interfaces (lo, LAN, WAN)
+    // 4. Configure Network (Loopback only)
     if sys.getpid() == Pid::from_raw(1) {
-        let rename_res =
-            network::resolve_and_rename_interfaces(&config.wan_mac, &config.lan_mac).await;
-        if let Err(e) = rename_res {
-            eprintln!(
-                "[init] ERROR: Failed to rename interfaces based on MAC: {}",
-                e
-            );
+        if let Err(e) = network::configure_network_init().await {
+            eprintln!("[init] ERROR: Failed to initialize network: {}", e);
         }
 
-        if let Err(e) = network::configure_network(
-            network::WAN_INTERFACE,
-            network::LAN_INTERFACE,
-            &config.lan_ip,
-        )
-        .await
-        {
-            eprintln!(
-                "[init] ERROR: Failed to configure network interfaces: {}",
-                e
-            );
-        }
-
-        // Spawn background watchdog tasks to monitor and configure LAN/WAN interfaces if added/re-added (e.g. hotplug)
-        let lan_iface_monitor = network::LAN_INTERFACE.to_string();
-        let lan_ip_monitor = config.lan_ip.clone();
-        tokio::spawn(monitor_lan_watchdog(lan_iface_monitor, lan_ip_monitor));
-
-        let wan_iface_monitor = network::WAN_INTERFACE.to_string();
-        tokio::spawn(monitor_wan_watchdog(wan_iface_monitor));
         if let Err(e) =
             netfilter::configure_firewall(network::WAN_INTERFACE, network::LAN_INTERFACE)
         {
@@ -168,7 +144,7 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     // 5. Lifecycle coordination flag
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-    // 5. Spawn Core Tasks
+    // 6. Spawn Core Tasks
     let reaper_sys = sys.clone();
     let reaper_shutdown = shutdown_flag.clone();
     tokio::spawn(async move {
@@ -191,52 +167,28 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     // Shared state for the DHCP lease obtained on WAN
     let lease_state = Arc::new(std::sync::Mutex::new(services::WanLease::default()));
 
-    use services::Service;
+    // Create and monitor interfaces via the unified ManagedInterface structure
+    let wan_iface = interface::ManagedInterface::new(
+        network::WAN_INTERFACE.to_string(),
+        config.wan_mac.clone(),
+        None,
+        interface::InterfaceType::Wan,
+    );
 
-    // Instantiate services
-    let mut dhcp_client = services::DhcpClient::new(network::WAN_INTERFACE.to_string(), lease_state.clone());
-    let mut dhcp_server = services::DhcpServer::new(network::LAN_INTERFACE.to_string(), config.lan_ip.clone());
-    let mut dns_forwarder = services::DnsForwarder::new(lease_state.clone());
-    let mut sntp_client = services::SntpClient::new(lease_state.clone());
+    let lan_iface = interface::ManagedInterface::new(
+        network::LAN_INTERFACE.to_string(),
+        config.lan_mac.clone(),
+        Some(config.lan_ip.clone()),
+        interface::InterfaceType::Lan,
+    );
 
-    // Start services using Service trait
-    if let Err(e) = dhcp_client.start().await {
-        eprintln!("[init] Failed to start WAN DHCP client: {}", e);
-    }
-    if let Err(e) = dhcp_server.start().await {
-        eprintln!("[init] Failed to start LAN DHCP server: {}", e);
-    }
-    if let Err(e) = dns_forwarder.start().await {
-        eprintln!("[init] Failed to start DNS forwarder: {}", e);
-    }
-    if let Err(e) = sntp_client.start().await {
-        eprintln!("[init] Failed to start SNTP client: {}", e);
-    }
+    tokio::spawn(interface::monitor_interface(wan_iface, lease_state.clone()));
+    tokio::spawn(interface::monitor_interface(lan_iface, lease_state.clone()));
 
     println!("[init] System startup completed successfully. Entering main event loop.");
 
     // Keep the main thread alive waiting for the signal handler to finish
     let _ = sig_handle.await;
 
-    // Perform clean shutdown of services on exit
     println!("[init] Stopping services...");
-    let _ = dhcp_client.stop().await;
-    let _ = dhcp_server.stop().await;
-    let _ = dns_forwarder.stop().await;
-    let _ = sntp_client.stop().await;
 }
-
-async fn monitor_lan_watchdog(iface: String, ip: String) {
-    loop {
-        let _ = network::ensure_interface_up_and_configured(&iface, &ip).await;
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-}
-
-async fn monitor_wan_watchdog(iface: String) {
-    loop {
-        let _ = network::ensure_interface_up(&iface).await;
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-}
-

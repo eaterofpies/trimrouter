@@ -123,7 +123,11 @@ impl DhcpClientInternal {
         Ok(())
     }
 
-    async fn handle_phase_failure(&self, e: DhcpError, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    async fn handle_phase_failure(
+        &self,
+        e: DhcpError,
+        shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) {
         println!(
             "[dhcp-client] Phase failed: {}. Retrying in {}s...",
             e, SOCKET_RESTART_DELAY_SECS
@@ -134,7 +138,6 @@ impl DhcpClientInternal {
             _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => {}
         }
     }
-
 
     async fn discover_phase(&self) -> Result<(u32, DhcpOffer), DhcpError> {
         let xid = rand::random::<u32>();
@@ -186,7 +189,11 @@ impl DhcpClientInternal {
             .await;
             let timeout = get_jittered_duration(retry_delay_secs);
 
-            if let Some(result) = self.wait_for_ack(xid, timeout).await?.and_then(handle_ack_result) {
+            if let Some(result) = self
+                .wait_for_ack(xid, timeout)
+                .await?
+                .and_then(handle_ack_result)
+            {
                 return result;
             }
 
@@ -594,11 +601,12 @@ async fn run_client_loop(
             }
         };
 
-        let client = DhcpClientInternal::new(socket, mac, lease_state.clone(), wan_interface.clone());
-        
+        let client =
+            DhcpClientInternal::new(socket, mac, lease_state.clone(), wan_interface.clone());
+
         let mut shutdown_rx_clone = shutdown_rx.clone();
         let shutdown_rx_for_run = shutdown_rx.clone();
-        
+
         tokio::select! {
             _ = wait_shutdown(&mut shutdown_rx_clone) => {
                 client.deconfigure().await;
@@ -611,7 +619,10 @@ async fn run_client_loop(
     }
 }
 
-async fn handle_socket_creation_error(e: std::io::Error, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+async fn handle_socket_creation_error(
+    e: std::io::Error,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) {
     eprintln!(
         "[dhcp-client] ERROR: Failed to create client socket: {}. Retrying in {}s...",
         e, SOCKET_RESTART_DELAY_SECS

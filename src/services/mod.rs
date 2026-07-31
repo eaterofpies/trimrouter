@@ -41,4 +41,3 @@ pub trait Service: Send + Sync {
     async fn start(&mut self) -> Result<(), ServiceError>;
     async fn stop(&mut self) -> Result<(), ServiceError>;
 }
-

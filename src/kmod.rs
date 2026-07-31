@@ -288,12 +288,7 @@ pub fn load_required_modules() {
     //   where network configuration runs before the virtual interfaces have finished registering.
     // - nft_chain_nat & nft_ct: Kernel netlink API does not trigger modprobe autoloading for NAT base
     //   chains or connection tracking state hooks. They must be loaded beforehand.
-    let modules = [
-        "virtio_pci",
-        "virtio_mmio",
-        "nft_chain_nat",
-        "nft_ct",
-    ];
+    let modules = ["virtio_pci", "virtio_mmio", "nft_chain_nat", "nft_ct"];
 
     if kdir.is_empty() {
         for mod_name in &modules {
@@ -435,8 +430,8 @@ fn handle_uevent(uevent: kobject_uevent::UEvent) {
 }
 
 fn run_uevent_listener() -> Result<(), Box<dyn std::error::Error>> {
-    use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_KOBJECT_UEVENT};
     use kobject_uevent::UEvent;
+    use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_KOBJECT_UEVENT};
 
     let mut socket = Socket::new(NETLINK_KOBJECT_UEVENT)?;
     let addr = SocketAddr::new(0, 1); // Group 1 is the standard multicast group for uevents

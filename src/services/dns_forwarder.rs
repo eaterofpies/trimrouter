@@ -55,7 +55,6 @@ impl DnsForwarder {
     }
 }
 
-
 impl Service for DnsForwarder {
     async fn start(&mut self) -> Result<(), ServiceError> {
         if self.task_handle.is_some() {
@@ -191,7 +190,10 @@ async fn run_upstream_receiver(
     }
 }
 
-async fn handle_upstream_error(e: std::io::Error, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+async fn handle_upstream_error(
+    e: std::io::Error,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) {
     eprintln!("[dns-forwarder] Upstream socket read error: {}", e);
     tokio::select! {
         _ = wait_shutdown(shutdown_rx) => {}
@@ -199,7 +201,10 @@ async fn handle_upstream_error(e: std::io::Error, shutdown_rx: &mut tokio::sync:
     }
 }
 
-async fn run_cache_cleanup(cache: SharedCache, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+async fn run_cache_cleanup(
+    cache: SharedCache,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -285,14 +290,18 @@ async fn run_query_loop(
             &lease_state,
             &mut shutdown_rx,
             &mut buf,
-        ).await;
+        )
+        .await;
         if !proceed {
             break;
         }
     }
 }
 
-async fn handle_query_loop_error(e: std::io::Error, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+async fn handle_query_loop_error(
+    e: std::io::Error,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) {
     eprintln!(
         "[dns-forwarder] Socket receive error: {}. Retrying in 1s...",
         e
@@ -302,7 +311,6 @@ async fn handle_query_loop_error(e: std::io::Error, shutdown_rx: &mut tokio::syn
         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
     }
 }
-
 
 async fn handle_dns_query(
     query: Vec<u8>,
