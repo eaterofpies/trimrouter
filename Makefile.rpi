@@ -1,161 +1,44 @@
 # =========================================================================
-# Raspberry Pi Deployment Makefile (Parameterized by ARCH)
+# Raspberry Pi Specific Architecture Rules
 # =========================================================================
 
-.PHONY: image run-qemu clean-rpi
+# Raspberry Pi specific variables
+KERNEL_FILE_arm64  := kernel8.img
+KERNEL_FILE_armhf  := kernel.img
 
-# Default architecture: arm64 (Pi 3 / Zero 2 W). Can be overridden via ARCH=armhf
-ARCH ?= arm64
+DTBS_arm64         := bcm2710-rpi-zero-2-w.dtb bcm2710-rpi-3-b-plus.dtb
+DTBS_armhf         := bcm2708-rpi-zero-w.dtb
 
-ifeq ($(ARCH),arm64)
-    # 64-bit target configurations
-    RUST_TARGET := aarch64-unknown-linux-musl
-    DEB_ARCH := arm64
-    KERNEL_FILE := kernel8.img
-    CONFIG_TXT_LINES := kernel=kernel8.img\narm_64bit=1\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=2
-    DTBS := bcm2710-rpi-zero-2-w.dtb bcm2710-rpi-3-b-plus.dtb
-else ifeq ($(ARCH),armhf)
-    # 32-bit target configurations (Pi Zero W / Pi 1 / Pi 2)
-    RUST_TARGET := arm-unknown-linux-musleabihf
-    DEB_ARCH := armhf
-    KERNEL_FILE := kernel.img
-    CONFIG_TXT_LINES := kernel=kernel.img\narm_64bit=0\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=2
-    DTBS := bcm2708-rpi-zero-w.dtb
-else ifeq ($(ARCH),x86_64)
-    # x86_64 host dummy values for RPi targets
-    RUST_TARGET := x86_64-unknown-linux-musl
-    DEB_ARCH := amd64
-    KERNEL_FILE := vmlinuz
-    CONFIG_TXT_LINES := 
-    DTBS := 
-else
-    $(error Unsupported ARCH: $(ARCH). Must be x86_64, arm64, or armhf)
-endif
+# Convenience defaults for Pi
+image: image-arm64
+run-qemu: run-qemu-arm64
 
-# Target files
-RPI_BINARY := target/$(RUST_TARGET)/release/rustyrouter
-RPI_INITRAMFS := target/$(ARCH)/pi_initramfs.cpio.gz
-RPI_STAGING := target/$(ARCH)/pi_initramfs
-RPI_BOOT_DIR := $(CURDIR)/target/$(ARCH)/pi_boot
-RPI_DEB_DIR := $(CURDIR)/target/$(ARCH)/rpi_deb
-RPI_IMAGE := $(CURDIR)/target/rustyrouter.img
-APT_DIR := $(CURDIR)/target/$(ARCH)/apt
+# =========================================================================
+# Raspberry Pi Specific Architecture Rules Template
+# =========================================================================
+define RPI_ARCH_RULES
+# $(1): Architecture (arm64, armhf)
 
-# Default image target
-image: $(RPI_IMAGE)
+image-$(1): target/$(1)/rustyrouter.img
 
-# Securely download and extract verified Raspberry Pi kernels & boot firmware
-$(RPI_DEB_DIR)/.extracted_stamp:
-	@echo "[apt-rpi] Setting up sandboxed repository for $(ARCH)..."
-	@rm -rf $(RPI_DEB_DIR) $(APT_DIR)
-	@mkdir -p $(RPI_DEB_DIR)
-	@mkdir -p $(APT_DIR)/state/lists/partial $(APT_DIR)/cache/archives/partial $(APT_DIR)/etc/trusted.gpg.d
-	@touch $(APT_DIR)/state/status
-	@echo "deb [arch=$(DEB_ARCH) trusted=yes] http://archive.raspberrypi.org/debian/ bookworm main" > $(APT_DIR)/etc/sources.list
-	@echo "Updating sandboxed APT package index..."
-	@apt-get -o Dir::State=$(APT_DIR)/state \
-	         -o Dir::State::status=$(APT_DIR)/state/status \
-	         -o Dir::State::Lists=$(APT_DIR)/state/lists \
-	         -o Dir::Cache=$(APT_DIR)/cache \
-	         -o Dir::Cache::archives=$(APT_DIR)/cache/archives \
-	         -o Dir::Etc=$(APT_DIR)/etc \
-	         -o Dir::Etc::SourceList=$(APT_DIR)/etc/sources.list \
-	         -o Dir::Etc::TrustedParts=$(APT_DIR)/etc/trusted.gpg.d \
-	         update
-	@echo "Downloading latest $(ARCH) kernel & bootloader..."
-	@cd $(RPI_DEB_DIR) && apt-get -o Dir::State=$(APT_DIR)/state \
-	                           -o Dir::State::status=$(APT_DIR)/state/status \
-	                           -o Dir::State::Lists=$(APT_DIR)/state/lists \
-	                           -o Dir::Cache=$(APT_DIR)/cache \
-	                           -o Dir::Cache::archives=$(APT_DIR)/cache/archives \
-	                           -o Dir::Etc=$(APT_DIR)/etc \
-	                           -o Dir::Etc::SourceList=$(APT_DIR)/etc/sources.list \
-	                           -o Dir::Etc::TrustedParts=$(APT_DIR)/etc/trusted.gpg.d \
-	                           download raspberrypi-kernel raspberrypi-bootloader
-	@echo "Extracting packages..."
-	@cd $(RPI_DEB_DIR) && for f in raspberrypi-kernel_*.deb; do \
-		ar x "$$f" && (tar -xf data.tar.xz 2>/dev/null || tar -xf data.tar.zst 2>/dev/null || tar -xf data.tar.gz 2>/dev/null); \
-		rm -f debian-binary control.tar.* data.tar.*; \
-	done
-	@cd $(RPI_DEB_DIR) && for f in raspberrypi-bootloader_*.deb; do \
-		ar x "$$f" && (tar -xf data.tar.xz 2>/dev/null || tar -xf data.tar.zst 2>/dev/null || tar -xf data.tar.gz 2>/dev/null); \
-		rm -f debian-binary control.tar.* data.tar.*; \
-	done
-	@touch $@
+run-qemu-$(1): target/$(1)/rustyrouter.img
+	@echo "[qemu-rpi] Booting Raspberry Pi image ($(1)) under QEMU emulation..."
+	@qemu-system-aarch64 \
+	    -M raspi3b \
+	    -cpu cortex-a53 \
+	    -m 1024 \
+	    -kernel target/$(1)/pi_boot/$(KERNEL_FILE_$(1)) \
+	    -dtb target/$(1)/pi_boot/$(firstword $(DTBS_$(1))) \
+	    -initrd target/$(1)/pi_initramfs.cpio.gz \
+	    -drive file=target/$(1)/rustyrouter.img,if=sd,format=raw \
+	    -device usb-net,netdev=lan0,mac=52:54:00:12:34:57 \
+	    -netdev user,id=lan0 \
+	    -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0 dwc_otg.lpm_enable=0 dwc_otg.fiq_enable=0 dwc_otg.fiq_fsm_enable=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
+	    -nographic
 
-# Package the target-specific initramfs containing only the matching kernel modules
-$(RPI_INITRAMFS): $(RPI_BINARY) $(RPI_DEB_DIR)/.extracted_stamp
-	@echo "[build-rpi] Creating Pi initramfs staging area..."
-	@rm -rf $(RPI_STAGING)
-	@mkdir -p $(RPI_STAGING)/proc $(RPI_STAGING)/sys $(RPI_STAGING)/dev $(RPI_STAGING)/run $(RPI_STAGING)/etc $(RPI_STAGING)/bin
-	@cp $(RPI_BINARY) $(RPI_STAGING)/init
-	@chmod +x $(RPI_STAGING)/init
-	@mknod -m 600 $(RPI_STAGING)/dev/console c 5 1 2>/dev/null || true
-	@mknod -m 666 $(RPI_STAGING)/dev/null c 1 3 2>/dev/null || true
-	@echo "[build-rpi] Staging netfilter modules for $(ARCH) kernel release..."
-	@mkdir -p $(RPI_STAGING)/lib/modules
-	@for mod_dir in $(RPI_DEB_DIR)/lib/modules/*; do \
-		if [ -d "$$mod_dir" ]; then \
-			rel_name=$$(basename "$$mod_dir"); \
-			mkdir -p $(RPI_STAGING)/lib/modules/$$rel_name/kernel/net/netfilter; \
-			if [ -d "$$mod_dir/kernel/net/netfilter" ]; then \
-				cp -r "$$mod_dir/kernel/net/netfilter"/* $(RPI_STAGING)/lib/modules/$$rel_name/kernel/net/netfilter/ 2>/dev/null || true; \
-			fi; \
-			if [ -d "$$mod_dir/kernel/net/ipv4" ]; then \
-				mkdir -p $(RPI_STAGING)/lib/modules/$$rel_name/kernel/net/ipv4; \
-				cp -r "$$mod_dir/kernel/net/ipv4"/* $(RPI_STAGING)/lib/modules/$$rel_name/kernel/net/ipv4/ 2>/dev/null || true; \
-			fi; \
-			if [ -d "$$mod_dir/kernel/net/ipv6" ]; then \
-				mkdir -p $(RPI_STAGING)/lib/modules/$$rel_name/kernel/net/ipv6; \
-				cp -r "$$mod_dir/kernel/net/ipv6"/* $(RPI_STAGING)/lib/modules/$$rel_name/kernel/net/ipv6/ 2>/dev/null || true; \
-			fi; \
-		fi; \
-	done
-	@echo "[build-rpi] Packaging Pi initramfs into $(RPI_INITRAMFS)..."
-	@mkdir -p target/$(ARCH)
-	@(cd $(RPI_STAGING) && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > ../pi_initramfs.cpio.gz)
+target/$(1)/rustyrouter.img: target/$(RUST_TARGET_$(1))/release/rustyrouter
+	@./scripts/build_rpi_image.sh $(1)
+endef
 
-# Compile, format, and build the final bootable SD Card raw image
-$(RPI_IMAGE): $(RPI_INITRAMFS) $(RPI_DEB_DIR)/.extracted_stamp
-	@echo "[build-rpi] Staging boot partition directory..."
-	@rm -rf $(RPI_BOOT_DIR)
-	@mkdir -p $(RPI_BOOT_DIR)
-	@cp $(RPI_INITRAMFS) $(RPI_BOOT_DIR)/
-	@cp $(RPI_DEB_DIR)/boot/bootcode.bin $(RPI_BOOT_DIR)/
-	@cp $(RPI_DEB_DIR)/boot/fixup.dat $(RPI_BOOT_DIR)/
-	@cp $(RPI_DEB_DIR)/boot/start.elf $(RPI_BOOT_DIR)/
-	@cp $(RPI_DEB_DIR)/boot/$(KERNEL_FILE) $(RPI_BOOT_DIR)/
-	@for dtb in $(DTBS); do \
-		cp $(RPI_DEB_DIR)/boot/$$dtb $(RPI_BOOT_DIR)/; \
-	done
-	@cp -r $(RPI_DEB_DIR)/boot/overlays $(RPI_BOOT_DIR)/
-	@echo "Staging configuration boot scripts..."
-	@echo -e "$(CONFIG_TXT_LINES)" > $(RPI_BOOT_DIR)/config.txt
-	@echo "console=serial0,115200 console=tty1 root=/dev/ram0 rdinit=/init quiet panic=-1 net.ifnames=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=00:11:22:33:44:55 rustyrouter.lan_mac=66:77:88:99:aa:bb" > $(RPI_BOOT_DIR)/cmdline.txt
-	@echo "[build-rpi] Allocating blank raw disk block file $(RPI_IMAGE)..."
-	@dd if=/dev/zero of=$(RPI_IMAGE) bs=1M count=128 2>/dev/null
-	@parted -s $(RPI_IMAGE) mklabel msdos mkpart primary fat32 1MiB 100%
-	@echo "[build-rpi] Formatting FAT32 partition in raw disk image..."
-	@mformat -i "$(RPI_IMAGE)@@1M" -F
-	@echo "[build-rpi] Writing boot sector payload files..."
-	@mcopy -i "$(RPI_IMAGE)@@1M" $(RPI_BOOT_DIR)/bootcode.bin ::/
-	@mcopy -i "$(RPI_IMAGE)@@1M" $(RPI_BOOT_DIR)/start.elf ::/
-	@mcopy -i "$(RPI_IMAGE)@@1M" $(RPI_BOOT_DIR)/fixup.dat ::/
-	@mcopy -i "$(RPI_IMAGE)@@1M" $(RPI_BOOT_DIR)/$(KERNEL_FILE) ::/
-	@mcopy -i "$(RPI_IMAGE)@@1M" $(RPI_BOOT_DIR)/pi_initramfs.cpio.gz ::/
-	@mcopy -i "$(RPI_IMAGE)@@1M" $(RPI_BOOT_DIR)/config.txt ::/
-	@mcopy -i "$(RPI_IMAGE)@@1M" $(RPI_BOOT_DIR)/cmdline.txt ::/
-	@mcopy -i "$(RPI_IMAGE)@@1M" $(RPI_BOOT_DIR)/*.dtb ::/
-	@mcopy -s -i "$(RPI_IMAGE)@@1M" $(RPI_BOOT_DIR)/overlays ::/
-	@echo "========================================================="
-	@echo "SUCCESSFULLY CREATED $(ARCH) IMAGE: $(RPI_IMAGE)"
-	@echo "========================================================="
-
-# Run interactive QEMU simulation (native guest target)
-run-qemu:
-	@echo "[qemu-rpi] Booting Raspberry Pi image under QEMU emulation..."
-	@./run_qemu.sh
-
-clean-rpi:
-	@echo "[clean-rpi] Cleaning Raspberry Pi target directories..."
-	@rm -rf target/$(ARCH)/pi_staging target/$(ARCH)/pi_initramfs target/$(ARCH)/pi_boot target/$(ARCH)/rpi_deb target/$(ARCH)/apt $(RPI_IMAGE)
+# Instantiate templates for Raspberry Pi
+$(foreach arch,arm64 armhf,$(eval $(call RPI_ARCH_RULES,$(arch))))
