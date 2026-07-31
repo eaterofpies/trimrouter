@@ -81,7 +81,6 @@ Using a routing Netlink socket (the standard `rtnetlink` interface), `rustyroute
 4. **Dynamic WAN Routing & Lease Expiry (via DHCP)**:
    - **Lease Obtained**: When the WAN DHCP client obtains a lease:
      - Assigns the leased IP address to the WAN interface (e.g., `10.0.2.15/24`).
-     - **Subnet Collision Avoidance**: Compares the leased WAN IP network with the default LAN subnet configuration. If the WAN IP belongs to the LAN network (default `192.168.1.0/24`), `rustyrouter` reconfigures the LAN interface address to `192.168.0.1/24` (subnet `192.168.0.0/24`). If the WAN IP belongs to `192.168.0.0/24`, the LAN interface address shifts to `192.168.1.1/24`. If there is no conflict, it uses the configured default LAN IP (`192.168.1.1/24` or the value from cmdline).
      - Adds a default gateway route (`0.0.0.0/0` via the DHCP-provided gateway IP) on the WAN interface.
      - Automatically updates or replaces the default gateway route if the WAN lease changes.
    - **Lease Lost / Expired**: If the WAN DHCP client loses its lease or it expires:

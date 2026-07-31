@@ -65,6 +65,13 @@ pub enum InterfaceType {
     Lan,
 }
 
+pub enum RouterService {
+    DhcpClient(services::DhcpClient),
+    DhcpServer(services::DhcpServer),
+    DnsForwarder(services::DnsForwarder),
+    SntpClient(services::SntpClient),
+}
+
 pub struct ManagedInterface {
     /// The target system name (e.g. "wan", "lan")
     pub name: String,
@@ -74,8 +81,8 @@ pub struct ManagedInterface {
     pub ip_config: Option<String>,
     /// The classification of this interface
     pub service_type: InterfaceType,
-    /// Active running service containers
-    pub active_services: Vec<Box<dyn Service>>,
+    /// Active running service containers managed via concrete enum variant wrappers
+    pub active_services: Vec<RouterService>,
 }
 ```
 
@@ -115,10 +122,16 @@ Each interface task transitions through the following state machine:
             +-----------+------------+                       |
                         | (Services started)                 |
                         v                                    |
-            +------------------------+                       |
+            +------------------------+
             |         ACTIVE         | ----------------------+
             +------------------------+
 ```
+
+> [!NOTE]
+> In the implementation, these states are represented implicitly rather than via an explicit Rust state `enum`:
+> * **`ABSENT`**: Indicated by `active_index` being `None` and `active_services` being empty.
+> * **`ACTIVE`**: Indicated by `active_index` being `Some(index)` and `active_services` containing the active, running service wrappers.
+> * **`PRESENT` / `CONFIGURED`**: Transient states handled sequentially inside the linear asynchronous execution of the `activate_interface` helper function.
 
 ### Action Table
 
