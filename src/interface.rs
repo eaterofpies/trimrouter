@@ -29,8 +29,6 @@ pub enum RouterService {
     DhcpClient(services::DhcpClient),
     /// LAN DHCP Server service.
     DhcpServer(services::DhcpServer),
-    /// DNS caching forwarder service.
-    DnsForwarder(services::DnsForwarder),
     /// SNTP Client time synchronization service.
     SntpClient(services::SntpClient),
 }
@@ -41,7 +39,6 @@ impl RouterService {
         match self {
             RouterService::DhcpClient(s) => s.start().await,
             RouterService::DhcpServer(s) => s.start().await,
-            RouterService::DnsForwarder(s) => s.start().await,
             RouterService::SntpClient(s) => s.start().await,
         }
     }
@@ -51,7 +48,6 @@ impl RouterService {
         match self {
             RouterService::DhcpClient(s) => s.stop().await,
             RouterService::DhcpServer(s) => s.stop().await,
-            RouterService::DnsForwarder(s) => s.stop().await,
             RouterService::SntpClient(s) => s.stop().await,
         }
     }
@@ -104,9 +100,7 @@ impl ManagedInterface {
             InterfaceType::Lan => {
                 let ip_str = self.ip_config.as_deref().unwrap_or("192.168.1.1/24");
                 let server = services::DhcpServer::new(self.name.clone(), ip_str.to_string());
-                let dns = services::DnsForwarder::new(lease_state.clone());
                 services.push(RouterService::DhcpServer(server));
-                services.push(RouterService::DnsForwarder(dns));
             }
         }
         self.active_services = services;

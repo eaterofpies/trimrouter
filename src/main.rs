@@ -167,6 +167,13 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     // Shared state for the DHCP lease obtained on WAN
     let lease_state = Arc::new(std::sync::Mutex::new(services::WanLease::default()));
 
+    // Start DNS Forwarder as a global service
+    use services::Service;
+    let mut dns_forwarder = services::DnsForwarder::new(lease_state.clone());
+    if let Err(e) = dns_forwarder.start().await {
+        eprintln!("[init] ERROR: Failed to start DNS forwarder: {}", e);
+    }
+
     // Create and monitor interfaces via the unified ManagedInterface structure
     let wan_iface = interface::ManagedInterface::new(
         network::WAN_INTERFACE.to_string(),
@@ -191,4 +198,5 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     let _ = sig_handle.await;
 
     println!("[init] Stopping services...");
+    let _ = dns_forwarder.stop().await;
 }
