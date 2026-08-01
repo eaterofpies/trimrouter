@@ -1,6 +1,9 @@
+use pnet::util::MacAddr;
+use rtnetlink::packet_route::link::LinkAttribute;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
+use crate::error::RouterError;
 
 // =========================================================================
 // Shared WAN Lease Info
@@ -18,23 +21,27 @@ pub type SharedWanLease = Arc<Mutex<WanLease>>;
 // =========================================================================
 // Helper Functions for Raw Sockets
 // =========================================================================
-fn find_mac_address_attribute(
-    attributes: Vec<rtnetlink::packet_route::link::LinkAttribute>,
-) -> Option<pnet::util::MacAddr> {
-    for attr in attributes {
-        if let rtnetlink::packet_route::link::LinkAttribute::Address(mac_vec) = attr {
-            if mac_vec.len() != 6 {
-                continue;
-            }
-            return Some(pnet::util::MacAddr(
-                mac_vec[0], mac_vec[1], mac_vec[2], mac_vec[3], mac_vec[4], mac_vec[5],
-            ));
-        }
+pub fn mac_from_slice(slice: &[u8]) -> Result<MacAddr, RouterError> {
+    if slice.len() == 6 {
+        Ok(MacAddr(
+            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5],
+        ))
+    } else {
+        Err(RouterError::Generic(format!(
+            "Invalid MAC address length: expected 6, found {}",
+            slice.len()
+        )))
     }
-    None
 }
 
-pub async fn get_interface_mac(ifname: &str) -> Result<pnet::util::MacAddr, String> {
+fn find_mac_address_attribute(attributes: Vec<LinkAttribute>) -> Option<MacAddr> {
+    attributes.into_iter().find_map(|attr| match attr {
+        LinkAttribute::Address(mac_vec) => mac_from_slice(&mac_vec).ok(),
+        _ => None,
+    })
+}
+
+pub async fn get_interface_mac(ifname: &str) -> Result<MacAddr, String> {
     let (connection, handle, _) = rtnetlink::new_connection()
         .map_err(|e| format!("Failed to open netlink connection: {}", e))?;
     tokio::spawn(connection);

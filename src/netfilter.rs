@@ -1,3 +1,4 @@
+use crate::error::RouterError;
 use rustables::expr::{
     Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Immediate, Masquerade, Meta,
     MetaType, VerdictKind,
@@ -5,7 +6,6 @@ use rustables::expr::{
 use rustables::{
     Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, ProtocolFamily, Rule, Table,
 };
-use crate::error::RouterError;
 
 fn pad_interface_name(name: &str) -> [u8; 16] {
     let mut bytes = [0u8; 16];
@@ -15,10 +15,7 @@ fn pad_interface_name(name: &str) -> [u8; 16] {
     bytes
 }
 
-pub fn configure_firewall(
-    wan_iface: &str,
-    lan_iface: &str,
-) -> Result<(), RouterError> {
+pub fn configure_firewall(wan_iface: &str, lan_iface: &str) -> Result<(), RouterError> {
     println!("[netfilter] Configuring NAT and firewall rules...");
 
     let table = Table::new(ProtocolFamily::Ipv4).with_name("rustyrouter");

@@ -4,13 +4,14 @@
 //! handles interface renaming based on MAC address mapping to avoid conflicts, configures IP addresses,
 //! and orchestrates starting/stopping dependent network services when links appear or disappear.
 
+use crate::error::RouterError;
 use crate::network;
 use crate::services::utils::SharedWanLease;
 use crate::services::{self, Service};
-use crate::error::RouterError;
 use futures_util::{StreamExt, TryStreamExt};
 use pnet::util::MacAddr;
 use rtnetlink::MulticastGroup;
+use rtnetlink::packet_route::link::LinkAttribute;
 
 /// Classification of interface roles in the router system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,8 +129,6 @@ impl ManagedInterface {
     }
 }
 
-const MAC_ADDR_LEN: usize = 6;
-
 /// Subscribes to Netlink link multicast groups and monitors the lifecycle of all managed interfaces.
 ///
 /// Deduplicates dynamic hardware detection logs, handles interface renaming on match,
@@ -171,9 +170,15 @@ pub async fn monitor_interfaces(
     }
 
     while let Some((message, _addr)) = messages.next().await {
-        let payload = message.payload;
-        if let rtnetlink::packet_core::NetlinkPayload::InnerMessage(rtnl_msg) = payload {
-            if let Err(e) = process_netlink_message(rtnl_msg, &mut interfaces, &lease_state, &mut detected_indices).await {
+        if let rtnetlink::packet_core::NetlinkPayload::InnerMessage(rtnl_msg) = message.payload {
+            let res = process_netlink_message(
+                rtnl_msg,
+                &mut interfaces,
+                &lease_state,
+                &mut detected_indices,
+            )
+            .await;
+            if let Err(e) = res {
                 panic!(
                     "CRITICAL: Interface monitoring or configuration failure: {}",
                     e
@@ -184,20 +189,14 @@ pub async fn monitor_interfaces(
 }
 
 /// Helper function to parse link attributes from a LinkMessage.
-fn parse_link_attributes(
-    attributes: Vec<rtnetlink::packet_route::link::LinkAttribute>,
-) -> (Option<String>, Option<pnet::util::MacAddr>) {
+fn parse_link_attributes(attributes: Vec<LinkAttribute>) -> (Option<String>, Option<MacAddr>) {
     let mut name = None;
     let mut address = None;
     for nla in attributes {
         match nla {
-            rtnetlink::packet_route::link::LinkAttribute::IfName(n) => name = Some(n),
-            rtnetlink::packet_route::link::LinkAttribute::Address(addr) => {
-                if addr.len() == MAC_ADDR_LEN {
-                    address = Some(pnet::util::MacAddr(
-                        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
-                    ));
-                }
+            LinkAttribute::IfName(n) => name = Some(n),
+            LinkAttribute::Address(addr) => {
+                address = services::utils::mac_from_slice(&addr).ok();
             }
             _ => {}
         }
@@ -206,7 +205,7 @@ fn parse_link_attributes(
 }
 
 /// Formats and logs the newly detected network device's MAC address.
-fn log_detected_device(name: &str, mac: pnet::util::MacAddr) {
+fn log_detected_device(name: &str, mac: MacAddr) {
     println!(
         "[interface] Detected network device: {} (MAC: {})",
         name, mac
@@ -241,7 +240,7 @@ async fn handle_new_link_event(
 ) -> Result<(), RouterError> {
     let index = link_msg.header.index;
     let (name, address) = parse_link_attributes(link_msg.attributes);
-    
+
     let (Some(n), Some(addr)) = (name, address) else {
         return Ok(());
     };
@@ -292,7 +291,7 @@ async fn handle_new_link(
     lease_state: &SharedWanLease,
     index: u32,
     name: &str,
-    mac: pnet::util::MacAddr,
+    mac: MacAddr,
 ) -> Result<(), RouterError> {
     if mac == iface.mac {
         if iface.active_index.is_none() {
@@ -410,10 +409,7 @@ async fn find_interface_by_name(name: &str) -> Option<u32> {
 }
 
 /// Modifies the administrative state and changes the name of an interface by its index.
-async fn rename_interface_by_index(
-    index: u32,
-    new_name: &str,
-) -> Result<(), RouterError> {
+async fn rename_interface_by_index(index: u32, new_name: &str) -> Result<(), RouterError> {
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 

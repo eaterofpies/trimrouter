@@ -11,6 +11,9 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::time::sleep;
 
+#[path = "../src/error.rs"]
+mod error;
+
 #[path = "../src/packet.rs"]
 mod packet;
 

@@ -6,7 +6,6 @@ pub enum RouterError {
     Io(std::io::Error),
     AddrParse(std::net::AddrParseError),
     InterfaceNotFound(String),
-    Collision(String),
     ParseInt(std::num::ParseIntError),
     Generic(String),
 }
@@ -18,7 +17,6 @@ impl fmt::Display for RouterError {
             Self::Io(e) => write!(f, "I/O error: {}", e),
             Self::AddrParse(e) => write!(f, "Address parsing failed: {}", e),
             Self::InterfaceNotFound(name) => write!(f, "Interface not found: {}", name),
-            Self::Collision(msg) => write!(f, "Interface name collision: {}", msg),
             Self::ParseInt(e) => write!(f, "Parse int error: {}", e),
             Self::Generic(msg) => write!(f, "Router error: {}", msg),
         }
