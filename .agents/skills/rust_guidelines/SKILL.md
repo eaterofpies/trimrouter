@@ -38,3 +38,7 @@ This skill provides code style and design standards for writing and modifying Ru
 * **Aggressively deduplicate code**. Avoid copy-pasting helper functions, boilerplate code, or duplicate logic patterns across different modules.
 * Consolidate common behaviors (e.g., asynchronous task wait/shutdown logic, packet processing utility patterns, or socket configuration routines) into shared modules (such as `utils`) or common traits instead of repeating them.
 
+## 8. Strong Typing at Boundaries (Early Symbolic Conversion)
+* Parse and convert raw, weakly typed inputs (such as byte slices `&[u8]`, raw binary buffers, or strings) into strongly typed, domain-specific Rust structures (e.g., `pnet::util::MacAddr`, `std::net::Ipv4Addr`, or custom domain enums/structs) as early as possible (e.g., at network, parsing, or file boundaries).
+* Avoid passing raw collections (like `&[u8]`, `Vec<u8>`, or generic `String`) down into core processing logic. Strongly typed symbolic boundaries prevent type-safety bypasses, eliminate redundant parser/formatter loops, and make calling interfaces self-documenting.
+
