@@ -428,25 +428,7 @@ pub fn start_uevent_listener() {
 fn handle_uevent(uevent: kobject_uevent::UEvent) {
     use kobject_uevent::ActionType;
 
-    // 1. Handle network device hotplug
-    if uevent.action == ActionType::Add
-        && let Some(subsystem) = uevent.env.get("SUBSYSTEM")
-        && subsystem == "net"
-        && let Some(ifname) = uevent.env.get("INTERFACE")
-    {
-        let sys_path = format!("/sys/class/net/{}/address", ifname);
-        // Wait briefly (up to 50ms) to ensure sysfs entry is fully populated
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let mac_addr = fs::read_to_string(&sys_path)
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-        println!(
-            "[uevent] Hotplugged network device detected: {} (MAC: {})",
-            ifname, mac_addr
-        );
-    }
-
-    // 2. Handle kernel module autoloading
+    // Handle kernel module autoloading
     if uevent.action == ActionType::Add
         && let Some(modalias) = uevent.env.get("MODALIAS")
     {

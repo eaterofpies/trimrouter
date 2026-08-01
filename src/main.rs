@@ -189,8 +189,7 @@ async fn run_as_init(sys: Arc<RealSystem>) {
         interface::InterfaceType::Lan,
     );
 
-    tokio::spawn(interface::monitor_interface(wan_iface, lease_state.clone()));
-    tokio::spawn(interface::monitor_interface(lan_iface, lease_state.clone()));
+    tokio::spawn(interface::monitor_interfaces(vec![wan_iface, lan_iface], lease_state.clone()));
 
     println!("[init] System startup completed successfully. Entering main event loop.");
 

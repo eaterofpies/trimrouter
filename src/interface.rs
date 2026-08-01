@@ -127,11 +127,16 @@ impl ManagedInterface {
     }
 }
 
-/// Subscribes to Netlink link multicast groups and monitors the lifecycle of the interface.
+const MAC_ADDR_LEN: usize = 6;
+
+/// Subscribes to Netlink link multicast groups and monitors the lifecycle of all managed interfaces.
 ///
-/// If the interface already exists at boot, it is detected and initialized.
-/// If it appears or changes state dynamically, it is configured reactively.
-pub async fn monitor_interface(mut iface: ManagedInterface, lease_state: SharedWanLease) {
+/// Deduplicates dynamic hardware detection logs, handles interface renaming on match,
+/// and manages dynamic service transitions.
+pub async fn monitor_interfaces(
+    mut interfaces: Vec<ManagedInterface>,
+    lease_state: SharedWanLease,
+) {
     let (connection, _handle, mut messages) =
         match rtnetlink::new_multicast_connection(&[MulticastGroup::Link]) {
             Ok(res) => res,
@@ -145,28 +150,112 @@ pub async fn monitor_interface(mut iface: ManagedInterface, lease_state: SharedW
         };
     tokio::spawn(connection);
 
-    // Initial check (catch up on startup)
-    if let Some((index, name)) = find_interface_by_mac(&iface.mac).await {
-        println!(
-            "[interface] Interface {} (MAC: {}) detected at startup. Renaming and starting services...",
-            iface.name, iface.mac
-        );
-        activate_interface(&mut iface, index, &name, &lease_state).await;
+    // Local set tracking discovered interfaces to deduplicate logs (no static globals needed)
+    let mut detected_indices = std::collections::HashSet::new();
+
+    // Initial check (catch up on startup for all interfaces)
+    for iface in &mut interfaces {
+        if let Some((index, name)) = find_interface_by_mac(&iface.mac).await {
+            println!(
+                "[interface] Interface {} (MAC: {}) detected at startup. Renaming and starting services...",
+                iface.name, iface.mac
+            );
+            detected_indices.insert(index);
+            activate_interface(iface, index, &name, &lease_state).await;
+        }
     }
 
     while let Some((message, _addr)) = messages.next().await {
         let payload = message.payload;
         if let rtnetlink::packet_core::NetlinkPayload::InnerMessage(rtnl_msg) = payload {
-            match rtnl_msg {
-                rtnetlink::packet_route::RouteNetlinkMessage::NewLink(link_msg) => {
-                    handle_new_link(&mut iface, &lease_state, link_msg).await;
-                }
-                rtnetlink::packet_route::RouteNetlinkMessage::DelLink(link_msg) => {
-                    handle_del_link(&mut iface, link_msg).await;
-                }
-                _ => {}
-            }
+            process_netlink_message(rtnl_msg, &mut interfaces, &lease_state, &mut detected_indices).await;
         }
+    }
+}
+
+/// Helper function to parse link attributes from a LinkMessage.
+fn parse_link_attributes(
+    attributes: Vec<rtnetlink::packet_route::link::LinkAttribute>,
+) -> (Option<String>, Option<pnet::util::MacAddr>) {
+    let mut name = None;
+    let mut address = None;
+    for nla in attributes {
+        match nla {
+            rtnetlink::packet_route::link::LinkAttribute::IfName(n) => name = Some(n),
+            rtnetlink::packet_route::link::LinkAttribute::Address(addr) => {
+                if addr.len() == MAC_ADDR_LEN {
+                    address = Some(pnet::util::MacAddr(
+                        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    (name, address)
+}
+
+/// Formats and logs the newly detected network device's MAC address.
+fn log_detected_device(name: &str, mac: pnet::util::MacAddr) {
+    println!(
+        "[interface] Detected network device: {} (MAC: {})",
+        name, mac
+    );
+}
+
+/// Helper function to route incoming Netlink route messages to their handlers.
+async fn process_netlink_message(
+    rtnl_msg: rtnetlink::packet_route::RouteNetlinkMessage,
+    interfaces: &mut [ManagedInterface],
+    lease_state: &SharedWanLease,
+    detected_indices: &mut std::collections::HashSet<u32>,
+) {
+    match rtnl_msg {
+        rtnetlink::packet_route::RouteNetlinkMessage::NewLink(link_msg) => {
+            handle_new_link_event(link_msg, interfaces, lease_state, detected_indices).await;
+        }
+        rtnetlink::packet_route::RouteNetlinkMessage::DelLink(link_msg) => {
+            handle_del_link_event(link_msg, interfaces, detected_indices).await;
+        }
+        _ => {}
+    }
+}
+
+/// Handles incoming NewLink netlink events by parsing attributes and routing to managed interfaces.
+async fn handle_new_link_event(
+    link_msg: rtnetlink::packet_route::link::LinkMessage,
+    interfaces: &mut [ManagedInterface],
+    lease_state: &SharedWanLease,
+    detected_indices: &mut std::collections::HashSet<u32>,
+) {
+    let index = link_msg.header.index;
+    let (name, address) = parse_link_attributes(link_msg.attributes);
+    
+    let (Some(n), Some(addr)) = (name, address) else {
+        return;
+    };
+
+    // 1. Dedup and log detection of any new physical/USB interface
+    if n != "lo" && detected_indices.insert(index) {
+        log_detected_device(&n, addr);
+    }
+
+    // 2. Route hotplug matching to the respective managed interface
+    for iface in interfaces {
+        handle_new_link(iface, lease_state, index, &n, addr).await;
+    }
+}
+
+/// Handles incoming DelLink netlink events by removing from detected index and stopping active services.
+async fn handle_del_link_event(
+    link_msg: rtnetlink::packet_route::link::LinkMessage,
+    interfaces: &mut [ManagedInterface],
+    detected_indices: &mut std::collections::HashSet<u32>,
+) {
+    let index = link_msg.header.index;
+    detected_indices.remove(&index);
+    for iface in interfaces {
+        handle_del_link(iface, index).await;
     }
 }
 
@@ -188,59 +277,42 @@ async fn activate_interface(
     }
 }
 
-/// Handles incoming `RTM_NEWLINK` events from the kernel multicast stream.
-///
-/// Reacts to interface appearance/hotplugging, name collisions, and acts as a watchdog.
+/// Handles interface appearance/hotplugging, name collisions, and acts as a watchdog.
 async fn handle_new_link(
     iface: &mut ManagedInterface,
     lease_state: &SharedWanLease,
-    link_msg: rtnetlink::packet_route::link::LinkMessage,
+    index: u32,
+    name: &str,
+    mac: pnet::util::MacAddr,
 ) {
-    let index = link_msg.header.index;
-    let mut name = None;
-    let mut address = None;
-    for nla in link_msg.attributes {
-        match nla {
-            rtnetlink::packet_route::link::LinkAttribute::IfName(n) => name = Some(n),
-            rtnetlink::packet_route::link::LinkAttribute::Address(addr) => address = Some(addr),
-            _ => {}
-        }
-    }
-
-    if let (Some(n), Some(addr)) = (name, address) {
-        let Ok(target_mac) = pnet::util::MacAddr::from_str(&iface.mac) else {
-            return;
-        };
-        if addr == target_mac.octets()[..] {
-            if iface.active_index.is_none() {
-                println!(
-                    "[interface] Interface {} (MAC: {}) appeared. Renaming and starting services...",
-                    iface.name, iface.mac
-                );
-                activate_interface(iface, index, &n, lease_state).await;
-            } else if iface.active_index == Some(index) {
-                // Watchdog: keep configured
-                configure_interface(iface).await;
-            }
-        } else if n == iface.name {
-            // Collision: another interface has our target name but different MAC.
-            // Rename it out of the way.
-            let temp_name = format!("{}_old_{}", iface.name, index);
+    let Ok(target_mac) = pnet::util::MacAddr::from_str(&iface.mac) else {
+        return;
+    };
+    if mac == target_mac {
+        if iface.active_index.is_none() {
             println!(
-                "[interface] Interface name collision: renaming existing interface {} (index {}) to {} to free up the name",
-                iface.name, index, temp_name
+                "[interface] Interface {} (MAC: {}) appeared. Renaming and starting services...",
+                iface.name, iface.mac
             );
-            let _ = rename_interface_by_index(index, &temp_name).await;
+            activate_interface(iface, index, name, lease_state).await;
+        } else if iface.active_index == Some(index) {
+            // Watchdog: keep configured
+            configure_interface(iface).await;
         }
+    } else if name == iface.name {
+        // Collision: another interface has our target name but different MAC.
+        // Rename it out of the way.
+        let temp_name = format!("{}_old_{}", iface.name, index);
+        println!(
+            "[interface] Interface name collision: renaming existing interface {} (index {}) to {} to free up the name",
+            iface.name, index, temp_name
+        );
+        let _ = rename_interface_by_index(index, &temp_name).await;
     }
 }
 
-/// Handles `RTM_DELLINK` events to clean up services when the interface disappears.
-async fn handle_del_link(
-    iface: &mut ManagedInterface,
-    link_msg: rtnetlink::packet_route::link::LinkMessage,
-) {
-    let index = link_msg.header.index;
+/// Handles dynamic cleanup of services when an active interface disappears.
+async fn handle_del_link(iface: &mut ManagedInterface, index: u32) {
     if iface.active_index == Some(index) {
         println!(
             "[interface] Interface {} (MAC: {}) disappeared. Stopping and deleting services...",
