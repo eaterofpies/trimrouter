@@ -1,6 +1,6 @@
 # trimrouter
 
-`trimrouter` is a lightweight, self-contained NATting router written in Rust, designed to run as the initialization process (PID 1) in a minimalist Linux container or virtual machine. 
+`trimrouter` is a lightweight, self-contained NATting router written in Rust, designed to run as the initialization process (PID 1) in a minimalist Linux virtual machine or bare-metal environment. 
 
 It manages virtual filesystems, signal forwarding, orphan reaping, and launches an asynchronous network controller managing routing, firewall, and local network services without requiring any userspace helper utilities (such as `ip`, `iptables`, or `dnsmasq`).
 
