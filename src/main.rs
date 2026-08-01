@@ -15,6 +15,7 @@ macro_rules! eprintln {
 }
 
 mod config;
+mod error;
 mod interface;
 mod kmod;
 mod netfilter;
@@ -120,7 +121,12 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     }
 
     // 3. Load Configuration
-    let config = RouterConfig::parse(sys.as_ref());
+    let config = match RouterConfig::parse(sys.as_ref()) {
+        Ok(c) => c,
+        Err(e) => {
+            panic!("FATAL: Failed to parse configuration: {}", e);
+        }
+    };
     let delay_val = match config.reboot_delay {
         None => -1,
         Some(d) => d as i32,
@@ -131,7 +137,7 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     // 4. Configure Network (Loopback only)
     if sys.getpid() == Pid::from_raw(1) {
         if let Err(e) = network::configure_network_init().await {
-            eprintln!("[init] ERROR: Failed to initialize network: {}", e);
+            panic!("FATAL: Failed to initialize network: {}", e);
         }
 
         if let Err(e) =

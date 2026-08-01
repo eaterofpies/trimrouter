@@ -1,3 +1,4 @@
+use crate::error::RouterError;
 use rtnetlink::Handle;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -5,7 +6,7 @@ use std::str::FromStr;
 pub const WAN_INTERFACE: &str = "wan";
 pub const LAN_INTERFACE: &str = "lan";
 
-pub async fn configure_network_init() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn configure_network_init() -> Result<(), RouterError> {
     // 1. Enable IPv4 Packet Forwarding
     println!("[network] Enabling IPv4 forwarding...");
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
@@ -27,13 +28,13 @@ async fn configure_interface(
     handle: &Handle,
     name: &str,
     ip_cidr: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), RouterError> {
     // Get link index by name
     use futures_util::TryStreamExt;
     let mut links = handle.link().get().match_name(name.to_string()).execute();
     let link = match links.try_next().await {
         Ok(Some(l)) => l,
-        Ok(None) => return Err(format!("Interface {} not found", name).into()),
+        Ok(None) => return Err(RouterError::InterfaceNotFound(name.to_string())),
         Err(e) => return Err(e.into()),
     };
     let index = link.header.index;
@@ -74,7 +75,7 @@ async fn configure_interface(
 pub async fn ensure_interface_up_and_configured(
     name: &str,
     ip_cidr: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, RouterError> {
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 
@@ -147,7 +148,7 @@ pub async fn ensure_interface_up_and_configured(
     Ok(true)
 }
 
-pub async fn ensure_interface_up(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+pub async fn ensure_interface_up(name: &str) -> Result<bool, RouterError> {
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 

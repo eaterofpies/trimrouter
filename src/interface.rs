@@ -7,9 +7,10 @@
 use crate::network;
 use crate::services::utils::SharedWanLease;
 use crate::services::{self, Service};
+use crate::error::RouterError;
 use futures_util::{StreamExt, TryStreamExt};
+use pnet::util::MacAddr;
 use rtnetlink::MulticastGroup;
-use std::str::FromStr;
 
 /// Classification of interface roles in the router system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +59,7 @@ pub struct ManagedInterface {
     /// The target name of the interface (e.g., "wan", "lan").
     pub name: String,
     /// The target MAC address mapping to detect and identify the hardware interface.
-    pub mac: String,
+    pub mac: MacAddr,
     /// Optional IP configuration CIDR (e.g. "192.168.1.1/24") for static assignment.
     pub ip_config: Option<String>,
     /// The type / role of this interface.
@@ -73,7 +74,7 @@ impl ManagedInterface {
     /// Creates a new managed interface description.
     pub fn new(
         name: String,
-        mac: String,
+        mac: MacAddr,
         ip_config: Option<String>,
         service_type: InterfaceType,
     ) -> Self {
@@ -141,11 +142,10 @@ pub async fn monitor_interfaces(
         match rtnetlink::new_multicast_connection(&[MulticastGroup::Link]) {
             Ok(res) => res,
             Err(e) => {
-                eprintln!(
+                panic!(
                     "[interface] Failed to create Netlink multicast socket: {}",
                     e
                 );
-                return;
             }
         };
     tokio::spawn(connection);
@@ -155,20 +155,30 @@ pub async fn monitor_interfaces(
 
     // Initial check (catch up on startup for all interfaces)
     for iface in &mut interfaces {
-        if let Some((index, name)) = find_interface_by_mac(&iface.mac).await {
+        if let Some((index, name)) = find_interface_by_mac(iface.mac).await {
             println!(
                 "[interface] Interface {} (MAC: {}) detected at startup. Renaming and starting services...",
                 iface.name, iface.mac
             );
             detected_indices.insert(index);
-            activate_interface(iface, index, &name, &lease_state).await;
+            if let Err(e) = activate_interface(iface, index, &name, &lease_state).await {
+                panic!(
+                    "CRITICAL: Failed to activate interface {} on startup: {}",
+                    iface.name, e
+                );
+            }
         }
     }
 
     while let Some((message, _addr)) = messages.next().await {
         let payload = message.payload;
         if let rtnetlink::packet_core::NetlinkPayload::InnerMessage(rtnl_msg) = payload {
-            process_netlink_message(rtnl_msg, &mut interfaces, &lease_state, &mut detected_indices).await;
+            if let Err(e) = process_netlink_message(rtnl_msg, &mut interfaces, &lease_state, &mut detected_indices).await {
+                panic!(
+                    "CRITICAL: Interface monitoring or configuration failure: {}",
+                    e
+                );
+            }
         }
     }
 }
@@ -209,16 +219,17 @@ async fn process_netlink_message(
     interfaces: &mut [ManagedInterface],
     lease_state: &SharedWanLease,
     detected_indices: &mut std::collections::HashSet<u32>,
-) {
+) -> Result<(), RouterError> {
     match rtnl_msg {
         rtnetlink::packet_route::RouteNetlinkMessage::NewLink(link_msg) => {
-            handle_new_link_event(link_msg, interfaces, lease_state, detected_indices).await;
+            handle_new_link_event(link_msg, interfaces, lease_state, detected_indices).await?;
         }
         rtnetlink::packet_route::RouteNetlinkMessage::DelLink(link_msg) => {
             handle_del_link_event(link_msg, interfaces, detected_indices).await;
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Handles incoming NewLink netlink events by parsing attributes and routing to managed interfaces.
@@ -227,12 +238,12 @@ async fn handle_new_link_event(
     interfaces: &mut [ManagedInterface],
     lease_state: &SharedWanLease,
     detected_indices: &mut std::collections::HashSet<u32>,
-) {
+) -> Result<(), RouterError> {
     let index = link_msg.header.index;
     let (name, address) = parse_link_attributes(link_msg.attributes);
     
     let (Some(n), Some(addr)) = (name, address) else {
-        return;
+        return Ok(());
     };
 
     // 1. Dedup and log detection of any new physical/USB interface
@@ -242,8 +253,9 @@ async fn handle_new_link_event(
 
     // 2. Route hotplug matching to the respective managed interface
     for iface in interfaces {
-        handle_new_link(iface, lease_state, index, &n, addr).await;
+        handle_new_link(iface, lease_state, index, &n, addr).await?;
     }
+    Ok(())
 }
 
 /// Handles incoming DelLink netlink events by removing from detected index and stopping active services.
@@ -265,16 +277,13 @@ async fn activate_interface(
     index: u32,
     current_name: &str,
     lease_state: &SharedWanLease,
-) {
-    if rename_and_up_interface(&iface.name, &iface.mac, index, current_name)
-        .await
-        .is_ok()
-    {
-        configure_interface(iface).await;
-        iface.instantiate_services(lease_state.clone());
-        iface.start_services().await;
-        iface.active_index = Some(index);
-    }
+) -> Result<(), RouterError> {
+    rename_and_up_interface(&iface.name, iface.mac, index, current_name).await?;
+    configure_interface(iface).await?;
+    iface.instantiate_services(lease_state.clone());
+    iface.start_services().await;
+    iface.active_index = Some(index);
+    Ok(())
 }
 
 /// Handles interface appearance/hotplugging, name collisions, and acts as a watchdog.
@@ -284,20 +293,17 @@ async fn handle_new_link(
     index: u32,
     name: &str,
     mac: pnet::util::MacAddr,
-) {
-    let Ok(target_mac) = pnet::util::MacAddr::from_str(&iface.mac) else {
-        return;
-    };
-    if mac == target_mac {
+) -> Result<(), RouterError> {
+    if mac == iface.mac {
         if iface.active_index.is_none() {
             println!(
                 "[interface] Interface {} (MAC: {}) appeared. Renaming and starting services...",
                 iface.name, iface.mac
             );
-            activate_interface(iface, index, name, lease_state).await;
+            activate_interface(iface, index, name, lease_state).await?;
         } else if iface.active_index == Some(index) {
             // Watchdog: keep configured
-            configure_interface(iface).await;
+            configure_interface(iface).await?;
         }
     } else if name == iface.name {
         // Collision: another interface has our target name but different MAC.
@@ -307,8 +313,9 @@ async fn handle_new_link(
             "[interface] Interface name collision: renaming existing interface {} (index {}) to {} to free up the name",
             iface.name, index, temp_name
         );
-        let _ = rename_interface_by_index(index, &temp_name).await;
+        rename_interface_by_index(index, &temp_name).await?;
     }
+    Ok(())
 }
 
 /// Handles dynamic cleanup of services when an active interface disappears.
@@ -324,19 +331,17 @@ async fn handle_del_link(iface: &mut ManagedInterface, index: u32) {
 }
 
 /// Configures IP address routing rules and ensures the administrative state is UP.
-async fn configure_interface(iface: &ManagedInterface) {
+async fn configure_interface(iface: &ManagedInterface) -> Result<(), RouterError> {
     if let Some(ref cidr) = iface.ip_config {
-        let _ = network::ensure_interface_up_and_configured(&iface.name, cidr).await;
+        network::ensure_interface_up_and_configured(&iface.name, cidr).await?;
     } else {
-        let _ = network::ensure_interface_up(&iface.name).await;
+        network::ensure_interface_up(&iface.name).await?;
     }
+    Ok(())
 }
 
 /// Finds the kernel interface index and current name matching the target MAC address.
-async fn find_interface_by_mac(mac_str: &str) -> Option<(u32, String)> {
-    let Ok(target_mac) = pnet::util::MacAddr::from_str(mac_str) else {
-        return None;
-    };
+async fn find_interface_by_mac(target_mac: MacAddr) -> Option<(u32, String)> {
     let target_bytes = target_mac.octets();
 
     let Ok((connection, handle, _)) = rtnetlink::new_connection() else {
@@ -366,10 +371,10 @@ async fn find_interface_by_mac(mac_str: &str) -> Option<(u32, String)> {
 /// Safe helper to rename an interface collision-free and set its link administrative state UP.
 async fn rename_and_up_interface(
     target_name: &str,
-    mac: &str,
+    mac: MacAddr,
     index: u32,
     current_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), RouterError> {
     if current_name != target_name {
         // Check for collisions and rename the colliding interface out of the way
         if let Some(collision_idx) = find_interface_by_name(target_name).await {
@@ -378,7 +383,7 @@ async fn rename_and_up_interface(
                 "[interface] Interface name collision: renaming existing interface {} (index {}) to {} to free up the name",
                 target_name, collision_idx, temp_name
             );
-            let _ = rename_interface_by_index(collision_idx, &temp_name).await;
+            rename_interface_by_index(collision_idx, &temp_name).await?;
         }
 
         println!(
@@ -408,7 +413,7 @@ async fn find_interface_by_name(name: &str) -> Option<u32> {
 async fn rename_interface_by_index(
     index: u32,
     new_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), RouterError> {
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 

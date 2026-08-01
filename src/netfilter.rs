@@ -5,6 +5,7 @@ use rustables::expr::{
 use rustables::{
     Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, ProtocolFamily, Rule, Table,
 };
+use crate::error::RouterError;
 
 fn pad_interface_name(name: &str) -> [u8; 16] {
     let mut bytes = [0u8; 16];
@@ -17,7 +18,7 @@ fn pad_interface_name(name: &str) -> [u8; 16] {
 pub fn configure_firewall(
     wan_iface: &str,
     lan_iface: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), RouterError> {
     println!("[netfilter] Configuring NAT and firewall rules...");
 
     let table = Table::new(ProtocolFamily::Ipv4).with_name("rustyrouter");
@@ -25,7 +26,15 @@ pub fn configure_firewall(
     // 1. Delete pre-existing table to flush old state (ignore error if it doesn't exist)
     let mut del_batch = Batch::new();
     del_batch.add(&table, MsgType::Del);
-    let _ = del_batch.send();
+    if let Err(e) = del_batch.send() {
+        let is_enoent = match e {
+            rustables::error::QueryError::NetlinkError(ref err) => err.error.abs() == libc::ENOENT,
+            _ => false,
+        };
+        if !is_enoent {
+            return Err(e.into());
+        }
+    }
 
     // 2. Build Table and Chains
     let nat_chain = Chain::new(&table)

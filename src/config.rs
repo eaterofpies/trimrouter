@@ -1,10 +1,13 @@
 use crate::system::SystemOps;
+use pnet::util::MacAddr;
+use std::str::FromStr;
+use crate::error::RouterError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouterConfig {
     pub lan_ip: String,
-    pub wan_mac: String,
-    pub lan_mac: String,
+    pub wan_mac: MacAddr,
+    pub lan_mac: MacAddr,
     pub reboot_delay: Option<u32>, // Some(N) = N seconds, None = infinite
 }
 
@@ -47,11 +50,17 @@ fn parse_cmdline<S: SystemOps>(sys: &S) -> (Option<String>, Option<String>, Opti
 }
 
 impl RouterConfig {
-    pub fn parse<S: SystemOps>(sys: &S) -> Self {
-        let (lan_ip, wan_mac, lan_mac, reboot_delay_str) = parse_cmdline(sys);
+    pub fn parse<S: SystemOps>(sys: &S) -> Result<Self, RouterError> {
+        let (lan_ip, wan_mac_str, lan_mac_str, reboot_delay_str) = parse_cmdline(sys);
 
-        let wan_mac = wan_mac.expect("rustyrouter.wan_mac configuration parameter is required");
-        let lan_mac = lan_mac.expect("rustyrouter.lan_mac configuration parameter is required");
+        let wan_mac_raw = wan_mac_str.ok_or_else(|| RouterError::Generic("rustyrouter.wan_mac configuration parameter is required".to_string()))?;
+        let lan_mac_raw = lan_mac_str.ok_or_else(|| RouterError::Generic("rustyrouter.lan_mac configuration parameter is required".to_string()))?;
+
+        let wan_mac = MacAddr::from_str(&wan_mac_raw)
+            .map_err(|_| RouterError::Generic("rustyrouter.wan_mac must be a valid MAC address".to_string()))?;
+        let lan_mac = MacAddr::from_str(&lan_mac_raw)
+            .map_err(|_| RouterError::Generic("rustyrouter.lan_mac must be a valid MAC address".to_string()))?;
+
         let lan_ip = lan_ip.unwrap_or_else(|| "192.168.1.1/24".to_string());
 
         let reboot_delay = match reboot_delay_str {
@@ -59,12 +68,12 @@ impl RouterConfig {
             None => None, // unset = infinite if not specified at all
         };
 
-        RouterConfig {
+        Ok(RouterConfig {
             lan_ip,
             wan_mac,
             lan_mac,
             reboot_delay,
-        }
+        })
     }
 }
 
@@ -74,19 +83,21 @@ mod tests {
     use crate::system::mock::MockSystem;
 
     #[test]
-    #[should_panic(expected = "rustyrouter.wan_mac configuration parameter is required")]
     fn test_config_parsing_missing_wan_mac() {
         let mut sys = MockSystem::new();
         sys.cmdline_content = "rustyrouter.lan_mac=52:54:00:12:34:57".to_string();
-        RouterConfig::parse(&sys);
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().to_string(), "Router error: rustyrouter.wan_mac configuration parameter is required");
     }
 
     #[test]
-    #[should_panic(expected = "rustyrouter.lan_mac configuration parameter is required")]
     fn test_config_parsing_missing_lan_mac() {
         let mut sys = MockSystem::new();
         sys.cmdline_content = "rustyrouter.wan_mac=52:54:00:12:34:56".to_string();
-        RouterConfig::parse(&sys);
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().to_string(), "Router error: rustyrouter.lan_mac configuration parameter is required");
     }
 
     #[test]
@@ -94,10 +105,10 @@ mod tests {
         let mut sys = MockSystem::new();
         sys.cmdline_content = "rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57 rustyrouter.lan_ip=10.0.0.1/24".to_string();
 
-        let config = RouterConfig::parse(&sys);
+        let config = RouterConfig::parse(&sys).unwrap();
         assert_eq!(config.lan_ip, "10.0.0.1/24");
-        assert_eq!(config.wan_mac, "52:54:00:12:34:56");
-        assert_eq!(config.lan_mac, "52:54:00:12:34:57");
+        assert_eq!(config.wan_mac, MacAddr::from_str("52:54:00:12:34:56").unwrap());
+        assert_eq!(config.lan_mac, MacAddr::from_str("52:54:00:12:34:57").unwrap());
         assert_eq!(config.reboot_delay, None); // unspecified is infinite
     }
 
@@ -105,11 +116,11 @@ mod tests {
     fn test_config_parsing_reboot_delay() {
         let mut sys = MockSystem::new();
         sys.cmdline_content = "rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57 rustyrouter.reboot_delay=5".to_string();
-        let cfg = RouterConfig::parse(&sys);
+        let cfg = RouterConfig::parse(&sys).unwrap();
         assert_eq!(cfg.reboot_delay, Some(5));
 
         sys.cmdline_content = "rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57 rustyrouter.reboot_delay".to_string();
-        let cfg = RouterConfig::parse(&sys);
+        let cfg = RouterConfig::parse(&sys).unwrap();
         assert_eq!(cfg.reboot_delay, Some(10)); // standalone flag is 10
     }
 }
