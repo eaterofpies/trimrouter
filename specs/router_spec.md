@@ -43,12 +43,16 @@ When running as PID 1:
 2. **Signal Handling**:
    - Standard init process signal masking/handling.
    - Traps system termination and shutdown signals (`SIGINT`, `SIGTERM`, `SIGPWR`).
-   - Upon receiving any of these signals (e.g. from a supervisor request or direct kill), triggers a clean system shutdown: cleans up Netfilter tables, brings network interface links down, and reboots with poweroff mode (`nix::sys::reboot::reboot(RebootMode::RB_POWER_OFF)`).
+   - Upon receiving any of these signals (e.g. from a supervisor request or direct kill), logs a teardown message, waits briefly, and calls `nix::sys::reboot::reboot(RebootMode::RB_POWER_OFF)` to halt the system. Full network and firewall teardown before poweroff is not yet implemented.
 3. **Orphan Reaping**:
    - Run a non-blocking or asynchronous reaping loop using `waitpid` to prevent zombie processes.
 4. **Configuration Extraction**:
    - Read and parse `/proc/cmdline` to extract network settings (e.g., `trimrouter.wan_mac=52:54:00:12:34:56`, `trimrouter.lan_mac=52:54:00:12:34:57`, `trimrouter.lan_ip=192.168.1.1/24`).
    - The `wan_mac` and `lan_mac` parameters are strictly required. If either is missing, the init process immediately panics (halts). Upon successful extraction, matching interfaces are renamed to the constants `wan` and `lan`.
+5. **Kernel Module Autoloading**:
+   - Probes a set of required kernel modules at startup (`load_required_modules()`) by calling a built-in `modprobe` emulator linked into the same binary.
+   - Listens for `NETLINK_KOBJECT_UEVENT` (uevent) broadcasts from the kernel and automatically loads modules matching the received `modalias` string by resolving dependencies from `modules.dep`.
+   - The binary detects whether it was invoked as `modprobe` (via `argv[0]`) and runs as a drop-in modprobe replacement when called by the kernel, requiring no external `modprobe` binary on the filesystem.
 5. **Panic & Unrecoverable Error Handling**:
    - Registers a custom panic hook (`std::panic::set_hook`) to intercept Rust panics.
    - If a panic or unrecoverable error occurs, logs the traceback or error message directly to `stdout`.
@@ -144,20 +148,20 @@ When running as PID 1, `trimrouter` settings are read from `/proc/cmdline` (the 
 Example parameters:
 - `trimrouter.wan_mac=52:54:00:12:34:56` (Required: map WAN interface by MAC and rename to `wan`)
 - `trimrouter.lan_mac=52:54:00:12:34:57` (Required: map LAN interface by MAC and rename to `lan`)
-- `trimrouter.lan_ip=192.168.1.1/24` (Specify the static LAN gateway IP and subnet)
-- `trimrouter.dns=8.8.8.8,1.1.1.1` (Optional static DNS resolver fallbacks)
+- `trimrouter.lan_ip=192.168.1.1/24` (Optional: static LAN gateway IP and subnet; defaults to `192.168.1.1/24`)
+- `trimrouter.reboot_delay[=N]` (Optional: on panic or unrecoverable error, reboot after `N` seconds instead of hanging indefinitely; standalone flag without `=N` defaults to 10 seconds)
 
 The `trimrouter.wan_mac` and `trimrouter.lan_mac` parameters are strictly required. If they are missing or if `/proc/cmdline` cannot be read, the init process will print a configuration error and panic (halt).
-- Defaults the LAN IP to `192.168.1.1/24`.
 
 ---
 
 ## 4. Technical Stack & Dependencies (Rust)
 
-- **Asynchronous Runtime**: `tokio` (single-threaded executor with `rt`, `macros`, `net`, `time`, `io-util`).
-- **System Calls & Signals**: `nix` (using features `mount`, `signal`, `process` to interface with the kernel directly).
+- **Asynchronous Runtime**: `tokio` (multi-threaded executor, `features = ["full"]`).
+- **System Calls & Signals**: `nix` (using features `mount`, `signal`, `process`, `reboot`, `kmod`, `time`, `user`).
 - **Netlink / Routing**: `rtnetlink` (to manage link states, addresses, and route tables).
-- **Netlink Firewall**: `netlink-packet-netfilter` combined with `netlink-sys` or a pure-Rust netlink wrapper to configure nftables without FFI/C dependencies.
+- **Netlink Firewall**: `rustables` — a pure-Rust nftables builder/sender crate that communicates directly with the kernel's `nf_tables` subsystem over Netlink without FFI/C dependencies.
+- **Kernel Module Loading**: Built-in `modprobe` emulator using the `nix` `kmod` feature and a `NETLINK_KOBJECT_UEVENT` listener for dynamic module autoloading.
 - **DHCP Client & Server**: Raw packet sockets (`AF_PACKET` / `SOCK_RAW`) with a pure-Rust DHCP packet parser/builder.
 - **DNS Resolver/Proxy**: Custom minimal UDP proxy forwarding to parsed WAN DNS addresses.
 
@@ -191,7 +195,10 @@ ldd target/x86_64-unknown-linux-musl/release/trimrouter
 To verify `trimrouter`'s behavior as a real PID 1 init process, we boot it in QEMU alongside a second client VM connected over a virtual socket link.
 
 #### 5.2.1 Initramfs Creation
-1. Copy the statically compiled binary to a temporary staging folder as `init`:
+In practice the initramfs is built automatically by `make` (or `make test`) which calls `scripts/build_initramfs.sh`. The output is placed at `target/x86_64/initramfs.cpio.gz` and includes the binary, kernel modules, and a minimal device layout.
+
+Conceptually the steps are:
+1. Copy the statically compiled binary to a staging folder as `init`:
    ```bash
    mkdir -p staging
    cp target/x86_64-unknown-linux-musl/release/trimrouter staging/init
@@ -200,7 +207,7 @@ To verify `trimrouter`'s behavior as a real PID 1 init process, we boot it in QE
 2. Pack the directory into a gzipped cpio archive:
    ```bash
    cd staging
-   find . -print0 | cpio --null -ov --format=newc | gzip -9 > ../initramfs.cpio.gz
+   find . -print0 | cpio --null -ov --format=newc | gzip -9 > ../target/x86_64/initramfs.cpio.gz
    cd ..
    ```
 

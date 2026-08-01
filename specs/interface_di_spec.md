@@ -59,32 +59,18 @@ This design eliminates periodic polling wakeups, triggering state machine transi
 
 Both WAN and LAN will be defined as instances of `ManagedInterface`. The specific behaviors and services are injected dynamically.
 
-```rust
-pub enum InterfaceType {
-    Wan,
-    Lan,
-}
+The network stack represents both WAN and LAN boundaries using a unified `ManagedInterface` model. The unique behaviors and network services of each interface are injected dynamically upon link state activation.
 
-pub enum RouterService {
-    DhcpClient(services::DhcpClient),
-    DhcpServer(services::DhcpServer),
-    DnsForwarder(services::DnsForwarder),
-    SntpClient(services::SntpClient),
-}
+The structure encapsulates:
+- **Interface Classification**: Identifies the interface role (either WAN for external upstream transit, or LAN for internal local distribution).
+- **Target Interface Name**: The target system name mapped in the host kernel (e.g. `"wan"`, `"lan"`).
+- **Hardware MAC Address**: The unique hardware MAC address used to discover, identify, and bind the physical link.
+- **IP Configuration**: An optional static IP address configuration (typically assigned to the LAN gateway interface).
+- **Active Service Suite**: A list of running network service controllers (like DHCP client/server or SNTP time sync) dynamically bound to this interface's lifecycle.
+- **Active Kernel Index**: The dynamic kernel-level interface index (registered once the device is detected on netlink).
 
-pub struct ManagedInterface {
-    /// The target system name (e.g. "wan", "lan")
-    pub name: String,
-    /// The hardware MAC address used for discovery
-    pub mac: String,
-    /// Optional static IP configuration (e.g., Some("192.168.1.1/24"))
-    pub ip_config: Option<String>,
-    /// The classification of this interface
-    pub service_type: InterfaceType,
-    /// Active running service containers managed via concrete enum variant wrappers
-    pub active_services: Vec<RouterService>,
-}
-```
+> [!NOTE]
+> `DnsForwarder` is **not** part of the `RouterService` enum. The DNS forwarder is a global singleton started once in `main.rs` before interface monitoring begins. It is not tied to the LAN interface lifecycle.
 
 ### Dynamic Service Mapping (Dependency Injection)
 
@@ -93,7 +79,7 @@ On interface discovery, the controller instantiates the service suite:
 | Interface Type | Configured IP | Dynamic Services Injected |
 | :--- | :--- | :--- |
 | **WAN** (`InterfaceType::Wan`) | None (DHCP Assigned) | 1. `DhcpClient` (retrieves lease)<br>2. `SntpClient` (synchronizes system time) |
-| **LAN** (`InterfaceType::Lan`) | Static (`192.168.1.1/24`) | 1. `DhcpServer` (allocates client leases)<br>2. `DnsForwarder` (resolves queries local/upstream) |
+| **LAN** (`InterfaceType::Lan`) | Static (`192.168.1.1/24`) | 1. `DhcpServer` (allocates client leases) |
 
 ---
 
@@ -152,41 +138,16 @@ Each interface task transitions through the following state machine:
 
 A new module [src/interface.rs](../src/interface.rs) will be created to isolate this logic:
 
-```rust
-// src/interface.rs
+The system logic is divided into a dedicated interface monitoring module and a simplified application entrypoint:
 
-pub async fn monitor_interface(
-    mut iface: ManagedInterface,
-    lease_state: SharedWanLease,
-) {
-    // Shared monitoring loop logic...
-}
-```
+### Interface Controller Module (`interface.rs`)
+The interface manager exposes an entry point that accepts a list of managed interfaces and the shared WAN lease state. It maintains a unified Netlink link listener, watching for device status changes, and manages service lifecycle activation and teardown routines.
 
-The [src/main.rs](../src/main.rs) initialization code will be simplified to:
-
-```rust
-// src/main.rs (Proposed Initialization)
-
-let lease_state = Arc::new(Mutex::new(WanLease::default()));
-
-let wan_iface = ManagedInterface::new(
-    network::WAN_INTERFACE.to_string(),
-    config.wan_mac.clone(),
-    None,
-    InterfaceType::Wan,
-);
-
-let lan_iface = ManagedInterface::new(
-    network::LAN_INTERFACE.to_string(),
-    config.lan_mac.clone(),
-    Some(config.lan_ip.clone()),
-    InterfaceType::Lan,
-);
-
-tokio::spawn(interface::monitor_interface(wan_iface, lease_state.clone()));
-tokio::spawn(interface::monitor_interface(lan_iface, lease_state.clone()));
-```
+### System Startup Initialization (`main.rs`)
+At startup, the initialization sequence performs the following high-level tasks:
+1. Instantiates a shared WAN lease record.
+2. Constructs the managed interface configurations for WAN and LAN, populating them with target names, discovery MAC addresses, static IPs (for LAN), and classifications.
+3. Spawns the interface monitoring task with the collection of managed interfaces, kicking off the main event loop.
 
 ---
 

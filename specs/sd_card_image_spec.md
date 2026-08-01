@@ -27,7 +27,7 @@ graph TD
 ### Phase 2: Package Initramfs Archive
 - Prepares a clean staging directory matching the minimal Linux filesystem layout (`/bin`, `/dev`, `/proc`, `/sys`, `/run`, `/etc`).
 - Copies the compiled binary as `/init` (enabling it to run as PID 1).
-- Creates fallback basic device nodes (`/dev/console` and `/dev/null`) and packs the structure into a compressed GNU `cpio` archive (`target/pi_initramfs.cpio.gz`).
+- Creates fallback basic device nodes (`/dev/console` and `/dev/null`) and packs the structure into a compressed GNU `cpio` archive (`target/<arch>/pi_initramfs.cpio.gz`, e.g. `target/arm64/pi_initramfs.cpio.gz`).
 
 ### Phase 3: Stage Boot Files
 - Configures a sandboxed, unprivileged local **APT environment** (`target/apt`) pointing to the official Raspberry Pi package repositories.
@@ -103,7 +103,7 @@ qemu-system-aarch64 \
     -cpu cortex-a53 \
     -m 1024 \
     -kernel target/pi_boot/kernel8.img \
-    -initrd target/pi_boot/pi_initramfs.cpio.gz \
+    -initrd target/arm64/pi_initramfs.cpio.gz \
     -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
     -netdev user,id=wan0 \
     -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
@@ -122,6 +122,6 @@ qemu-system-aarch64 \
 | `make` / `make all` | Build Host | Builds the static release binary and initramfs for the x86_64 host simulation. |
 | `make qemu` | Run Host Sim | Boots the host simulation in QEMU (x86_64). |
 | `make image` | Build Pi Image | Automatically runs the full pipeline to build `target/trimrouter.img` for Raspberry Pi Zero/Zero2/3. |
-| `make run-qemu` | Run Pi Sim | Boots the Raspberry Pi system in QEMU's ARM64 Virt Machine emulator. |
+| `make run-qemu` | Run Pi Sim | Boots the Raspberry Pi image in QEMU emulating a Raspberry Pi 3B (`-M raspi3b`). |
 | `make clean` | Clean | Deletes all host and Raspberry Pi build targets, packages, caches, and raw images. |
 
