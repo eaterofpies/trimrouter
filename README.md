@@ -24,7 +24,7 @@ It manages virtual filesystems, signal forwarding, orphan reaping, and launches 
   - **DHCP Client (WAN)**: Handles dynamic leases and unicast renewals on the WAN interface over raw sockets.
   - **DHCP Server (LAN)**: Manages LAN lease allocations, address conflicts, and lease release/decline requests.
   - **DNS Forwarder/Proxy (LAN)**: Listens for DNS queries on the LAN interface and forwards them to the dynamic DNS servers obtained from the WAN lease.
-  - **NTP Client (SNTP)**: Periodically synchronizes the router system time from pool.ntp.org.
+  - **NTP Client (SNTP)**: Periodically synchronizes the router system time from time.google.com.
 
 ---
 

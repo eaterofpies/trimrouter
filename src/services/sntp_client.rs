@@ -144,8 +144,8 @@ async fn sleep_or_shutdown(
 }
 
 async fn sync_time() -> Result<chrono::DateTime<chrono::Utc>, String> {
-    // Resolve pool.ntp.org manually via local DNS forwarder
-    let ntp_server_ip = super::utils::resolve_dns_a_record("pool.ntp.org").await?;
+    // Resolve time.google.com manually via local DNS forwarder
+    let ntp_server_ip = super::utils::resolve_dns_a_record("time.google.com").await?;
     let ntp_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ntp_server_ip), NTP_PORT);
 
     // Synchronize using standard rsntp client
