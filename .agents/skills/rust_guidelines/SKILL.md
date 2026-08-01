@@ -47,3 +47,7 @@ This skill provides code style and design standards for writing and modifying Ru
 * Declare imports (`use` statements) at the top of the file. This reduces code clutter, simplifies function signatures, and makes it easier to refactor type namespaces in a single place.
 * Inline qualification should only be used where necessary to resolve name collisions (e.g., distinguishing `std::fmt::Error` from `std::io::Error`), or when using imports/aliases is less readable.
 
+## 10. Pre-Commit Verification and Autoformatting
+* Run `cargo fmt` to ensure the codebase is formatted according to the standard style before staging changes.
+* Run `cargo clippy --all-targets` and fix any warnings or errors before committing code. Warnings should be treated as errors where possible to maintain the highest code quality standards.
+
