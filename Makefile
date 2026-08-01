@@ -2,7 +2,7 @@
 # Trimrouter main Makefile (Supports separate targets for each architecture)
 # =========================================================================
 
-.PHONY: all clean qemu image test run-qemu \
+.PHONY: all clean qemu image test run-qemu help \
         initramfs-x86_64 initramfs-arm64 initramfs-armhf \
         qemu-x86_64 qemu-arm64 qemu-armhf \
         test-x86_64 test-arm64 test-armhf
@@ -23,6 +23,28 @@ all: initramfs-x86_64
 
 qemu: qemu-x86_64
 test: test-x86_64
+
+help:
+	@echo "trimrouter build targets (Supported architectures: x86_64, arm64, armhf):"
+	@echo ""
+	@echo "  Host (x86_64)"
+	@echo "    make / make all          Build static binary and initramfs for x86_64"
+	@echo "    make qemu                Boot x86_64 initramfs in QEMU"
+	@echo "    make test                Run integration test suite against x86_64 QEMU VM"
+	@echo ""
+	@echo "  Raspberry Pi (arm64)"
+	@echo "    make image               Build a bootable .img file for Raspberry Pi (arm64)"
+	@echo "    make run-qemu            Boot the Raspberry Pi image in QEMU (-M raspi3b)"
+	@echo ""
+	@echo "  Architecture-specific"
+	@echo "    make initramfs-<arch>    Build initramfs for a specific arch (x86_64, arm64, armhf)"
+	@echo "    make qemu-<arch>         Boot initramfs for a specific arch in QEMU"
+	@echo "    make test-<arch>         Run integration tests for a specific arch"
+	@echo "    make image-<arch>        Build Raspberry Pi .img for a specific arch (arm64, armhf)"
+	@echo "    make run-qemu-<arch>     Boot Raspberry Pi image for a specific arch in QEMU"
+	@echo ""
+	@echo "  Misc"
+	@echo "    make clean               Delete all build artifacts"
 
 # =========================================================================
 # Generic Architecture Rules Template
