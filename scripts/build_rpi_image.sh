@@ -36,8 +36,8 @@ RPI_INITRAMFS="target/${ARCH}/pi_initramfs.cpio.gz"
 RPI_STAGING="target/${ARCH}/pi_initramfs"
 RPI_BOOT_DIR="target/${ARCH}/pi_boot"
 RPI_DEB_DIR="target/${ARCH}/rpi_deb"
-RPI_IMAGE="target/${ARCH}/rustyrouter.img"
-BINARY="target/${RUST_TARGET}/release/rustyrouter"
+RPI_IMAGE="target/${ARCH}/trimrouter.img"
+BINARY="target/${RUST_TARGET}/release/trimrouter"
 APT_DIR="target/${ARCH}/apt"
 
 # 1. APT download & extract stamp
@@ -159,7 +159,7 @@ cp -r "${RPI_DEB_DIR}/boot/overlays" "$RPI_BOOT_DIR/"
 
 echo "Staging configuration boot scripts for ${ARCH}..."
 echo -e "${CONFIG_TXT}" > "$RPI_BOOT_DIR/config.txt"
-echo "console=serial0,115200 console=tty1 root=/dev/ram0 rdinit=/init quiet panic=-1 net.ifnames=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=00:11:22:33:44:55 rustyrouter.lan_mac=66:77:88:99:aa:bb" > "$RPI_BOOT_DIR/cmdline.txt"
+echo "console=serial0,115200 console=tty1 root=/dev/ram0 rdinit=/init quiet panic=-1 net.ifnames=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=00:11:22:33:44:55 trimrouter.lan_mac=66:77:88:99:aa:bb" > "$RPI_BOOT_DIR/cmdline.txt"
 
 echo "[build-rpi] Allocating blank raw disk block file for ${ARCH}..."
 dd if=/dev/zero of="$RPI_IMAGE" bs=1M count=128 2>/dev/null

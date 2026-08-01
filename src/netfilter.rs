@@ -18,7 +18,7 @@ fn pad_interface_name(name: &str) -> [u8; 16] {
 pub fn configure_firewall(wan_iface: &str, lan_iface: &str) -> Result<(), RouterError> {
     println!("[netfilter] Configuring NAT and firewall rules...");
 
-    let table = Table::new(ProtocolFamily::Ipv4).with_name("rustyrouter");
+    let table = Table::new(ProtocolFamily::Ipv4).with_name("trimrouter");
 
     // 1. Delete pre-existing table to flush old state (ignore error if it doesn't exist)
     let mut del_batch = Batch::new();

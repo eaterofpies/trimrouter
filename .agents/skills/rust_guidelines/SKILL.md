@@ -5,7 +5,7 @@ description: Coding standards and guidelines for writing clean, flat, and idioma
 
 # Rust Coding Guidelines Skill
 
-This skill provides code style and design standards for writing and modifying Rust code in the `rustyrouter` repository.
+This skill provides code style and design standards for writing and modifying Rust code in the `trimrouter` repository.
 
 ## 1. Package Constants
 * Avoid redefining protocol or system constants.

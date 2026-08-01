@@ -29,7 +29,7 @@ esac
 CURDIR=$(pwd)
 STAGING="target/${ARCH}/staging"
 TEST_BOOT="target/${ARCH}/test_boot"
-BINARY="target/${RUST_TARGET}/release/rustyrouter"
+BINARY="target/${RUST_TARGET}/release/trimrouter"
 DIRECT_DEPS="virtio_net virtio_pci virtio_mmio nft_masq nft_chain_nat nft_ct"
 
 echo "[build] Creating initramfs staging area for ${ARCH}..."

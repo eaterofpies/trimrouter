@@ -1,6 +1,6 @@
-# rustyrouter
+# trimrouter
 
-`rustyrouter` is a lightweight, self-contained NATting router written in Rust, designed to run as the initialization process (PID 1) in a minimalist Linux container or virtual machine. 
+`trimrouter` is a lightweight, self-contained NATting router written in Rust, designed to run as the initialization process (PID 1) in a minimalist Linux container or virtual machine. 
 
 It manages virtual filesystems, signal forwarding, orphan reaping, and launches an asynchronous network controller managing routing, firewall, and local network services without requiring any userspace helper utilities (such as `ip`, `iptables`, or `dnsmasq`).
 
@@ -43,7 +43,7 @@ Compile the static release binary and package it into a compressed `cpio` initra
 ```bash
 make
 ```
-This generates `target/x86_64/initramfs.cpio.gz` which contains the statically linked `rustyrouter` binary mapped to `/init` and required Linux kernel modules.
+This generates `target/x86_64/initramfs.cpio.gz` which contains the statically linked `trimrouter` binary mapped to `/init` and required Linux kernel modules.
 
 ### Testing
 
@@ -64,8 +64,8 @@ make qemu
 
 ## Raspberry Pi Image Pipeline
 
-`rustyrouter` includes a fully unprivileged pipeline to build bootable raw FAT32 SD card images for Raspberry Pi hardware (Zero 2 W / Pi 3 / Pi 4 / Pi 5):
+`trimrouter` includes a fully unprivileged pipeline to build bootable raw FAT32 SD card images for Raspberry Pi hardware (Zero 2 W / Pi 3 / Pi 4 / Pi 5):
 ```bash
 make image
 ```
-This outputs a bootable flash image at `target/rustyrouter.img`. For full instructions on hardware deployment and ARM emulation testing, refer to the [specs/sd_card_image_spec.md](file:///workspaces/rustyrouter/specs/sd_card_image_spec.md) document.
+This outputs a bootable flash image at `target/trimrouter.img`. For full instructions on hardware deployment and ARM emulation testing, refer to the [specs/sd_card_image_spec.md](specs/sd_card_image_spec.md) document.

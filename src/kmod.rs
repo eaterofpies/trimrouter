@@ -474,7 +474,7 @@ mod tests {
     impl TempDir {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "rustyrouter_test_{}_{}",
+                "trimrouter_test_{}_{}",
                 name,
                 rand::random::<u64>()
             ));

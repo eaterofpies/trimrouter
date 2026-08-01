@@ -1,5 +1,5 @@
 # =========================================================================
-# Rustyrouter main Makefile (Supports separate targets for each architecture)
+# Trimrouter main Makefile (Supports separate targets for each architecture)
 # =========================================================================
 
 .PHONY: all clean qemu image test run-qemu \
@@ -40,10 +40,10 @@ test-$(1): target/$(1)/initramfs.cpio.gz
 	@TEST_ARCH=$(1) cargo test --test wan_dhcp_test -- --nocapture
 
 # Rule for building the target static binary
-target/$(RUST_TARGET_$(1))/release/rustyrouter: Cargo.toml Cargo.lock $(SRCS)
+target/$(RUST_TARGET_$(1))/release/trimrouter: Cargo.toml Cargo.lock $(SRCS)
 	@echo "[build] Ensuring $(RUST_TARGET_$(1)) target is installed..."
 	@rustup target add $(RUST_TARGET_$(1))
-	@echo "[build] Compiling rustyrouter (Static $(1) Release)..."
+	@echo "[build] Compiling trimrouter (Static $(1) Release)..."
 	@RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld" cargo build --release --target $(RUST_TARGET_$(1))
 
 # Rule for downloading and extracting Debian cloud kernel for tests
@@ -51,7 +51,7 @@ target/$(1)/test_boot/.kernel_extracted: scripts/extract_kernel.sh
 	@./scripts/extract_kernel.sh $(1)
 
 # Rule for building the target initramfs cpio archive
-target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/rustyrouter target/$(1)/test_boot/.kernel_extracted scripts/build_initramfs.sh
+target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/test_boot/.kernel_extracted scripts/build_initramfs.sh
 	@./scripts/build_initramfs.sh $(1)
 endef
 
@@ -64,7 +64,7 @@ $(foreach arch,$(ARCHS),$(eval $(call ARCH_RULES,$(arch))))
 clean:
 	@echo "[clean] Cleaning all build targets and staging directories..."
 	@cargo clean
-	@rm -rf target/x86_64 target/arm64 target/armhf target/rustyrouter.img target/pi_boot
+	@rm -rf target/x86_64 target/arm64 target/armhf target/trimrouter.img target/pi_boot
 
 # Include Raspberry Pi deployment build rules
 include Makefile.rpi

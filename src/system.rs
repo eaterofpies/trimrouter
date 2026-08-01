@@ -111,7 +111,7 @@ pub static REBOOT_DELAY: AtomicI32 = AtomicI32::new(-1);
 
 fn log_panic_info(info: &std::panic::PanicHookInfo<'_>) {
     eprintln!("====================================================");
-    eprintln!("CRITICAL: RUSTYROUTER PANICKED!");
+    eprintln!("CRITICAL: TRIMROUTER PANICKED!");
     if let Some(s) = info.payload().downcast_ref::<&str>() {
         eprintln!("Panic Cause: {}", s);
     } else if let Some(s) = info.payload().downcast_ref::<String>() {

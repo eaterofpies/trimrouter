@@ -1,6 +1,6 @@
 # Specification: Bootable SD Card Image Build Pipeline
 
-This specification outlines the high-level process to compile, assemble, and package the static router binary, the Linux kernel, and the Broadcom GPU firmware into a single raw bootable SD card image file (`target/rustyrouter.img`).
+This specification outlines the high-level process to compile, assemble, and package the static router binary, the Linux kernel, and the Broadcom GPU firmware into a single raw bootable SD card image file (`target/trimrouter.img`).
 
 By leveraging `mtools`, the entire pipeline runs in a **fully unprivileged environment** (no loop device mounts, no `chroot`, and no `sudo`/root access required).
 
@@ -17,7 +17,7 @@ graph TD
     C --> D[4. Create Raw Disk Image]
     D --> E[5. Format FAT32 Partition]
     E --> F[6. Copy Files to Image]
-    F --> G[rustyrouter.img]
+    F --> G[trimrouter.img]
 ```
 
 ### Phase 1: Compile Target Binary
@@ -43,7 +43,7 @@ graph TD
 - Writes a Master Boot Record (MBR/msdos) partition table containing a single primary partition starting at a block-aligned offset of `1MiB`.
 
 ### Phase 5: Format FAT32 Partition
-- Uses `mtools` (`mformat`) to format the partition inside the raw block file directly, referencing the block-aligned offset (`target/rustyrouter.img@@1M`).
+- Uses `mtools` (`mformat`) to format the partition inside the raw block file directly, referencing the block-aligned offset (`target/trimrouter.img@@1M`).
 
 ### Phase 6: Copy Files to Image
 - Uses `mtools` (`mcopy`) to recursively copy all firmware files, device tree blobs, overlays, configurations, kernels, and the initramfs archive directly into the FAT32 partition.
@@ -63,10 +63,10 @@ The resulting raw disk image uses a standard layout to ensure Raspberry Pi firmw
 
 ## 3. Flash to Hardware
 
-Once the final image (`target/rustyrouter.img`) is created, it can be flashed directly onto a MicroSD card using any standard image-writing software (e.g. Raspberry Pi Imager, Rufus, or `dd` via command line):
+Once the final image (`target/trimrouter.img`) is created, it can be flashed directly onto a MicroSD card using any standard image-writing software (e.g. Raspberry Pi Imager, Rufus, or `dd` via command line):
 
 ```bash
-sudo dd if=target/rustyrouter.img of=/dev/sdX bs=4M status=progress conv=fsync
+sudo dd if=target/trimrouter.img of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 *(Where `/dev/sdX` represents the target card reader block device).*
 
@@ -86,8 +86,8 @@ qemu-system-aarch64 \
     -m 1024 \
     -kernel target/pi_boot/kernel8.img \
     -dtb target/pi_boot/bcm2710-rpi-3-b-plus.dtb \
-    -drive file=target/rustyrouter.img,if=sd,format=raw \
-    -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
+    -drive file=target/trimrouter.img,if=sd,format=raw \
+    -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
     -nographic
 ```
 
@@ -108,7 +108,7 @@ qemu-system-aarch64 \
     -netdev user,id=wan0 \
     -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
     -netdev user,id=lan0 \
-    -append "console=ttyAMA0 root=/dev/ram0 rdinit=/init quiet rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
+    -append "console=ttyAMA0 root=/dev/ram0 rdinit=/init quiet trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
     -nographic
 ```
 *(Note: To boot QEMU's `-M virt`, ensure your `kernel8.img` or the host's generic arm64 kernel has the `CONFIG_VIRTIO_NET` and `CONFIG_PCI` options enabled).*
@@ -121,7 +121,7 @@ qemu-system-aarch64 \
 | :--- | :--- | :--- |
 | `make` / `make all` | Build Host | Builds the static release binary and initramfs for the x86_64 host simulation. |
 | `make qemu` | Run Host Sim | Boots the host simulation in QEMU (x86_64). |
-| `make image` | Build Pi Image | Automatically runs the full pipeline to build `target/rustyrouter.img` for Raspberry Pi Zero/Zero2/3. |
+| `make image` | Build Pi Image | Automatically runs the full pipeline to build `target/trimrouter.img` for Raspberry Pi Zero/Zero2/3. |
 | `make run-qemu` | Run Pi Sim | Boots the Raspberry Pi system in QEMU's ARM64 Virt Machine emulator. |
 | `make clean` | Clean | Deletes all host and Raspberry Pi build targets, packages, caches, and raw images. |
 

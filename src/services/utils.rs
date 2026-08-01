@@ -1,9 +1,9 @@
+use crate::error::RouterError;
 use pnet::util::MacAddr;
 use rtnetlink::packet_route::link::LinkAttribute;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
-use crate::error::RouterError;
 
 // =========================================================================
 // Shared WAN Lease Info

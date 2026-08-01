@@ -1,7 +1,7 @@
 #!/bin/bash
 # run_qemu.sh - Boot the router system in QEMU based on built target architecture
 
-if [ ! -f "target/pi_boot/pi_initramfs.cpio.gz" ] || [ ! -f "target/rustyrouter.img" ]; then
+if [ ! -f "target/pi_boot/pi_initramfs.cpio.gz" ] || [ ! -f "target/trimrouter.img" ]; then
     echo "Staged boot files not found. Please run 'make image' first."
     exit 1
 fi
@@ -15,10 +15,10 @@ if [ -f "target/pi_boot/kernel8.img" ]; then
         -kernel target/pi_boot/kernel8.img \
         -dtb target/pi_boot/bcm2710-rpi-3-b-plus.dtb \
         -initrd target/pi_boot/pi_initramfs.cpio.gz \
-        -drive file=target/rustyrouter.img,if=sd,format=raw \
+        -drive file=target/trimrouter.img,if=sd,format=raw \
         -device usb-net,netdev=lan0,mac=52:54:00:12:34:57 \
         -netdev user,id=lan0 \
-        -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0 dwc_otg.lpm_enable=0 dwc_otg.fiq_enable=0 dwc_otg.fiq_fsm_enable=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
+        -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0 dwc_otg.lpm_enable=0 dwc_otg.fiq_enable=0 dwc_otg.fiq_fsm_enable=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
         -nographic
 elif [ -f "target/pi_boot/kernel.img" ]; then
     echo "Booting router in QEMU ARM32 (Pi Zero W / raspi2b emulation)..."
@@ -28,10 +28,10 @@ elif [ -f "target/pi_boot/kernel.img" ]; then
         -kernel target/pi_boot/kernel.img \
         -dtb target/pi_boot/bcm2708-rpi-zero-w.dtb \
         -initrd target/pi_boot/pi_initramfs.cpio.gz \
-        -drive file=target/rustyrouter.img,if=sd,format=raw \
+        -drive file=target/trimrouter.img,if=sd,format=raw \
         -device usb-net,netdev=lan0,mac=52:54:00:12:34:57 \
         -netdev user,id=lan0 \
-        -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0 dwc_otg.lpm_enable=0 dwc_otg.fiq_enable=0 dwc_otg.fiq_fsm_enable=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
+        -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0 dwc_otg.lpm_enable=0 dwc_otg.fiq_enable=0 dwc_otg.fiq_fsm_enable=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
         -nographic
 else
     echo "No valid Raspberry Pi kernel found in target/pi_boot/."

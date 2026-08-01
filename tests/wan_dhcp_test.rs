@@ -311,7 +311,7 @@ async fn startup_stage() -> TestEnv {
         "ttyAMA0"
     };
     let append_arg = format!(
-        "console={} loglevel=8 panic=-1 net.ifnames=0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57",
+        "console={} loglevel=8 panic=-1 net.ifnames=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57",
         console
     );
 

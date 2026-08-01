@@ -150,7 +150,7 @@ Each interface task transitions through the following state machine:
 
 ## 4. Implementation Code Layout
 
-A new module [src/interface.rs](file:///workspaces/rustyrouter/src/interface.rs) will be created to isolate this logic:
+A new module [src/interface.rs](../src/interface.rs) will be created to isolate this logic:
 
 ```rust
 // src/interface.rs
@@ -163,7 +163,7 @@ pub async fn monitor_interface(
 }
 ```
 
-The [src/main.rs](file:///workspaces/rustyrouter/src/main.rs) initialization code will be simplified to:
+The [src/main.rs](../src/main.rs) initialization code will be simplified to:
 
 ```rust
 // src/main.rs (Proposed Initialization)

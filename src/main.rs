@@ -98,7 +98,7 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     }
 
     println!("====================================================");
-    println!("Starting rustyrouter (PID 1 Init Daemon)");
+    println!("Starting trimrouter (PID 1 Init Daemon)");
     println!("====================================================");
 
     // 1. Register Panic Hook (Emergency Reboot)

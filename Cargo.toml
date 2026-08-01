@@ -1,7 +1,8 @@
 [package]
-name = "rustyrouter"
+name = "trimrouter"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [[test]]
 name = "wan_dhcp_test"

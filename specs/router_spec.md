@@ -1,6 +1,6 @@
-# Specification: `rustyrouter`
+# Specification: `trimrouter`
 
-`rustyrouter` is a lightweight, self-contained Rust application designed to run as the initialization process (PID 1) in a minimalist Linux container or virtual machine. It acts as a basic NATting router, providing essential network services (DHCP client/server, DNS forwarding, and IP masquerading) while performing standard init process duties. 
+`trimrouter` is a lightweight, self-contained Rust application designed to run as the initialization process (PID 1) in a minimalist Linux container or virtual machine. It acts as a basic NATting router, providing essential network services (DHCP client/server, DNS forwarding, and IP masquerading) while performing standard init process duties. 
 
 Crucially, **no other files** will be present on the target filesystem other than the Linux kernel and this binary (statically linked). It requires zero external helper utilities (no `iptables`, `nft`, `ip`, `dnsmasq`, `udev`, etc.) and configures itself via kernel command line parameters or automatic interface detection.
 
@@ -47,7 +47,7 @@ When running as PID 1:
 3. **Orphan Reaping**:
    - Run a non-blocking or asynchronous reaping loop using `waitpid` to prevent zombie processes.
 4. **Configuration Extraction**:
-   - Read and parse `/proc/cmdline` to extract network settings (e.g., `rustyrouter.wan_mac=52:54:00:12:34:56`, `rustyrouter.lan_mac=52:54:00:12:34:57`, `rustyrouter.lan_ip=192.168.1.1/24`).
+   - Read and parse `/proc/cmdline` to extract network settings (e.g., `trimrouter.wan_mac=52:54:00:12:34:56`, `trimrouter.lan_mac=52:54:00:12:34:57`, `trimrouter.lan_ip=192.168.1.1/24`).
    - The `wan_mac` and `lan_mac` parameters are strictly required. If either is missing, the init process immediately panics (halts). Upon successful extraction, matching interfaces are renamed to the constants `wan` and `lan`.
 5. **Panic & Unrecoverable Error Handling**:
    - Registers a custom panic hook (`std::panic::set_hook`) to intercept Rust panics.
@@ -62,14 +62,14 @@ When running as PID 1:
 
 ### 2.2 Routing, Address, & NAT Configuration (Kernel-Space)
 
-`rustyrouter` relies entirely on the Linux kernel for IP packet routing, forwarding, and connection tracking (NAT/Masquerade). It configures the kernel programmatically using Netlink sockets, requiring no external file dependencies or helper binaries.
+`trimrouter` relies entirely on the Linux kernel for IP packet routing, forwarding, and connection tracking (NAT/Masquerade). It configures the kernel programmatically using Netlink sockets, requiring no external file dependencies or helper binaries.
 
 #### 2.2.1 IP Forwarding
-To allow packets to pass between the interfaces, `rustyrouter` enables IPv4 forwarding in the kernel at startup:
+To allow packets to pass between the interfaces, `trimrouter` enables IPv4 forwarding in the kernel at startup:
 - Writes `"1"` to `/proc/sys/net/ipv4/ip_forward`.
 
 #### 2.2.2 Netlink Interface & Route Management (`NETLINK_ROUTE`)
-Using a routing Netlink socket (the standard `rtnetlink` interface), `rustyrouter` performs the following operations asynchronously:
+Using a routing Netlink socket (the standard `rtnetlink` interface), `trimrouter` performs the following operations asynchronously:
 1. **Loopback Interface (`lo`)**:
    - Resolves the index of `lo` and sets its link state to `UP` (equivalent to `ip link set lo up`). The IP address `127.0.0.1/8` is automatically assigned to loopback by the kernel.
 2. **LAN Interface Link & Address**:
@@ -88,15 +88,15 @@ Using a routing Netlink socket (the standard `rtnetlink` interface), `rustyroute
      - Deletes the default gateway route associated with that lease to prevent routing blackholes.
 
 #### 2.2.3 Netfilter / nftables NAT Configuration (`NETLINK_NETFILTER`)
-To enable Source NAT (Masquerading), `rustyrouter` communicates directly with the kernel's `nf_tables` subsystem over a netfilter Netlink socket. It constructs and sends standard netlink messages to build the following netfilter objects:
+To enable Source NAT (Masquerading), `trimrouter` communicates directly with the kernel's `nf_tables` subsystem over a netfilter Netlink socket. It constructs and sends standard netlink messages to build the following netfilter objects:
 1. **Table**:
-   - Creates a single IPv4 table named `rustyrouter` under the `ip` family.
+   - Creates a single IPv4 table named `trimrouter` under the `ip` family.
 2. **NAT Configuration (`nat_postrouting` chain)**:
-   - Creates a chain named `nat_postrouting` in the `rustyrouter` table.
+   - Creates a chain named `nat_postrouting` in the `trimrouter` table.
    - Configures the chain as a base chain of type `nat`, hooked to `postrouting` (`NF_INET_POST_ROUTING`), priority `100` (`NF_IP_PRI_NAT_SRC`), and default policy `accept`.
    - **Masquerade Rule**: Appends a rule matching outbound traffic on the WAN interface (e.g., matching the outgoing interface index `oif`) and targets `masquerade`.
 3. **Firewall / Input Filter Configuration (`filter_input` chain)**:
-   - Creates a chain named `filter_input` in the `rustyrouter` table.
+   - Creates a chain named `filter_input` in the `trimrouter` table.
    - Configures the chain as a base chain of type `filter`, hooked to `input` (`NF_INET_LOCAL_IN`), priority `0` (`NF_IP_PRI_FILTER`), and default policy `drop` (block all traffic by default).
    - **Input Rules**:
      - *Loopback Rule*: Accept all packets where the input interface (`iif`) is `lo`.
@@ -107,7 +107,7 @@ To enable Source NAT (Masquerading), `rustyrouter` communicates directly with th
 ---
 
 ### 2.3 Network Services (Embedded)
-All services are implemented directly inside the `rustyrouter` binary using async tasks:
+All services are implemented directly inside the `trimrouter` binary using async tasks:
 1. **DHCP Client (WAN)**:
    - Negotiates IP configuration with the upstream DHCP server using raw packet sockets (`AF_PACKET` / `SOCK_RAW`) bound directly to the WAN interface.
    - This bypasses the kernel TCP/IP stack to send broadcast DISCOVER/REQUEST packets and receive unicast/broadcast OFFER/ACK replies before the interface has an IP address assigned.
@@ -119,7 +119,7 @@ All services are implemented directly inside the `rustyrouter` binary using asyn
    - Uses raw packet sockets (`AF_PACKET`) to unicast DHCP replies directly to the client's MAC address (since the client does not yet have an IP address and cannot respond to ARP).
    - **Lease Integrity & Eviction**: Manages an in-memory database of active leases using a synchronized `LeaseTable` module to ensure the lease map and IP allocation index remain aligned. Evicts expired leases automatically to reclaim IPs.
    - **Address Validation**: Rejects client requests that fall outside the LAN subnet, match the server's own IP, or conflict with another active lease (returns `DHCPNAK` on conflicts).
-   - Hands out IPs to LAN clients, advertising `rustyrouter`'s LAN IP as the gateway and DNS resolver.
+   - Hands out IPs to LAN clients, advertising `trimrouter`'s LAN IP as the gateway and DNS resolver.
 3. **DNS Forwarder**:
    - Listens on port 53 (UDP) on the LAN interface.
    - By default, forwards client DNS queries to the DNS server IPs dynamically obtained from the WAN interface's DHCP lease.
@@ -133,21 +133,21 @@ All services are implemented directly inside the `rustyrouter` binary using asyn
    - Retries with backoff on network failures and performs sync checks every 30 minutes.
 
 ### 2.4 Logging & Timestamps
-- All standard output and error logs printed by `rustyrouter` must include a standardized timestamp prefix with millisecond resolution.
+- All standard output and error logs printed by `trimrouter` must include a standardized timestamp prefix with millisecond resolution.
 - Format: `[YYYY-MM-DD HH:MM:SS.mmm] [module] message` (e.g. `[2026-07-18 15:18:30.123] [init] Mounted /proc successfully.`).
 ---
 
 ## 3. Configuration & Startup Parameters
 
-When running as PID 1, `rustyrouter` settings are read from `/proc/cmdline` (the kernel command line). 
+When running as PID 1, `trimrouter` settings are read from `/proc/cmdline` (the kernel command line). 
 
 Example parameters:
-- `rustyrouter.wan_mac=52:54:00:12:34:56` (Required: map WAN interface by MAC and rename to `wan`)
-- `rustyrouter.lan_mac=52:54:00:12:34:57` (Required: map LAN interface by MAC and rename to `lan`)
-- `rustyrouter.lan_ip=192.168.1.1/24` (Specify the static LAN gateway IP and subnet)
-- `rustyrouter.dns=8.8.8.8,1.1.1.1` (Optional static DNS resolver fallbacks)
+- `trimrouter.wan_mac=52:54:00:12:34:56` (Required: map WAN interface by MAC and rename to `wan`)
+- `trimrouter.lan_mac=52:54:00:12:34:57` (Required: map LAN interface by MAC and rename to `lan`)
+- `trimrouter.lan_ip=192.168.1.1/24` (Specify the static LAN gateway IP and subnet)
+- `trimrouter.dns=8.8.8.8,1.1.1.1` (Optional static DNS resolver fallbacks)
 
-The `rustyrouter.wan_mac` and `rustyrouter.lan_mac` parameters are strictly required. If they are missing or if `/proc/cmdline` cannot be read, the init process will print a configuration error and panic (halt).
+The `trimrouter.wan_mac` and `trimrouter.lan_mac` parameters are strictly required. If they are missing or if `/proc/cmdline` cannot be read, the init process will print a configuration error and panic (halt).
 - Defaults the LAN IP to `192.168.1.1/24`.
 
 ---
@@ -165,7 +165,7 @@ The `rustyrouter.wan_mac` and `rustyrouter.lan_mac` parameters are strictly requ
 
 ## 5. Compilation & Initramfs Packaging
 
-Since `rustyrouter` runs in an environment with no other files, it must be compiled as a fully static binary.
+Since `trimrouter` runs in an environment with no other files, it must be compiled as a fully static binary.
 
 ### 5.1 Static Compilation
 To ensure the binary does not depend on a dynamic interpreter (`ld-linux.so`) or host libraries (like `libc.so`, `libnftnl.so`, etc.), it must be compiled against the `musl` libc target:
@@ -179,22 +179,22 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 Verify that the binary is statically linked:
 ```bash
-file target/x86_64-unknown-linux-musl/release/rustyrouter
+file target/x86_64-unknown-linux-musl/release/trimrouter
 # Expected output contains: statically linked
 
-ldd target/x86_64-unknown-linux-musl/release/rustyrouter
+ldd target/x86_64-unknown-linux-musl/release/trimrouter
 # Expected output: not a dynamic executable
 ```
 
 ### 5.2 QEMU-Based Testing & Verification Plan
 
-To verify `rustyrouter`'s behavior as a real PID 1 init process, we boot it in QEMU alongside a second client VM connected over a virtual socket link.
+To verify `trimrouter`'s behavior as a real PID 1 init process, we boot it in QEMU alongside a second client VM connected over a virtual socket link.
 
 #### 5.2.1 Initramfs Creation
 1. Copy the statically compiled binary to a temporary staging folder as `init`:
    ```bash
    mkdir -p staging
-   cp target/x86_64-unknown-linux-musl/release/rustyrouter staging/init
+   cp target/x86_64-unknown-linux-musl/release/trimrouter staging/init
    chmod +x staging/init
    ```
 2. Pack the directory into a gzipped cpio archive:
@@ -213,7 +213,7 @@ We boot the router VM with two NICs:
 qemu-system-x86_64 \
   -kernel /path/to/vmlinuz \
   -initrd initramfs.cpio.gz \
-  -append "console=ttyS0 rustyrouter.lan_ip=192.168.1.1/24 rustyrouter.wan_mac=52:54:00:12:34:56 rustyrouter.lan_mac=52:54:00:12:34:57" \
+  -append "console=ttyS0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
   -netdev user,id=wan0,net=10.0.2.0/24 \
   -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
   -netdev socket,id=lan0,listen=127.0.0.1:1234 \
@@ -234,7 +234,7 @@ qemu-system-x86_64 \
 ```
 
 Once booted, the client VM will:
-1. Run a standard DHCP client on its interface, which receives an IP address (e.g. `192.168.1.100`), default gateway (`192.168.1.1`), and DNS resolver (`192.168.1.1`) from `rustyrouter`'s server.
-2. Direct DNS queries to `192.168.1.1` (forwarded to the upstream gateway `10.0.2.2` by `rustyrouter`).
-3. Send ICMP packets or TCP streams out to the Internet, which the kernel of `rustyrouter` NATs and forwards through `wan`.
+1. Run a standard DHCP client on its interface, which receives an IP address (e.g. `192.168.1.100`), default gateway (`192.168.1.1`), and DNS resolver (`192.168.1.1`) from `trimrouter`'s server.
+2. Direct DNS queries to `192.168.1.1` (forwarded to the upstream gateway `10.0.2.2` by `trimrouter`).
+3. Send ICMP packets or TCP streams out to the Internet, which the kernel of `trimrouter` NATs and forwards through `wan`.
 

@@ -1161,29 +1161,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "rustyrouter"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dhcproto",
- "dns-parser",
- "evdev",
- "futures-util",
- "ipnet",
- "kobject-uevent",
- "libc",
- "netlink-sys",
- "nix 0.31.3",
- "pnet",
- "rand",
- "rsntp",
- "rtnetlink",
- "rustables",
- "socket2",
- "tokio",
-]
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1435,6 +1412,29 @@ name = "tracing-core"
 version = "0.1.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+
+[[package]]
+name = "trimrouter"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dhcproto",
+ "dns-parser",
+ "evdev",
+ "futures-util",
+ "ipnet",
+ "kobject-uevent",
+ "libc",
+ "netlink-sys",
+ "nix 0.31.3",
+ "pnet",
+ "rand",
+ "rsntp",
+ "rtnetlink",
+ "rustables",
+ "socket2",
+ "tokio",
+]
 
 [[package]]
 name = "unicode-ident"
