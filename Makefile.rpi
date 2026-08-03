@@ -6,8 +6,9 @@
 KERNEL_FILE_arm64  := kernel8.img
 KERNEL_FILE_armhf  := kernel.img
 
-DTBS_arm64         := bcm2710-rpi-zero-2-w.dtb bcm2710-rpi-3-b-plus.dtb
-DTBS_armhf         := bcm2708-rpi-zero-w.dtb
+# DTB used by QEMU for raspi3b emulation (one per arch)
+QEMU_DTB_arm64     := bcm2710-rpi-3-b-plus.dtb
+QEMU_DTB_armhf     := bcm2708-rpi-zero-w.dtb
 
 # =========================================================================
 # Raspberry Pi Specific Architecture Rules Template
@@ -24,7 +25,7 @@ run-qemu-$(1): target/$(1)/trimrouter.img
 	    -cpu cortex-a53 \
 	    -m 1024 \
 	    -kernel target/$(1)/pi_boot/$(KERNEL_FILE_$(1)) \
-	    -dtb target/$(1)/pi_boot/$(firstword $(DTBS_$(1))) \
+	    -dtb target/$(1)/pi_boot/$(QEMU_DTB_$(1)) \
 	    -initrd target/$(1)/pi_initramfs.cpio.gz \
 	    -drive file=target/$(1)/trimrouter.img,if=sd,format=raw \
 	    -device usb-net,netdev=lan0,mac=52:54:00:12:34:57 \

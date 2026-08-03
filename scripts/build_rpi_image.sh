@@ -16,14 +16,12 @@ case "$ARCH" in
         DEB_ARCH="arm64"
         KERNEL_FILE="kernel8.img"
         CONFIG_TXT="kernel=kernel8.img\narm_64bit=1\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=0"
-        DTBS="bcm2710-rpi-zero-2-w.dtb bcm2710-rpi-3-b-plus.dtb"
         ;;
     armhf)
         RUST_TARGET="arm-unknown-linux-musleabihf"
         DEB_ARCH="armhf"
         KERNEL_FILE="kernel.img"
         CONFIG_TXT="kernel=kernel.img\narm_64bit=0\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=0"
-        DTBS="bcm2708-rpi-zero-w.dtb"
         ;;
     *)
         echo "Unsupported architecture: $ARCH"
@@ -152,8 +150,8 @@ cp "${RPI_DEB_DIR}/boot/bootcode.bin" "$RPI_BOOT_DIR/"
 cp "${RPI_DEB_DIR}/boot/fixup.dat" "$RPI_BOOT_DIR/"
 cp "${RPI_DEB_DIR}/boot/start.elf" "$RPI_BOOT_DIR/"
 cp "${RPI_DEB_DIR}/boot/${KERNEL_FILE}" "$RPI_BOOT_DIR/"
-for dtb in ${DTBS}; do
-    cp "${RPI_DEB_DIR}/boot/${dtb}" "$RPI_BOOT_DIR/"
+for dtb in "${RPI_DEB_DIR}/boot/"bcm*.dtb; do
+    cp "$dtb" "$RPI_BOOT_DIR/"
 done
 cp -r "${RPI_DEB_DIR}/boot/overlays" "$RPI_BOOT_DIR/"
 
