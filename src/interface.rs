@@ -129,6 +129,30 @@ impl ManagedInterface {
     }
 }
 
+fn get_link_speed(iface_name: &str) -> String {
+    let path = format!("/sys/class/net/{}/speed", iface_name);
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&mbps| mbps > 0)
+        .map(|mbps| format!("{} Mbps", mbps))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn if_indextoname(index: u32) -> Option<String> {
+    std::fs::read_dir("/sys/class/net").ok()?.find_map(|entry| {
+        let entry = entry.ok()?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ifindex_path = format!("/sys/class/net/{}/ifindex", name);
+        let ifindex = std::fs::read_to_string(ifindex_path)
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        (ifindex == index).then_some(name)
+    })
+}
+
 /// Subscribes to Netlink link multicast groups and monitors the lifecycle of all managed interfaces.
 ///
 /// Deduplicates dynamic hardware detection logs, handles interface renaming on match,
@@ -137,7 +161,7 @@ pub async fn monitor_interfaces(
     mut interfaces: Vec<ManagedInterface>,
     lease_state: SharedWanLease,
 ) {
-    let (connection, _handle, mut messages) =
+    let (connection, handle, mut messages) =
         match rtnetlink::new_multicast_connection(&[MulticastGroup::Link]) {
             Ok(res) => res,
             Err(e) => {
@@ -148,6 +172,36 @@ pub async fn monitor_interfaces(
             }
         };
     tokio::spawn(connection);
+
+    // Map of interface index -> (name, MAC, has_link)
+    let mut link_states = std::collections::HashMap::new();
+
+    // Initial scan to populate current link states
+    let mut links = handle.link().get().execute();
+    while let Some(link_msg) = links.try_next().await.unwrap_or(None) {
+        let index = link_msg.header.index;
+        let (name, address) = parse_link_attributes(link_msg.attributes);
+        if let (Some(n), Some(addr)) = (name, address)
+            && n != "lo"
+        {
+            // Bring it UP administratively so carrier detection/negotiation can occur
+            let _ = network::ensure_interface_up(&n).await;
+
+            let has_link = link_msg
+                .header
+                .flags
+                .contains(rtnetlink::packet_route::link::LinkFlags::LowerUp);
+            link_states.insert(index, (n.clone(), addr, has_link));
+
+            if has_link {
+                let speed = get_link_speed(&n);
+                println!(
+                    "[interface] Interface {} (MAC: {}) got link (speed: {})",
+                    n, addr, speed
+                );
+            }
+        }
+    }
 
     // Local set tracking discovered interfaces to deduplicate logs (no static globals needed)
     let mut detected_indices = std::collections::HashSet::new();
@@ -176,6 +230,7 @@ pub async fn monitor_interfaces(
                 &mut interfaces,
                 &lease_state,
                 &mut detected_indices,
+                &mut link_states,
             )
             .await;
             if let Err(e) = res {
@@ -218,13 +273,21 @@ async fn process_netlink_message(
     interfaces: &mut [ManagedInterface],
     lease_state: &SharedWanLease,
     detected_indices: &mut std::collections::HashSet<u32>,
+    link_states: &mut std::collections::HashMap<u32, (String, MacAddr, bool)>,
 ) -> Result<(), RouterError> {
     match rtnl_msg {
         rtnetlink::packet_route::RouteNetlinkMessage::NewLink(link_msg) => {
-            handle_new_link_event(link_msg, interfaces, lease_state, detected_indices).await?;
+            handle_new_link_event(
+                link_msg,
+                interfaces,
+                lease_state,
+                detected_indices,
+                link_states,
+            )
+            .await?;
         }
         rtnetlink::packet_route::RouteNetlinkMessage::DelLink(link_msg) => {
-            handle_del_link_event(link_msg, interfaces, detected_indices).await;
+            handle_del_link_event(link_msg, interfaces, detected_indices, link_states).await;
         }
         _ => {}
     }
@@ -237,17 +300,52 @@ async fn handle_new_link_event(
     interfaces: &mut [ManagedInterface],
     lease_state: &SharedWanLease,
     detected_indices: &mut std::collections::HashSet<u32>,
+    link_states: &mut std::collections::HashMap<u32, (String, MacAddr, bool)>,
 ) -> Result<(), RouterError> {
     let index = link_msg.header.index;
     let (name, address) = parse_link_attributes(link_msg.attributes);
 
-    let (Some(n), Some(addr)) = (name, address) else {
-        return Ok(());
+    let (n, addr) = if let (Some(name_val), Some(addr_val)) = (name.clone(), address) {
+        (name_val, addr_val)
+    } else if let Some(cached) = link_states.get(&index) {
+        let name_resolved = name.unwrap_or_else(|| cached.0.clone());
+        let addr_resolved = address.unwrap_or(cached.1);
+        (name_resolved, addr_resolved)
+    } else {
+        let Some(name_resolved) = name.or_else(|| if_indextoname(index)) else {
+            return Ok(());
+        };
+        let addr_resolved = address.unwrap_or(MacAddr::new(0, 0, 0, 0, 0, 0));
+        (name_resolved, addr_resolved)
     };
 
+    if n == "lo" {
+        return Ok(());
+    }
+
+    let has_link = link_msg
+        .header
+        .flags
+        .contains(rtnetlink::packet_route::link::LinkFlags::LowerUp);
+    let prev_link = link_states.get(&index).map(|s| s.2);
+    if prev_link != Some(has_link) {
+        if has_link {
+            let speed = get_link_speed(&n);
+            println!(
+                "[interface] Interface {} (MAC: {}) got link (speed: {})",
+                n, addr, speed
+            );
+        } else {
+            println!("[interface] Interface {} (MAC: {}) lost link", n, addr);
+        }
+        link_states.insert(index, (n.clone(), addr, has_link));
+    }
+
     // 1. Dedup and log detection of any new physical/USB interface
-    if n != "lo" && detected_indices.insert(index) {
+    if detected_indices.insert(index) {
         log_detected_device(&n, addr);
+        // Ensure the newly detected interface is administratively UP to enable link negotiation
+        let _ = network::ensure_interface_up(&n).await;
     }
 
     // 2. Route hotplug matching to the respective managed interface
@@ -262,9 +360,15 @@ async fn handle_del_link_event(
     link_msg: rtnetlink::packet_route::link::LinkMessage,
     interfaces: &mut [ManagedInterface],
     detected_indices: &mut std::collections::HashSet<u32>,
+    link_states: &mut std::collections::HashMap<u32, (String, MacAddr, bool)>,
 ) {
     let index = link_msg.header.index;
     detected_indices.remove(&index);
+    if let Some((n, addr, has_link)) = link_states.remove(&index)
+        && has_link
+    {
+        println!("[interface] Interface {} (MAC: {}) lost link", n, addr);
+    }
     for iface in interfaces {
         handle_del_link(iface, index).await;
     }
