@@ -9,3 +9,8 @@
 - Clean up logging (maybe add a structured logging library like `tracing`)
 - Show ethernet link speed changes in the logs
 - Clean up option logs so they print clean values instead of `Some(...)`
+- Add logging to file + file rotation
+- Deduplicate dependencies
+- LAN/WAN IP conflict resolution
+- Add service stopping notifications
+- Panic doesn't stop routing / other services. Should it?
