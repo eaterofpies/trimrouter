@@ -14,3 +14,4 @@
 - LAN/WAN IP conflict resolution
 - Add service stopping notifications
 - Panic doesn't stop routing / other services. Should it?
+- Service privilege separation
