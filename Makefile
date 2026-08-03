@@ -2,7 +2,7 @@
 # Trimrouter main Makefile (Supports separate targets for each architecture)
 # =========================================================================
 
-.PHONY: all clean qemu image test run-qemu help \
+.PHONY: all clean qemu test run-qemu help \
         initramfs-x86_64 initramfs-arm64 initramfs-armhf \
         qemu-x86_64 qemu-arm64 qemu-armhf \
         test-x86_64 test-arm64 test-armhf
@@ -33,7 +33,6 @@ help:
 	@echo "    make test                Run integration test suite against x86_64 QEMU VM"
 	@echo ""
 	@echo "  Raspberry Pi (arm64)"
-	@echo "    make image               Build a bootable .img file for Raspberry Pi (arm64)"
 	@echo "    make run-qemu            Boot the Raspberry Pi image in QEMU (-M raspi3b)"
 	@echo ""
 	@echo "  Architecture-specific"

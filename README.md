@@ -73,6 +73,6 @@ make qemu
 
 `trimrouter` includes a fully unprivileged pipeline to build bootable raw FAT32 SD card images for Raspberry Pi hardware (Zero 2 W / Pi 3 / Pi 4 / Pi 5):
 ```bash
-make image
+make image-<arch>   # e.g. make image-arm64, make image-armhf
 ```
-This outputs a bootable flash image at `target/trimrouter.img`. For full instructions on hardware deployment and ARM emulation testing, refer to the [specs/sd_card_image_spec.md](specs/sd_card_image_spec.md) document.
+This outputs a bootable flash image at `target/<arch>/trimrouter.img`. For full instructions on hardware deployment and ARM emulation testing, refer to the [specs/sd_card_image_spec.md](specs/sd_card_image_spec.md) document.

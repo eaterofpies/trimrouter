@@ -9,10 +9,6 @@ KERNEL_FILE_armhf  := kernel.img
 DTBS_arm64         := bcm2710-rpi-zero-2-w.dtb bcm2710-rpi-3-b-plus.dtb
 DTBS_armhf         := bcm2708-rpi-zero-w.dtb
 
-# Convenience defaults for Pi
-image: image-arm64
-run-qemu: run-qemu-arm64
-
 # =========================================================================
 # Raspberry Pi Specific Architecture Rules Template
 # =========================================================================
