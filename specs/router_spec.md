@@ -199,6 +199,12 @@ The build pipeline (`make` or `make test`) automatically:
 1. Calls `scripts/build_initramfs.sh` to construct the initramfs archive at `target/x86_64/initramfs.cpio.gz` including the statically linked `trimrouter` binary (mapped to `/init`) and required Linux kernel modules.
 2. Calls `scripts/build_image.sh` to package the kernel (`vmlinuz`), the initramfs (`initramfs.cpio.gz`), and a `cmdline.txt` parameter file into a partitioned, bootable FAT32 raw disk image file at `target/x86_64/trimrouter.img`.
 
+On boot, `trimrouter` (as PID 1) will:
+1. Mount virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`).
+2. Synchronously load essential kernel drivers (including `virtio_blk`, `fat`, `vfat`, and NLS charsets).
+3. Identify and mount the primary boot partition of the disk image (e.g., `/dev/vda1`, `/dev/mmcblk0p1`) as **read-only** to `/boot`.
+4. Proceed to load configuration parameters and configure the network.
+
 #### 5.2.2 Running the Router VM
 We boot the router VM with the partitioned raw disk image attached as a VirtIO storage drive along with two virtual network interfaces:
 *   **eth0 (WAN)**: Connected to QEMU's User Network (which runs a built-in DHCP server providing IP addresses in the `10.0.2.0/24` range and NATting traffic to the host's internet).

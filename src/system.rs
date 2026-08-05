@@ -1,11 +1,14 @@
+use crate::error::RouterError;
 use nix::mount::MsFlags;
 use nix::sys::reboot::RebootMode;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::fs;
 use std::panic;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub trait SystemOps: Send + Sync + 'static {
     fn mount(
@@ -72,23 +75,23 @@ impl SystemOps for RealSystem {
     }
 }
 
-pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), String> {
+pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), RouterError> {
     println!("[init] Mounting virtual filesystems...");
 
     sys.mount(None, "/proc", "proc", MsFlags::empty(), None)
-        .map_err(|e| format!("Failed to mount /proc: {}", e))?;
+        .map_err(|e| RouterError::Generic(format!("Failed to mount /proc: {}", e)))?;
     println!("[init] Mounted /proc successfully.");
 
     sys.mount(None, "/sys", "sysfs", MsFlags::empty(), None)
-        .map_err(|e| format!("Failed to mount /sys: {}", e))?;
+        .map_err(|e| RouterError::Generic(format!("Failed to mount /sys: {}", e)))?;
     println!("[init] Mounted /sys successfully.");
 
     sys.mount(None, "/dev", "devtmpfs", MsFlags::empty(), None)
-        .map_err(|e| format!("Failed to mount /dev: {}", e))?;
+        .map_err(|e| RouterError::Generic(format!("Failed to mount /dev: {}", e)))?;
     println!("[init] Mounted /dev successfully.");
 
     sys.mount(None, "/run", "tmpfs", MsFlags::empty(), None)
-        .map_err(|e| format!("Failed to mount /run: {}", e))?;
+        .map_err(|e| RouterError::Generic(format!("Failed to mount /run: {}", e)))?;
     println!("[init] Mounted /run successfully.");
 
     // Set kernel modprobe helper path to trigger lazy loading
@@ -100,6 +103,70 @@ pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), String> {
     } else {
         println!("[init] Configured kernel modprobe path to /sbin/modprobe.");
     }
+
+    Ok(())
+}
+
+const BOOT_MOUNT_POINT: &str = "/boot";
+const BOOT_DEVICE_CANDIDATES: &[&str] = &["/dev/vda1", "/dev/mmcblk0p1", "/dev/sda1"];
+const BOOT_MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
+const BOOT_MOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn try_mount_candidates<S: SystemOps>(sys: &S) -> Option<String> {
+    for dev in BOOT_DEVICE_CANDIDATES {
+        if Path::new(dev).exists()
+            && sys
+                .mount(
+                    Some(*dev),
+                    BOOT_MOUNT_POINT,
+                    "vfat",
+                    MsFlags::MS_RDONLY,
+                    None,
+                )
+                .is_ok()
+        {
+            return Some((*dev).to_string());
+        }
+    }
+    None
+}
+
+pub fn mount_boot_partition<S: SystemOps>(sys: &S) -> Result<(), RouterError> {
+    if sys.getpid() != Pid::from_raw(1) {
+        return Ok(());
+    }
+
+    if let Err(e) = fs::create_dir_all(BOOT_MOUNT_POINT) {
+        println!(
+            "[init] Warning: failed to create {} directory: {}",
+            BOOT_MOUNT_POINT, e
+        );
+        return Ok(());
+    }
+
+    let start = Instant::now();
+    let mut mounted_device = None;
+
+    println!("[init] Waiting for boot partition to become available...");
+
+    while start.elapsed() < BOOT_MOUNT_TIMEOUT {
+        if let Some(dev) = try_mount_candidates(sys) {
+            mounted_device = Some(dev);
+            break;
+        }
+        thread::sleep(BOOT_MOUNT_POLL_INTERVAL);
+    }
+
+    let Some(dev) = mounted_device else {
+        return Err(RouterError::from(
+            "Timeout reached. Could not find or mount boot partition from any candidate device.",
+        ));
+    };
+
+    println!(
+        "[init] Successfully mounted {} on {} as read-only.",
+        dev, BOOT_MOUNT_POINT
+    );
 
     Ok(())
 }
@@ -252,6 +319,15 @@ mod tests {
         assert_eq!(calls[2].2, "devtmpfs");
         assert_eq!(calls[3].1, "/run");
         assert_eq!(calls[3].2, "tmpfs");
+    }
+
+    #[test]
+    fn test_mount_boot_partition_failure() {
+        let sys = MockSystem::new();
+        let result = mount_boot_partition(&sys);
+        assert!(result.is_err());
+        let calls = sys.mount_calls.lock().unwrap();
+        assert!(calls.is_empty());
     }
 
     #[test]

@@ -110,18 +110,25 @@ case "$ARCH" in
         mkdir -p "$RPI_STAGING/lib/modules"
         find "${RPI_DEB_DIR}/lib/modules" -mindepth 1 -maxdepth 1 -type d | while read -r mod_dir; do
             rel_name=$(basename "$mod_dir")
-            mkdir -p "$RPI_STAGING/lib/modules/${rel_name}/kernel/net/netfilter"
-            if [ -d "$mod_dir/kernel/net/netfilter" ]; then
-                cp -r "$mod_dir/kernel/net/netfilter"/* "$RPI_STAGING/lib/modules/${rel_name}/kernel/net/netfilter/" 2>/dev/null || true
-            fi
-            if [ -d "$mod_dir/kernel/net/ipv4" ]; then
-                mkdir -p "$RPI_STAGING/lib/modules/${rel_name}/kernel/net/ipv4"
-                cp -r "$mod_dir/kernel/net/ipv4"/* "$RPI_STAGING/lib/modules/${rel_name}/kernel/net/ipv4/" 2>/dev/null || true
-            fi
-            if [ -d "$mod_dir/kernel/net/ipv6" ]; then
-                mkdir -p "$RPI_STAGING/lib/modules/${rel_name}/kernel/net/ipv6"
-                cp -r "$mod_dir/kernel/net/ipv6"/* "$RPI_STAGING/lib/modules/${rel_name}/kernel/net/ipv6/" 2>/dev/null || true
-            fi
+            # Stage required kernel module directories (netfilter, filesystems, storage drivers)
+            DIRECT_DIRS=(
+                "kernel/net/netfilter"
+                "kernel/net/ipv4"
+                "kernel/net/ipv6"
+                "kernel/fs/fat"
+                "kernel/fs/nls"
+                "kernel/drivers/block"
+                "kernel/drivers/ata"
+                "kernel/drivers/scsi"
+                "kernel/drivers/usb/storage"
+                "kernel/drivers/mmc"
+            )
+            for dir_path in "${DIRECT_DIRS[@]}"; do
+                if [ -d "$mod_dir/$dir_path" ]; then
+                    mkdir -p "$RPI_STAGING/lib/modules/${rel_name}/$dir_path"
+                    cp -r "$mod_dir/$dir_path"/* "$RPI_STAGING/lib/modules/${rel_name}/$dir_path/" 2>/dev/null || true
+                fi
+            done
 
             # Stage USB network drivers and their dependencies
             if [ -d "${RPI_DEB_DIR}/lib/modules/${rel_name}/kernel/drivers/net/usb" ]; then

@@ -30,7 +30,7 @@ CURDIR=$(pwd)
 STAGING="target/${ARCH}/staging"
 TEST_BOOT="target/${ARCH}/test_boot"
 BINARY="target/${RUST_TARGET}/release/trimrouter"
-DIRECT_DEPS="virtio_net virtio_pci virtio_mmio nft_masq nft_chain_nat nft_ct"
+DIRECT_DEPS="virtio_net virtio_pci virtio_mmio virtio_blk usb_storage uas sd_mod mmc_block sdhci sdhci_pci ahci nft_masq nft_chain_nat nft_ct fat vfat nls_cp437 nls_ascii nls_utf8"
 
 echo "[build] Creating initramfs staging area for ${ARCH}..."
 rm -rf "$STAGING"
