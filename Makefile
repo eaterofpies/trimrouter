@@ -1,9 +1,10 @@
 # =========================================================================
-# Trimrouter main Makefile (Supports separate targets for each architecture)
+# trimrouter main Makefile (Supports separate targets for each architecture)
 # =========================================================================
 
-.PHONY: all clean qemu test run-qemu help \
+.PHONY: all clean help \
         initramfs-x86_64 initramfs-arm64 initramfs-armhf \
+        image-x86_64 image-arm64 image-armhf \
         qemu-x86_64 qemu-arm64 qemu-armhf \
         test-x86_64 test-arm64 test-armhf
 
@@ -19,28 +20,19 @@ RUST_TARGET_arm64  := aarch64-unknown-linux-musl
 RUST_TARGET_armhf  := arm-unknown-linux-musleabihf
 
 # Convenience default targets for host (x86_64)
-all: initramfs-x86_64
-
-qemu: qemu-x86_64
-test: test-x86_64
+all: image-x86_64
 
 help:
 	@echo "trimrouter build targets (Supported architectures: x86_64, arm64, armhf):"
 	@echo ""
 	@echo "  Host (x86_64)"
-	@echo "    make / make all          Build static binary and initramfs for x86_64"
-	@echo "    make qemu                Boot x86_64 initramfs in QEMU"
-	@echo "    make test                Run integration test suite against x86_64 QEMU VM"
-	@echo ""
-	@echo "  Raspberry Pi (arm64)"
-	@echo "    make run-qemu            Boot the Raspberry Pi image in QEMU (-M raspi3b)"
+	@echo "    make / make all          Build static binary and VM image for x86_64"
 	@echo ""
 	@echo "  Architecture-specific"
 	@echo "    make initramfs-<arch>    Build initramfs for a specific arch (x86_64, arm64, armhf)"
-	@echo "    make qemu-<arch>         Boot initramfs for a specific arch in QEMU"
+	@echo "    make image-<arch>        Build partitioned disk/SD image for a specific arch"
+	@echo "    make qemu-<arch>         Boot VM image for a specific arch in QEMU"
 	@echo "    make test-<arch>         Run integration tests for a specific arch"
-	@echo "    make image-<arch>        Build Raspberry Pi .img for a specific arch (arm64, armhf)"
-	@echo "    make run-qemu-<arch>     Boot Raspberry Pi image for a specific arch in QEMU"
 	@echo ""
 	@echo "  Misc"
 	@echo "    make clean               Delete all build artifacts"
@@ -53,10 +45,12 @@ define ARCH_RULES
 
 initramfs-$(1): target/$(1)/initramfs.cpio.gz
 
-qemu-$(1): target/$(1)/initramfs.cpio.gz
+image-$(1): target/$(1)/trimrouter.img
+
+qemu-$(1): target/$(1)/trimrouter.img
 	@ARCH=$(1) ./test_qemu.sh
 
-test-$(1): target/$(1)/initramfs.cpio.gz
+test-$(1): target/$(1)/trimrouter.img
 	@echo "[test] Running integration tests for target architecture $(1)..."
 	@TEST_ARCH=$(1) cargo test --test wan_dhcp_test -- --nocapture
 
@@ -74,6 +68,10 @@ target/$(1)/test_boot/.kernel_extracted: scripts/extract_kernel.sh
 # Rule for building the target initramfs cpio archive
 target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/test_boot/.kernel_extracted scripts/build_initramfs.sh
 	@./scripts/build_initramfs.sh $(1)
+
+# Rule for building the raw disk/SD image
+target/$(1)/trimrouter.img: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/initramfs.cpio.gz scripts/build_image.sh
+	@./scripts/build_image.sh $(1)
 endef
 
 # =========================================================================
@@ -81,11 +79,9 @@ endef
 # =========================================================================
 $(foreach arch,$(ARCHS),$(eval $(call ARCH_RULES,$(arch))))
 
+
 # Clean build artifacts
 clean:
 	@echo "[clean] Cleaning all build targets and staging directories..."
 	@cargo clean
 	@rm -rf target/x86_64 target/arm64 target/armhf target/trimrouter.img target/pi_boot
-
-# Include Raspberry Pi deployment build rules
-include Makefile.rpi

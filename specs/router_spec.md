@@ -194,25 +194,13 @@ ldd target/x86_64-unknown-linux-musl/release/trimrouter
 
 To verify `trimrouter`'s behavior as a real PID 1 init process, we boot it in QEMU alongside a second client VM connected over a virtual socket link.
 
-#### 5.2.1 Initramfs Creation
-In practice the initramfs is built automatically by `make` (or `make test`) which calls `scripts/build_initramfs.sh`. The output is placed at `target/x86_64/initramfs.cpio.gz` and includes the binary, kernel modules, and a minimal device layout.
-
-Conceptually the steps are:
-1. Copy the statically compiled binary to a staging folder as `init`:
-   ```bash
-   mkdir -p staging
-   cp target/x86_64-unknown-linux-musl/release/trimrouter staging/init
-   chmod +x staging/init
-   ```
-2. Pack the directory into a gzipped cpio archive:
-   ```bash
-   cd staging
-   find . -print0 | cpio --null -ov --format=newc | gzip -9 > ../target/x86_64/initramfs.cpio.gz
-   cd ..
-   ```
+#### 5.2.1 Initramfs & VM Image Creation
+The build pipeline (`make` or `make test`) automatically:
+1. Calls `scripts/build_initramfs.sh` to construct the initramfs archive at `target/x86_64/initramfs.cpio.gz` including the statically linked `trimrouter` binary (mapped to `/init`) and required Linux kernel modules.
+2. Calls `scripts/build_image.sh` to package the kernel (`vmlinuz`), the initramfs (`initramfs.cpio.gz`), and a `cmdline.txt` parameter file into a partitioned, bootable FAT32 raw disk image file at `target/x86_64/trimrouter.img`.
 
 #### 5.2.2 Running the Router VM
-We boot the router VM with two NICs:
+We boot the router VM with the partitioned raw disk image attached as a VirtIO storage drive along with two virtual network interfaces:
 *   **eth0 (WAN)**: Connected to QEMU's User Network (which runs a built-in DHCP server providing IP addresses in the `10.0.2.0/24` range and NATting traffic to the host's internet).
 *   **eth1 (LAN)**: Connected to a local TCP socket listener (`127.0.0.1:1234`) acting as a virtual switch.
 
@@ -221,6 +209,7 @@ qemu-system-x86_64 \
   -kernel /path/to/vmlinuz \
   -initrd initramfs.cpio.gz \
   -append "console=ttyS0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
+  -drive file=target/x86_64/trimrouter.img,format=raw,media=disk,if=virtio \
   -netdev user,id=wan0,net=10.0.2.0/24 \
   -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
   -netdev socket,id=lan0,listen=127.0.0.1:1234 \

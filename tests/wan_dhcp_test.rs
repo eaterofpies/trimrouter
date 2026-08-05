@@ -351,6 +351,8 @@ async fn startup_stage() -> TestEnv {
 
     let kernel = format!("target/{test_arch}/test_boot/vmlinuz");
     let initrd = format!("target/{test_arch}/initramfs.cpio.gz");
+    let image = format!("target/{test_arch}/trimrouter.img");
+    let drive_arg = format!("file={},format=raw,media=disk,if=virtio", image);
 
     let dev_arg = if test_arch == "x86_64" {
         "virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56,romfile=".to_string()
@@ -374,6 +376,8 @@ async fn startup_stage() -> TestEnv {
             &initrd,
             "-append",
             &append_arg,
+            "-drive",
+            &drive_arg,
             "-netdev",
             "stream,id=wan0,server=off,addr.type=unix,addr.path=target/wan.sock",
             "-device",

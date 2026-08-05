@@ -40,11 +40,11 @@ You will also need `cpio`, `qemu-system-x86_64`, `parted`, `mtools`, and standar
 
 ### Building and Packaging
 
-Compile the static release binary and package it into a compressed `cpio` initramfs archive:
+Compile the static release binary, package it into a compressed `cpio` initramfs archive, and wrap it into a bootable FAT32 VM disk image:
 ```bash
 make
 ```
-This generates `target/x86_64/initramfs.cpio.gz` which contains the statically linked `trimrouter` binary mapped to `/init` and required Linux kernel modules.
+This generates the bootable raw VM disk image at `target/x86_64/trimrouter.img` (which bundles the kernel `vmlinuz` and `initramfs.cpio.gz` containing the statically linked `trimrouter` binary mapped to `/init` and required Linux kernel modules).
 
 Configuration is passed via kernel command-line parameters:
 - `trimrouter.wan_mac=<mac>` — **Required.** MAC of the WAN interface.

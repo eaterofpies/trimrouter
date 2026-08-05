@@ -7,11 +7,12 @@ set -e
 # Detect target architecture (defaults to x86_64)
 ARCH=${ARCH:-x86_64}
 
-# Ensure the kernel is downloaded and the initramfs archive is compiled
-make target/${ARCH}/initramfs.cpio.gz ARCH=${ARCH}
+# Ensure the kernel is downloaded and the VM image is compiled
+make target/${ARCH}/trimrouter.img ARCH=${ARCH}
 
 KERNEL="target/${ARCH}/test_boot/vmlinuz"
 INITRAMFS="target/${ARCH}/initramfs.cpio.gz"
+IMAGE="target/${ARCH}/trimrouter.img"
 
 if [ ! -f "$KERNEL" ]; then
     echo "[qemu] ERROR: Kernel image not found at $KERNEL."
@@ -28,6 +29,7 @@ if [ "$ARCH" = "x86_64" ]; then
       -kernel "$KERNEL" \
       -initrd "$INITRAMFS" \
       -append "console=ttyS0 quiet panic=-1 net.ifnames=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
+      -drive file="$IMAGE",format=raw,media=disk,if=virtio \
       -netdev user,id=wan0,net=10.0.2.0/24 \
       -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
       -netdev user,id=lan0,net=192.168.1.0/24 \
@@ -35,29 +37,29 @@ if [ "$ARCH" = "x86_64" ]; then
       -nographic
 elif [ "$ARCH" = "arm64" ]; then
     exec qemu-system-aarch64 \
-      -M virt \
+      -M raspi3b \
       -cpu cortex-a53 \
-      -m 256 \
-      -kernel "$KERNEL" \
-      -initrd "$INITRAMFS" \
-      -append "console=ttyAMA0 quiet panic=-1 net.ifnames=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
-      -netdev user,id=wan0,net=10.0.2.0/24 \
-      -device virtio-net-device,netdev=wan0,mac=52:54:00:12:34:56 \
-      -netdev user,id=lan0,net=192.168.1.0/24 \
-      -device virtio-net-device,netdev=lan0,mac=52:54:00:12:34:57 \
+      -m 1024 \
+      -kernel "target/arm64/pi_boot/kernel8.img" \
+      -dtb "target/arm64/pi_boot/bcm2710-rpi-3-b-plus.dtb" \
+      -initrd "target/arm64/pi_initramfs.cpio.gz" \
+      -drive file="$IMAGE",if=sd,format=raw \
+      -device usb-net,netdev=lan0,mac=52:54:00:12:34:57 \
+      -netdev user,id=lan0 \
+      -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0 dwc_otg.lpm_enable=0 dwc_otg.fiq_enable=0 dwc_otg.fiq_fsm_enable=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
       -nographic
 elif [ "$ARCH" = "armhf" ]; then
-    exec qemu-system-arm \
-      -M virt \
-      -cpu cortex-a7 \
-      -m 256 \
-      -kernel "$KERNEL" \
-      -initrd "$INITRAMFS" \
-      -append "console=ttyAMA0 quiet panic=-1 net.ifnames=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
-      -netdev user,id=wan0,net=10.0.2.0/24 \
-      -device virtio-net-device,netdev=wan0,mac=52:54:00:12:34:56 \
-      -netdev user,id=lan0,net=192.168.1.0/24 \
-      -device virtio-net-device,netdev=lan0,mac=52:54:00:12:34:57 \
+    exec qemu-system-aarch64 \
+      -M raspi3b \
+      -cpu cortex-a53 \
+      -m 1024 \
+      -kernel "target/armhf/pi_boot/kernel.img" \
+      -dtb "target/armhf/pi_boot/bcm2708-rpi-zero-w.dtb" \
+      -initrd "target/armhf/pi_initramfs.cpio.gz" \
+      -drive file="$IMAGE",if=sd,format=raw \
+      -device usb-net,netdev=lan0,mac=52:54:00:12:34:57 \
+      -netdev user,id=lan0 \
+      -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0 dwc_otg.lpm_enable=0 dwc_otg.fiq_enable=0 dwc_otg.fiq_fsm_enable=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
       -nographic
 else
     echo "[qemu] ERROR: Unsupported architecture: $ARCH"
