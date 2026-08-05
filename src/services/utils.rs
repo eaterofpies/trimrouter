@@ -216,6 +216,71 @@ pub async fn send_raw_packet(
     }
 }
 
+/// A generic asynchronous wrapper around an AF_PACKET raw socket for sending
+/// and receiving raw Ethernet frames on a specific network interface.
+pub struct RawPacketSocket {
+    socket: Option<tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>>,
+}
+
+impl RawPacketSocket {
+    pub fn new(interface_name: &str) -> Result<Self, std::io::Error> {
+        let raw_fd = open_raw_socket(interface_name).map_err(std::io::Error::other)?;
+        let socket = tokio::io::unix::AsyncFd::new(raw_fd).inspect_err(|_| unsafe {
+            let _ = libc::close(raw_fd);
+        })?;
+        Ok(Self {
+            socket: Some(socket),
+        })
+    }
+
+    pub async fn send(&self, frame: &[u8]) -> Result<(), std::io::Error> {
+        let socket = self.socket.as_ref().expect("socket is active");
+        send_raw_packet(socket, frame).await;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let socket = self.socket.as_ref().expect("socket is active");
+        read_raw_packet(socket, buf).await
+    }
+
+    pub async fn recv_timeout(
+        &self,
+        buf: &mut [u8],
+        timeout: std::time::Duration,
+    ) -> Result<Option<usize>, std::io::Error> {
+        let socket = self.socket.as_ref().expect("socket is active");
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let Ok(Ok(mut guard)) = tokio::time::timeout(remaining, socket.readable()).await else {
+                return Ok(None);
+            };
+
+            if let Some(n) = try_read_raw(&mut guard, buf)? {
+                return Ok(Some(n));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for RawPacketSocket {
+    fn drop(&mut self) {
+        if let Some(async_fd) = self.socket.take() {
+            let fd = async_fd.into_inner();
+            unsafe {
+                let _ = libc::close(fd);
+            }
+        }
+    }
+}
+
 pub fn get_timestamp_prefix() -> String {
     let now = chrono::Utc::now();
     now.format("[%Y-%m-%dT%H:%M:%S%.3fZ] ").to_string()

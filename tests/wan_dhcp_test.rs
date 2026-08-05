@@ -128,9 +128,37 @@ struct TestEnv {
     _wan_isp_handle: tokio::task::JoinHandle<bool>,
     wan_verification_rx: tokio::sync::mpsc::Receiver<String>,
     wan_cmd_tx: tokio::sync::mpsc::Sender<String>,
+    /// Verification signals that arrived before WAN_DHCP_DONE during startup.
+    /// verify_dhcp_client_source_ip drains this first so no signals are lost.
+    pending_verification: Vec<String>,
     lan_client: UnixStreamMock,
     leased_ip: Option<Ipv4Addr>,
     router_lan_mac: MacAddr,
+}
+
+impl TestEnv {
+    async fn wait_for_signal(&mut self, target: &str, timeout: Duration) -> bool {
+        if let Some(pos) = self.pending_verification.iter().position(|x| x == target) {
+            self.pending_verification.remove(pos);
+            return true;
+        }
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            tokio::select! {
+                res = self.wan_verification_rx.recv() => {
+                    if let Some(msg) = res {
+                        if msg == target {
+                            return true;
+                        }
+                        self.pending_verification.push(msg);
+                    }
+                }
+                _ = sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        false
+    }
 }
 
 impl Drop for TestEnv {
@@ -168,6 +196,12 @@ macro_rules! run_step {
 }
 
 async fn run_all_steps(env: &mut TestEnv, passed: &mut usize, failed: &mut usize) {
+    run_step!(
+        "dhcp_client_source_ip",
+        verify_dhcp_client_source_ip(env),
+        *passed,
+        *failed
+    );
     run_step!(
         "wan_and_lan_dhcp",
         verify_wan_and_lan_dhcp(env),
@@ -384,17 +418,27 @@ async fn startup_stage() -> TestEnv {
         }
     });
 
-    // F. Await WAN DHCP lease negotiation
+    // F. Await WAN DHCP lease negotiation.
+    //    Print and buffer every verification signal that arrives before
+    //    WAN_DHCP_DONE so we can check ordering in the logs and hand the
+    //    signals to verify_dhcp_client_source_ip later.
     println!("[test-env] Awaiting WAN DHCP lease negotiation...");
     let mut rx = verification_rx;
     let mut wan_dhcp_done = false;
+    let mut pending_verification: Vec<String> = Vec::new();
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(35) {
-        if let Some(msg) = rx.recv().await
-            && msg == "WAN_DHCP_DONE"
-        {
-            wan_dhcp_done = true;
-            break;
+        if let Some(msg) = rx.recv().await {
+            if msg == "WAN_DHCP_DONE" {
+                wan_dhcp_done = true;
+                break;
+            } else {
+                // Log the signal so the ordering relative to qemu-stdout lines
+                // (e.g. "Successfully assigned 192.168.1.1/24 to lan") is
+                // visible in the test output.
+                println!("[test-env] Buffered verification signal: {}", msg);
+                pending_verification.push(msg);
+            }
         }
     }
     assert!(
@@ -510,10 +554,99 @@ async fn startup_stage() -> TestEnv {
         _wan_isp_handle: wan_isp_handle,
         wan_verification_rx: rx,
         wan_cmd_tx,
+        pending_verification,
         lan_client,
         leased_ip: Some(leased_ip),
         router_lan_mac,
     }
+}
+
+fn process_verification_message(
+    msg: &str,
+    discovers_verified: &mut usize,
+    expected_discovers: usize,
+) -> Result<bool, String> {
+    match msg {
+        "DISCOVER_SRC_IP_VERIFIED" => {
+            *discovers_verified += 1;
+            println!(
+                "[test] DHCPDISCOVER #{}/{} source IP verified as 0.0.0.0.",
+                discovers_verified, expected_discovers
+            );
+            Ok(false)
+        }
+        "DISCOVER_SRC_IP_WRONG" => Err("A DHCPDISCOVER was sent with a non-zero source IP. \
+             The WAN DHCP client must use 0.0.0.0 before a lease \
+             is acquired (RFC 2131 §4.1)."
+            .to_string()),
+        "REQUEST_SRC_IP_VERIFIED" => {
+            println!("[test] DHCPREQUEST source IP verified as 0.0.0.0.");
+            if *discovers_verified != expected_discovers {
+                return Err(format!(
+                    "Expected {} verified DISCOVERs before REQUEST",
+                    expected_discovers
+                ));
+            }
+            println!("[test] DHCP client source IP verified successfully.");
+            Ok(true)
+        }
+        "REQUEST_SRC_IP_WRONG" => Err("Initial DHCPREQUEST was sent with a non-zero source IP. \
+             The WAN DHCP client must use 0.0.0.0 in ciaddr before a \
+             lease is confirmed (RFC 2131 §4.3.2)."
+            .to_string()),
+        _ => Ok(false),
+    }
+}
+
+async fn verify_dhcp_client_source_ip(env: &mut TestEnv) {
+    const DISCOVERS_TO_VERIFY: usize = 3;
+    println!(
+        "[test] Waiting for {DISCOVERS_TO_VERIFY} DHCPDISCOVER + 1 DHCPREQUEST \
+         source-IP verifications from mock WAN ISP..."
+    );
+    let start = std::time::Instant::now();
+    let mut discovers_verified = 0;
+
+    // Process signals that were buffered during startup_stage first so none
+    // are lost.  These are the signals most likely to reveal the ordering bug
+    // (LAN IP assigned before the first DISCOVER).
+    let buffered: Vec<String> = std::mem::take(&mut env.pending_verification);
+    for msg in buffered {
+        println!("[test] Replaying buffered signal: {msg}");
+        match process_verification_message(&msg, &mut discovers_verified, DISCOVERS_TO_VERIFY) {
+            Ok(true) => return,
+            Ok(false) => {
+                // If it's a verification signal for other steps (e.g. NTP_VERIFIED), buffer it!
+                if msg != "DISCOVER_SRC_IP_VERIFIED" && msg != "REQUEST_SRC_IP_VERIFIED" {
+                    env.pending_verification.push(msg);
+                }
+            }
+            Err(e) => panic!("{}", e),
+        }
+    }
+
+    // Allow 35 s: initial discover (0 s) + retry 1 (~4 s) + retry 2 (~8 s) + buffer
+    while start.elapsed() < Duration::from_secs(35) {
+        tokio::select! {
+            Some(msg) = env.wan_verification_rx.recv() => {
+                match process_verification_message(&msg, &mut discovers_verified, DISCOVERS_TO_VERIFY) {
+                    Ok(true) => return,
+                    Ok(false) => {
+                        // If it's a verification signal for other steps (e.g. NTP_VERIFIED), buffer it!
+                        if msg != "DISCOVER_SRC_IP_VERIFIED" && msg != "REQUEST_SRC_IP_VERIFIED" {
+                            env.pending_verification.push(msg);
+                        }
+                    }
+                    Err(e) => panic!("{}", e),
+                }
+            }
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    panic!(
+        "Timed out: verified {discovers_verified}/{DISCOVERS_TO_VERIFY} DISCOVERs \
+         — check source-IP verification signals from mock WAN ISP"
+    );
 }
 
 async fn verify_wan_and_lan_dhcp(env: &TestEnv) {
@@ -563,19 +696,9 @@ async fn verify_nat_routing(env: &mut TestEnv) {
     );
 
     // Verify WAN mock server received it too
-    let mut icmp_verified = false;
-    let start_wan = std::time::Instant::now();
-    while start_wan.elapsed() < Duration::from_secs(5) {
-        tokio::select! {
-            Some(msg) = env.wan_verification_rx.recv() => {
-                if msg == "ICMP_VERIFIED" {
-                    icmp_verified = true;
-                    break;
-                }
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-    }
+    let icmp_verified = env
+        .wait_for_signal("ICMP_VERIFIED", Duration::from_secs(5))
+        .await;
     assert!(
         icmp_verified,
         "WAN mock server did not verify NATed ICMP Request"
@@ -625,19 +748,9 @@ async fn verify_dns_forwarding(env: &mut TestEnv) {
     );
 
     // Verify WAN mock server received it too
-    let mut dns_verified = false;
-    let start_wan = std::time::Instant::now();
-    while start_wan.elapsed() < Duration::from_secs(5) {
-        tokio::select! {
-            Some(msg) = env.wan_verification_rx.recv() => {
-                if msg == "DNS_VERIFIED" {
-                    dns_verified = true;
-                    break;
-                }
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-    }
+    let dns_verified = env
+        .wait_for_signal("DNS_VERIFIED", Duration::from_secs(5))
+        .await;
     assert!(
         dns_verified,
         "WAN mock server did not verify forwarded DNS query"
@@ -647,19 +760,9 @@ async fn verify_dns_forwarding(env: &mut TestEnv) {
 
 async fn verify_sntp_sync(env: &mut TestEnv) {
     println!("[test] Awaiting NTP time synchronization...");
-    let mut ntp_verified = false;
-    let start_wan = std::time::Instant::now();
-    while start_wan.elapsed() < Duration::from_secs(20) {
-        tokio::select! {
-            Some(msg) = env.wan_verification_rx.recv() => {
-                if msg == "NTP_VERIFIED" {
-                    ntp_verified = true;
-                    break;
-                }
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-    }
+    let ntp_verified = env
+        .wait_for_signal("NTP_VERIFIED", Duration::from_secs(20))
+        .await;
     assert!(
         ntp_verified,
         "NTP synchronization request was not verified on the WAN interface"
@@ -669,19 +772,9 @@ async fn verify_sntp_sync(env: &mut TestEnv) {
 
 async fn verify_dhcp_renewal(env: &mut TestEnv) {
     println!("[test] Waiting for DHCP lease renewal from WAN client...");
-    let mut renewal_verified = false;
-    let start_wan = std::time::Instant::now();
-    while start_wan.elapsed() < Duration::from_secs(35) {
-        tokio::select! {
-            Some(msg) = env.wan_verification_rx.recv() => {
-                if msg == "DHCP_RENEWAL_VERIFIED" {
-                    renewal_verified = true;
-                    break;
-                }
-            }
-            _ = sleep(Duration::from_millis(50)) => {}
-        }
-    }
+    let renewal_verified = env
+        .wait_for_signal("DHCP_RENEWAL_VERIFIED", Duration::from_secs(35))
+        .await;
     assert!(
         renewal_verified,
         "WAN mock server did not verify DHCP lease renewal"
@@ -694,18 +787,29 @@ async fn run_mock_wan_isp(
     verification_tx: tokio::sync::mpsc::Sender<String>,
     mut wan_cmd_rx: tokio::sync::mpsc::Receiver<String>,
 ) -> bool {
-    let xid;
-    let client_mac;
+    let mut xid: u32 = 0;
+    let mut client_mac = MacAddr::zero();
 
-    // 1. Receive DHCPDISCOVER
-    println!("[isp-test] Waiting for DHCPDISCOVER...");
+    // 1. Collect the first 3 DHCPDISCOVER retries and verify each carries
+    //    0.0.0.0 as the IPv4 source address (RFC 2131 §4.1).
+    //
+    // The OFFER is intentionally withheld until all 3 DISCOVERs are seen so
+    // that the retry path is exercised. The client's backoff schedule means
+    // the second arrives after ~4 s and the third after a further ~8 s.
+    const DISCOVERS_TO_VERIFY: usize = 3;
+    println!("[isp-test] Waiting for {DISCOVERS_TO_VERIFY} DHCPDISCOVER packets...");
     let start = std::time::Instant::now();
-    let timeout_dur = Duration::from_secs(30);
+    let timeout_dur = Duration::from_secs(60);
+    let mut discovers_seen = 0;
 
     loop {
         if start.elapsed() >= timeout_dur {
-            println!("[isp-test] Timeout waiting for DHCPDISCOVER");
-            return false;
+            if discovers_seen == 0 {
+                println!("[isp-test] Timeout waiting for DHCPDISCOVER");
+                return false;
+            }
+            // Proceed with whatever we collected if the deadline is hit.
+            break;
         }
         let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await
         {
@@ -723,16 +827,44 @@ async fn run_mock_wan_isp(
                 .opts()
                 .get(dhcproto::v4::OptionCode::MessageType);
             if let Some(dhcproto::v4::DhcpOption::MessageType(MessageType::Discover)) = msg_type {
-                client_mac = MacAddr(
-                    dhcp_discover.chaddr()[0],
-                    dhcp_discover.chaddr()[1],
-                    dhcp_discover.chaddr()[2],
-                    dhcp_discover.chaddr()[3],
-                    dhcp_discover.chaddr()[4],
-                    dhcp_discover.chaddr()[5],
+                // Capture MAC and XID from the first DISCOVER only.
+                if discovers_seen == 0 {
+                    client_mac = MacAddr(
+                        dhcp_discover.chaddr()[0],
+                        dhcp_discover.chaddr()[1],
+                        dhcp_discover.chaddr()[2],
+                        dhcp_discover.chaddr()[3],
+                        dhcp_discover.chaddr()[4],
+                        dhcp_discover.chaddr()[5],
+                    );
+                    xid = dhcp_discover.xid();
+                }
+                discovers_seen += 1;
+
+                // Verify the IPv4 source address of the enclosing packet.
+                let src_ip = parse_ipv4_source(&frame);
+                println!(
+                    "[isp-test] DHCPDISCOVER #{discovers_seen}/{DISCOVERS_TO_VERIFY} \
+                     IPv4 source: {src_ip:?}"
                 );
-                xid = dhcp_discover.xid();
-                break;
+                if src_ip == Some(Ipv4Addr::UNSPECIFIED) {
+                    let _ = verification_tx
+                        .send("DISCOVER_SRC_IP_VERIFIED".to_string())
+                        .await;
+                } else {
+                    println!(
+                        "[isp-test] ERROR: DHCPDISCOVER #{discovers_seen} sent from \
+                         {src_ip:?} — expected 0.0.0.0!"
+                    );
+                    let _ = verification_tx
+                        .send("DISCOVER_SRC_IP_WRONG".to_string())
+                        .await;
+                }
+
+                if discovers_seen >= DISCOVERS_TO_VERIFY {
+                    println!("[isp-test] Collected {DISCOVERS_TO_VERIFY} DISCOVERs.");
+                    break;
+                }
             }
         }
     }
@@ -755,7 +887,10 @@ async fn run_mock_wan_isp(
         return false;
     }
 
-    // 3. Wait for DHCPREQUEST
+    // 3. Wait for DHCPREQUEST and verify its IPv4 source address is 0.0.0.0.
+    //
+    // RFC 2131 §4.3.2: before a lease is confirmed ciaddr MUST be 0.0.0.0 and
+    // the UDP source address MUST therefore also be 0.0.0.0.
     println!("[isp-test] Waiting for DHCPREQUEST...");
     let start = std::time::Instant::now();
     let timeout_dur = Duration::from_secs(5);
@@ -781,6 +916,22 @@ async fn run_mock_wan_isp(
             if let Some(dhcproto::v4::DhcpOption::MessageType(MessageType::Request)) = msg_type
                 && dhcp_request.xid() == xid
             {
+                // Verify the IPv4 source address of the enclosing packet.
+                let src_ip = parse_ipv4_source(&frame);
+                println!("[isp-test] DHCPREQUEST IPv4 source: {:?}", src_ip);
+                if src_ip == Some(Ipv4Addr::UNSPECIFIED) {
+                    let _ = verification_tx
+                        .send("REQUEST_SRC_IP_VERIFIED".to_string())
+                        .await;
+                } else {
+                    println!(
+                        "[isp-test] ERROR: DHCPREQUEST sent from {:?} — expected 0.0.0.0!",
+                        src_ip
+                    );
+                    let _ = verification_tx
+                        .send("REQUEST_SRC_IP_WRONG".to_string())
+                        .await;
+                }
                 break;
             }
         }
@@ -1032,6 +1183,17 @@ async fn run_mock_wan_isp(
     }
 
     true
+}
+
+/// Extracts the IPv4 source address from a raw Ethernet frame.
+/// Returns None if the frame is not a valid IPv4 packet.
+fn parse_ipv4_source(frame: &[u8]) -> Option<Ipv4Addr> {
+    let eth = pnet::packet::ethernet::EthernetPacket::new(frame)?;
+    if eth.get_ethertype() != pnet::packet::ethernet::EtherTypes::Ipv4 {
+        return None;
+    }
+    let ip = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())?;
+    Some(ip.get_source())
 }
 
 fn parse_dhcp_message(

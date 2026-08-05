@@ -1,10 +1,8 @@
-use super::utils::{SharedWanLease, WanLease, get_interface_mac, wait_shutdown};
+use super::utils::{RawPacketSocket, SharedWanLease, WanLease, get_interface_mac, wait_shutdown};
+use crate::packet::build_raw_packet;
 use futures_util::TryStreamExt;
-use nix::sys::socket::{setsockopt, sockopt};
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
-use std::net::UdpSocket as StdUdpSocket;
-use tokio::net::UdpSocket;
 
 const DEFAULT_LEASE_SECS: u32 = 3600;
 const MAX_RETRY_DELAY_SECS: u32 = 64;
@@ -73,8 +71,83 @@ enum ParseAckResult {
     Nak,
     None,
 }
+
+/// A wrapper around a RawPacketSocket that handles DHCP-specific Layer-2
+/// packet formatting, filtering, and payload parsing.
+struct DhcpClientSocket {
+    raw_socket: RawPacketSocket,
+    mac: MacAddr,
+}
+
+impl DhcpClientSocket {
+    fn new(interface_name: &str, mac: MacAddr) -> Result<Self, std::io::Error> {
+        let raw_socket = RawPacketSocket::new(interface_name)?;
+        Ok(Self { raw_socket, mac })
+    }
+
+    async fn send(
+        &self,
+        message: &dhcproto::v4::Message,
+        dest_ip: Ipv4Addr,
+    ) -> Result<(), DhcpError> {
+        use dhcproto::{Encodable, Encoder};
+        let mut payload = Vec::new();
+        message
+            .encode(&mut Encoder::new(&mut payload))
+            .map_err(|e| DhcpError::Protocol(e.to_string()))?;
+
+        let src_ip = if message.ciaddr().is_unspecified() {
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            message.ciaddr()
+        };
+
+        let frame = build_raw_packet(
+            self.mac,
+            MacAddr::broadcast(),
+            src_ip,
+            dest_ip,
+            dhcproto::v4::CLIENT_PORT,
+            dhcproto::v4::SERVER_PORT,
+            &payload,
+        );
+        self.raw_socket.send(&frame).await?;
+        Ok(())
+    }
+
+    async fn recv(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<dhcproto::v4::Message>, DhcpError> {
+        let mut raw_buf = [0u8; 2048];
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let Some(n) = self
+                .raw_socket
+                .recv_timeout(&mut raw_buf, remaining)
+                .await?
+            else {
+                return Ok(None);
+            };
+
+            if let Some(dhcp) =
+                super::utils::parse_dhcp_payload(&raw_buf[..n], dhcproto::v4::CLIENT_PORT)
+            {
+                return Ok(Some(dhcp));
+            }
+        }
+        Ok(None)
+    }
+}
+
 struct DhcpClientInternal {
-    socket: UdpSocket,
+    socket: DhcpClientSocket,
     mac: MacAddr,
     lease_state: SharedWanLease,
     wan_interface: String,
@@ -82,7 +155,7 @@ struct DhcpClientInternal {
 
 impl DhcpClientInternal {
     fn new(
-        socket: UdpSocket,
+        socket: DhcpClientSocket,
         mac: MacAddr,
         lease_state: SharedWanLease,
         wan_interface: String,
@@ -304,7 +377,6 @@ impl DhcpClientInternal {
         timeout: std::time::Duration,
     ) -> Result<Option<DhcpOffer>, DhcpError> {
         let start = std::time::Instant::now();
-        let mut buf = [0u8; 2048];
 
         while start.elapsed() < timeout {
             let remaining = timeout.saturating_sub(start.elapsed());
@@ -312,11 +384,11 @@ impl DhcpClientInternal {
                 break;
             }
 
-            let Some(n) = self.receive_packet(&mut buf, remaining).await? else {
+            let Some(dhcp) = self.socket.recv(remaining).await? else {
                 break; // Timeout
             };
 
-            if let Some(offer) = parse_offer(&buf[..n], xid) {
+            if let Some(offer) = parse_offer(&dhcp, xid) {
                 return Ok(Some(offer));
             }
         }
@@ -329,7 +401,6 @@ impl DhcpClientInternal {
         timeout: std::time::Duration,
     ) -> Result<Option<ParseAckResult>, DhcpError> {
         let start = std::time::Instant::now();
-        let mut buf = [0u8; 2048];
 
         while start.elapsed() < timeout {
             let remaining = timeout.saturating_sub(start.elapsed());
@@ -337,11 +408,11 @@ impl DhcpClientInternal {
                 break;
             }
 
-            let Some(n) = self.receive_packet(&mut buf, remaining).await? else {
+            let Some(dhcp) = self.socket.recv(remaining).await? else {
                 break; // Timeout
             };
 
-            let res = parse_ack_nak(&buf[..n], xid);
+            let res = parse_ack_nak(&dhcp, xid);
             if !matches!(res, ParseAckResult::None) {
                 return Ok(Some(res));
             }
@@ -349,36 +420,12 @@ impl DhcpClientInternal {
         Ok(None)
     }
 
-    async fn receive_packet(
-        &self,
-        buf: &mut [u8],
-        timeout: std::time::Duration,
-    ) -> Result<Option<usize>, DhcpError> {
-        let Ok(recv_res) = tokio::time::timeout(timeout, self.socket.recv_from(buf)).await else {
-            return Ok(None); // Timeout occurred
-        };
-
-        let (n, _src) = recv_res?;
-        Ok(Some(n))
-    }
-
     async fn send_dhcp_message(
         &self,
         message: dhcproto::v4::Message,
         dest_ip: Ipv4Addr,
     ) -> Result<(), DhcpError> {
-        use dhcproto::{Encodable, Encoder};
-        let mut payload = Vec::new();
-        message
-            .encode(&mut Encoder::new(&mut payload))
-            .map_err(|e| DhcpError::Protocol(e.to_string()))?;
-
-        let dest_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-            dest_ip,
-            dhcproto::v4::SERVER_PORT,
-        ));
-        self.socket.send_to(&payload, dest_addr).await?;
-        Ok(())
+        self.socket.send(&message, dest_ip).await
     }
 
     async fn apply_lease_config(
@@ -593,7 +640,7 @@ async fn run_client_loop(
             wan_interface, mac
         );
 
-        let socket = match make_client_socket(&wan_interface) {
+        let socket = match DhcpClientSocket::new(&wan_interface, mac) {
             Ok(s) => s,
             Err(e) => {
                 handle_socket_creation_error(e, &mut shutdown_rx).await;
@@ -695,18 +742,16 @@ fn calculate_renewal_params(
     (retry_interval, dest_ip, in_rebinding)
 }
 
-fn parse_offer(buf: &[u8], xid: u32) -> Option<DhcpOffer> {
-    use dhcproto::v4::{DhcpOption, Message, MessageType, OptionCode};
-    use dhcproto::{Decodable, Decoder};
+fn parse_offer(dhcp: &dhcproto::v4::Message, xid: u32) -> Option<DhcpOffer> {
+    use dhcproto::v4::{DhcpOption, MessageType, OptionCode};
 
-    let dhcp = Message::decode(&mut Decoder::new(buf)).ok()?;
     if dhcp.xid() != xid {
         return None;
     }
     let msg_type = dhcp.opts().get(OptionCode::MessageType)?;
     if let DhcpOption::MessageType(MessageType::Offer) = msg_type {
         let offered_ip = dhcp.yiaddr();
-        let server_ip = get_server_identifier(&dhcp);
+        let server_ip = get_server_identifier(dhcp);
         Some(DhcpOffer {
             offered_ip,
             server_ip,
@@ -716,25 +761,20 @@ fn parse_offer(buf: &[u8], xid: u32) -> Option<DhcpOffer> {
     }
 }
 
-fn parse_ack_nak(buf: &[u8], xid: u32) -> ParseAckResult {
-    use dhcproto::v4::{DhcpOption, Message, MessageType, OptionCode};
-    use dhcproto::{Decodable, Decoder};
+fn parse_ack_nak(dhcp: &dhcproto::v4::Message, xid: u32) -> ParseAckResult {
+    use dhcproto::v4::{DhcpOption, MessageType, OptionCode};
 
-    let dhcp = match Message::decode(&mut Decoder::new(buf)) {
-        Ok(d) => d,
-        Err(_) => return ParseAckResult::None,
-    };
     if dhcp.xid() != xid {
         return ParseAckResult::None;
     }
     match dhcp.opts().get(OptionCode::MessageType) {
         Some(DhcpOption::MessageType(MessageType::Ack)) => {
-            let opts = parse_lease_options(&dhcp);
+            let opts = parse_lease_options(dhcp);
             ParseAckResult::Ack(DhcpAck {
                 ip: dhcp.yiaddr(),
                 mask: opts.mask,
                 gateway: opts.gateway,
-                server_ip: get_server_identifier(&dhcp),
+                server_ip: get_server_identifier(dhcp),
                 lease_secs: opts.lease_secs,
                 dns_servers: opts.dns_servers,
             })
@@ -894,30 +934,6 @@ fn parse_lease_options(dhcp: &dhcproto::v4::Message) -> LeaseOptions {
     }
 }
 
-fn make_client_socket(interface_name: &str) -> std::io::Result<UdpSocket> {
-    // Bind to 0.0.0.0 because the client doesn't have an IP address yet.
-    let std_socket = StdUdpSocket::bind(("0.0.0.0", dhcproto::v4::CLIENT_PORT))?;
-
-    // Allow broadcast on the interface
-    setsockopt(&std_socket, sockopt::Broadcast, &true).map_err(std::io::Error::from)?;
-
-    // Bind to the physical interface (e.g. "eth0") to rx packets where the packet doesn't match the interface IP
-    setsockopt(
-        &std_socket,
-        sockopt::BindToDevice,
-        &interface_name.to_string().into(),
-    )
-    .map_err(std::io::Error::from)?;
-
-    // Bypass kernel routing tables for unconfigured interfaces
-    setsockopt(&std_socket, sockopt::DontRoute, &true).map_err(std::io::Error::from)?;
-
-    // Set the socket to non-blocking mode for tokio
-    std_socket.set_nonblocking(true)?;
-    let socket = UdpSocket::from_std(std_socket)?;
-    Ok(socket)
-}
-
 // =========================================================================
 // Tests
 // =========================================================================
@@ -925,19 +941,12 @@ fn make_client_socket(interface_name: &str) -> std::io::Result<UdpSocket> {
 mod tests {
     use super::*;
     use dhcproto::v4::{DhcpOption, Message, MessageType};
-    use dhcproto::{Encodable, Encoder};
 
     const MOCK_SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
     const MOCK_CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
     const DEFAULT_MASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
     const DNS_IP_1: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
     const DNS_IP_2: Ipv4Addr = Ipv4Addr::new(8, 8, 4, 4);
-
-    fn encode_msg(msg: &Message) -> Vec<u8> {
-        let mut buf = Vec::new();
-        msg.encode(&mut Encoder::new(&mut buf)).unwrap();
-        buf
-    }
 
     #[test]
     fn test_parse_offer_valid() {
@@ -949,8 +958,7 @@ mod tests {
             .insert(DhcpOption::ServerIdentifier(MOCK_SERVER_IP));
         msg.set_yiaddr(MOCK_CLIENT_IP);
 
-        let buf = encode_msg(&msg);
-        let res = parse_offer(&buf, 0x12345678).unwrap();
+        let res = parse_offer(&msg, 0x12345678).unwrap();
         assert_eq!(res.offered_ip, MOCK_CLIENT_IP);
         assert_eq!(res.server_ip, Some(MOCK_SERVER_IP));
     }
@@ -962,8 +970,7 @@ mod tests {
         msg.opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Offer));
 
-        let buf = encode_msg(&msg);
-        let res = parse_offer(&buf, 0x22222222);
+        let res = parse_offer(&msg, 0x22222222);
         assert!(res.is_none());
     }
 
@@ -975,8 +982,7 @@ mod tests {
             .insert(DhcpOption::MessageType(MessageType::Offer));
         msg.set_yiaddr(MOCK_CLIENT_IP);
 
-        let buf = encode_msg(&msg);
-        let res = parse_offer(&buf, 0x12345678).unwrap();
+        let res = parse_offer(&msg, 0x12345678).unwrap();
         assert_eq!(res.offered_ip, MOCK_CLIENT_IP);
         assert_eq!(res.server_ip, None);
     }
@@ -997,8 +1003,7 @@ mod tests {
             .insert(DhcpOption::ServerIdentifier(MOCK_SERVER_IP));
         msg.set_yiaddr(MOCK_CLIENT_IP);
 
-        let buf = encode_msg(&msg);
-        let res = parse_ack_nak(&buf, 0xabcdef);
+        let res = parse_ack_nak(&msg, 0xabcdef);
         if let ParseAckResult::Ack(ack) = res {
             assert_eq!(ack.ip, MOCK_CLIENT_IP);
             assert_eq!(ack.mask, DEFAULT_MASK);
@@ -1018,8 +1023,7 @@ mod tests {
         msg.opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Nak));
 
-        let buf = encode_msg(&msg);
-        let res = parse_ack_nak(&buf, 0x9999);
+        let res = parse_ack_nak(&msg, 0x9999);
         assert!(matches!(res, ParseAckResult::Nak));
     }
 
