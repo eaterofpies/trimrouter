@@ -19,6 +19,17 @@ RUST_TARGET_x86_64 := x86_64-unknown-linux-musl
 RUST_TARGET_arm64  := aarch64-unknown-linux-musl
 RUST_TARGET_armhf  := arm-unknown-linux-musleabihf
 
+# Configuration override path (defaults to config/trimrouter.toml)
+TRIMROUTER_CONFIG ?= config/trimrouter.toml
+
+# Track changes in TRIMROUTER_CONFIG path variable
+CONFIG_PATH_TRACKER := target/.config_path
+$(shell mkdir -p target)
+OLD_CONFIG_PATH := $(shell cat $(CONFIG_PATH_TRACKER) 2>/dev/null)
+ifneq ($(OLD_CONFIG_PATH),$(TRIMROUTER_CONFIG))
+$(shell echo "$(TRIMROUTER_CONFIG)" > $(CONFIG_PATH_TRACKER))
+endif
+
 # Convenience default targets for host (x86_64)
 all: image-x86_64
 
@@ -33,6 +44,9 @@ help:
 	@echo "    make image-<arch>        Build partitioned disk/SD image for a specific arch"
 	@echo "    make qemu-<arch>         Boot VM image for a specific arch in QEMU"
 	@echo "    make test-<arch>         Run integration tests for a specific arch"
+	@echo ""
+	@echo "  Configuration Overrides"
+	@echo "    TRIMROUTER_CONFIG=path   Path to custom TOML config file (default: config/trimrouter.toml)"
 	@echo ""
 	@echo "  Misc"
 	@echo "    make clean               Delete all build artifacts"
@@ -50,7 +64,7 @@ image-$(1): target/$(1)/trimrouter.img
 qemu-$(1): target/$(1)/trimrouter.img
 	@ARCH=$(1) ./test_qemu.sh
 
-test-$(1): target/$(1)/trimrouter.img
+test-$(1): target/$(1)/trimrouter-test.img
 	@echo "[test] Running integration tests for target architecture $(1)..."
 	@TEST_ARCH=$(1) cargo test --test wan_dhcp_test -- --nocapture
 
@@ -70,8 +84,12 @@ target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter tar
 	@./scripts/build_initramfs.sh $(1)
 
 # Rule for building the raw disk/SD image
-target/$(1)/trimrouter.img: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/initramfs.cpio.gz scripts/build_image.sh
-	@./scripts/build_image.sh $(1)
+target/$(1)/trimrouter.img: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/initramfs.cpio.gz scripts/build_image.sh $(TRIMROUTER_CONFIG) $(CONFIG_PATH_TRACKER)
+	@./scripts/build_image.sh $(1) $(TRIMROUTER_CONFIG) trimrouter.img
+
+# Rule for building the test raw disk image (always uses repository-default config/trimrouter.toml)
+target/$(1)/trimrouter-test.img: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/initramfs.cpio.gz scripts/build_image.sh config/trimrouter.toml
+	@./scripts/build_image.sh $(1) config/trimrouter.toml trimrouter-test.img
 endef
 
 # =========================================================================
@@ -84,4 +102,4 @@ $(foreach arch,$(ARCHS),$(eval $(call ARCH_RULES,$(arch))))
 clean:
 	@echo "[clean] Cleaning all build targets and staging directories..."
 	@cargo clean
-	@rm -rf target/x86_64 target/arm64 target/armhf target/trimrouter.img target/pi_boot
+	@rm -rf target/x86_64 target/arm64 target/armhf target/trimrouter.img target/trimrouter-test.img target/pi_boot target/.config_path

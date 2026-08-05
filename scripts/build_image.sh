@@ -6,12 +6,14 @@ set -e
 
 ARCH=$1
 if [ -z "$ARCH" ]; then
-    echo "Usage: $0 <arch>"
+    echo "Usage: $0 <arch> [config_file] [image_name]"
     exit 1
 fi
+CONFIG_FILE=${2:-config/trimrouter.toml}
+IMAGE_NAME=${3:-trimrouter.img}
 
 CURDIR=$(pwd)
-IMAGE="target/${ARCH}/trimrouter.img"
+IMAGE="target/${ARCH}/${IMAGE_NAME}"
 mkdir -p "target/${ARCH}"
 
 case "$ARCH" in
@@ -36,7 +38,7 @@ case "$ARCH" in
         echo "console=ttyS0 quiet panic=-1 net.ifnames=0" > "target/x86_64/cmdline.txt"
         mcopy -i "${IMAGE}@@1M" "target/x86_64/cmdline.txt" ::/cmdline.txt
         mmd -i "${IMAGE}@@1M" ::/config 2>/dev/null || true
-        mcopy -i "${IMAGE}@@1M" "${CURDIR}/config/trimrouter.toml" ::/config/trimrouter.toml
+        mcopy -i "${IMAGE}@@1M" "${CONFIG_FILE}" ::/config/trimrouter.toml
         ;;
 
     arm64|armhf)
@@ -205,7 +207,7 @@ case "$ARCH" in
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/config.txt" ::/
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/cmdline.txt" ::/
         mmd -i "${IMAGE}@@1M" ::/config 2>/dev/null || true
-        mcopy -i "${IMAGE}@@1M" "${CURDIR}/config/trimrouter.toml" ::/config/trimrouter.toml
+        mcopy -i "${IMAGE}@@1M" "${CONFIG_FILE}" ::/config/trimrouter.toml
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR"/*.dtb ::/
         mcopy -s -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/overlays" ::/
         ;;

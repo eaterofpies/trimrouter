@@ -348,7 +348,7 @@ async fn startup_stage() -> TestEnv {
 
     let kernel = format!("target/{test_arch}/test_boot/vmlinuz");
     let initrd = format!("target/{test_arch}/initramfs.cpio.gz");
-    let image = format!("target/{test_arch}/trimrouter.img");
+    let image = format!("target/{test_arch}/trimrouter-test.img");
     let drive_arg = format!("file={},format=raw,media=disk,if=virtio", image);
 
     let dev_arg = if test_arch == "x86_64" {

@@ -46,6 +46,12 @@ make
 ```
 This generates the bootable raw VM disk image at `target/x86_64/trimrouter.img` (which bundles the kernel `vmlinuz` and `initramfs.cpio.gz` containing the statically linked `trimrouter` binary mapped to `/init` and required Linux kernel modules).
 
+#### Custom Configuration Override
+Build the image with a custom configuration:
+```bash
+make TRIMROUTER_CONFIG=path/to/custom_config.toml
+```
+
 Configuration is read from the TOML configuration file `/boot/config/trimrouter.toml` on the boot partition of the disk image:
 
 ```toml

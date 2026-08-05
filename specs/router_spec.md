@@ -207,7 +207,9 @@ To verify `trimrouter`'s behavior as a real PID 1 init process, we boot it in QE
 #### 5.2.1 Initramfs & VM Image Creation
 The build pipeline (`make` or `make test`) automatically:
 1. Calls `scripts/build_initramfs.sh` to construct the initramfs archive at `target/x86_64/initramfs.cpio.gz` including the statically linked `trimrouter` binary (mapped to `/init`) and required Linux kernel modules.
-2. Calls `scripts/build_image.sh` to package the kernel (`vmlinuz`), the initramfs (`initramfs.cpio.gz`), and a `cmdline.txt` parameter file into a partitioned, bootable FAT32 raw disk image file at `target/x86_64/trimrouter.img`.
+2. Calls `scripts/build_image.sh` to package the kernel (`vmlinuz`), the initramfs (`initramfs.cpio.gz`), and a `cmdline.txt` parameter file into a partitioned, bootable FAT32 raw disk image file.
+   - **Configuration Override**: The output image (`target/<arch>/trimrouter.img`) depends directly on the configuration file path configured via the `TRIMROUTER_CONFIG` environment/command-line variable (default: `config/trimrouter.toml`). Modifying the configuration file or changing the path target triggers an automatic rebuild of the disk image without requiring a `make clean`.
+   - **Test Isolation**: Integration tests compile and run using a dedicated `target/<arch>/trimrouter-test.img` image that always packages the default `config/trimrouter.toml` settings, ensuring that user overrides do not impact test verification.
 
 On boot, `trimrouter` (as PID 1) will:
 1. Mount virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`).
