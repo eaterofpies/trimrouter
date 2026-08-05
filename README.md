@@ -46,11 +46,21 @@ make
 ```
 This generates the bootable raw VM disk image at `target/x86_64/trimrouter.img` (which bundles the kernel `vmlinuz` and `initramfs.cpio.gz` containing the statically linked `trimrouter` binary mapped to `/init` and required Linux kernel modules).
 
-Configuration is passed via kernel command-line parameters:
-- `trimrouter.wan_mac=<mac>` — **Required.** MAC of the WAN interface.
-- `trimrouter.lan_mac=<mac>` — **Required.** MAC of the LAN interface.
-- `trimrouter.lan_ip=<cidr>` — Optional static LAN IP (default: `192.168.1.1/24`).
-- `trimrouter.reboot_delay[=N]` — Optional. Reboot after `N` seconds on panic instead of hanging (standalone flag defaults to 10s).
+Configuration is read from the TOML configuration file `/boot/config/trimrouter.toml` on the boot partition of the disk image:
+
+```toml
+[network]
+# The MAC addresses used to map the WAN and LAN interfaces (Required)
+wan_mac = "52:54:00:12:34:56"
+lan_mac = "52:54:00:12:34:57"
+
+# Optional static LAN gateway IP and subnet (default: "192.168.1.1/24")
+lan_ip = "192.168.1.1/24"
+
+[system]
+# Optional reboot delay in seconds on panic (defaults to infinite hang if omitted)
+# reboot_delay = 10
+```
 
 ### Testing
 

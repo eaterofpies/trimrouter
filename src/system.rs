@@ -28,7 +28,7 @@ pub trait SystemOps: Send + Sync + 'static {
         options: Option<WaitPidFlag>,
     ) -> Result<WaitStatus, nix::Error>;
 
-    fn read_cmdline(&self) -> Result<String, std::io::Error>;
+    fn read_config_file(&self) -> Result<String, std::io::Error>;
 
     fn getpid(&self) -> Pid;
 }
@@ -66,8 +66,8 @@ impl SystemOps for RealSystem {
         nix::sys::wait::waitpid(pid, options)
     }
 
-    fn read_cmdline(&self) -> Result<String, std::io::Error> {
-        fs::read_to_string("/proc/cmdline")
+    fn read_config_file(&self) -> Result<String, std::io::Error> {
+        fs::read_to_string("/boot/config/trimrouter.toml")
     }
 
     fn getpid(&self) -> Pid {
@@ -227,7 +227,7 @@ pub mod mock {
 
     pub struct MockSystem {
         pub pid: Pid,
-        pub cmdline_content: String,
+        pub config_content: String,
         pub mount_calls: Mutex<Vec<MountCall>>,
         pub reboot_call: Mutex<Option<RebootMode>>,
         pub waitpid_results: Mutex<Vec<Result<WaitStatus, nix::Error>>>,
@@ -237,7 +237,7 @@ pub mod mock {
         pub fn new() -> Self {
             MockSystem {
                 pid: Pid::from_raw(1),
-                cmdline_content: "".to_string(),
+                config_content: "".to_string(),
                 mount_calls: Mutex::new(Vec::new()),
                 reboot_call: Mutex::new(None),
                 waitpid_results: Mutex::new(Vec::new()),
@@ -281,14 +281,14 @@ pub mod mock {
             }
         }
 
-        fn read_cmdline(&self) -> Result<String, std::io::Error> {
-            if self.cmdline_content.is_empty() {
+        fn read_config_file(&self) -> Result<String, std::io::Error> {
+            if self.config_content.is_empty() {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    "No cmdline mock",
+                    "No config mock",
                 ))
             } else {
-                Ok(self.cmdline_content.clone())
+                Ok(self.config_content.clone())
             }
         }
 

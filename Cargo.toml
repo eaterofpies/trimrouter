@@ -26,6 +26,8 @@ chrono = { version = "0.4", features = ["clock"] }
 rsntp = "4.1.2"
 kobject-uevent = "0.2.0"
 netlink-sys = "0.8.8"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
 
 
 

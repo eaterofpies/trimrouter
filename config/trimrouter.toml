@@ -1,0 +1,14 @@
+# trimrouter configuration file
+# This file is loaded from the boot partition (/boot/config/trimrouter.toml)
+
+[network]
+# The IP address and mask to assign to the LAN interface
+lan_ip = "192.168.1.1/24"
+
+# The MAC addresses used to identify and map the WAN and LAN interfaces
+wan_mac = "52:54:00:12:34:56"
+lan_mac = "52:54:00:12:34:57"
+
+[system]
+# Delay in seconds before auto-rebooting on panic (unset/commented out for infinite hang)
+# reboot_delay = 10

@@ -33,8 +33,10 @@ case "$ARCH" in
         # 3. Write boot payloads to the image
         mcopy -i "${IMAGE}@@1M" "$KERNEL" ::/vmlinuz
         mcopy -i "${IMAGE}@@1M" "$INITRAMFS" ::/initramfs.cpio.gz
-        echo "console=ttyS0 quiet panic=-1 net.ifnames=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" > "target/x86_64/cmdline.txt"
+        echo "console=ttyS0 quiet panic=-1 net.ifnames=0" > "target/x86_64/cmdline.txt"
         mcopy -i "${IMAGE}@@1M" "target/x86_64/cmdline.txt" ::/cmdline.txt
+        mmd -i "${IMAGE}@@1M" ::/config 2>/dev/null || true
+        mcopy -i "${IMAGE}@@1M" "${CURDIR}/config/trimrouter.toml" ::/config/trimrouter.toml
         ;;
 
     arm64|armhf)
@@ -185,7 +187,7 @@ case "$ARCH" in
 
         echo "Staging configuration boot scripts for ${ARCH}..."
         echo -e "${CONFIG_TXT}" > "$RPI_BOOT_DIR/config.txt"
-        echo "console=serial0,115200 console=tty1 root=/dev/ram0 rdinit=/init quiet panic=-1 net.ifnames=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=00:11:22:33:44:55 trimrouter.lan_mac=66:77:88:99:aa:bb" > "$RPI_BOOT_DIR/cmdline.txt"
+        echo "console=serial0,115200 console=tty1 root=/dev/ram0 rdinit=/init quiet panic=-1 net.ifnames=0" > "$RPI_BOOT_DIR/cmdline.txt"
 
         echo "[build-rpi] Allocating blank raw disk block file for ${ARCH}..."
         dd if=/dev/zero of="$IMAGE" bs=1M count=128 2>/dev/null
@@ -202,6 +204,8 @@ case "$ARCH" in
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/pi_initramfs.cpio.gz" ::/
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/config.txt" ::/
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/cmdline.txt" ::/
+        mmd -i "${IMAGE}@@1M" ::/config 2>/dev/null || true
+        mcopy -i "${IMAGE}@@1M" "${CURDIR}/config/trimrouter.toml" ::/config/trimrouter.toml
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR"/*.dtb ::/
         mcopy -s -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/overlays" ::/
         ;;

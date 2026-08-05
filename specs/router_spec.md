@@ -15,7 +15,7 @@ The application is designed to run exclusively as the initialization process (PI
                  │
                  ▼
          [ Init Manager ] ──────────────► [ Orphan Reaper Loop ]
-   (Mount VFS, Parse /proc/cmdline)       (Continuous zombie collection)
+   (Mount VFS, Parse TOML Config)       (Continuous zombie collection)
                  │
                  ▼
      [ Network Initialization ]
@@ -47,8 +47,8 @@ When running as PID 1:
 3. **Orphan Reaping**:
    - Run a non-blocking or asynchronous reaping loop using `waitpid` to prevent zombie processes.
 4. **Configuration Extraction**:
-   - Read and parse `/proc/cmdline` to extract network settings (e.g., `trimrouter.wan_mac=52:54:00:12:34:56`, `trimrouter.lan_mac=52:54:00:12:34:57`, `trimrouter.lan_ip=192.168.1.1/24`).
-   - The `wan_mac` and `lan_mac` parameters are strictly required. If either is missing, the init process immediately panics (halts). Upon successful extraction, matching interfaces are renamed to the constants `wan` and `lan`.
+   - Read and parse `/boot/config/trimrouter.toml` to extract network settings (e.g., `wan_mac = "52:54:00:12:34:56"`, `lan_mac = "52:54:00:12:34:57"`, `lan_ip = "192.168.1.1/24"`).
+   - The `wan_mac` and `lan_mac` parameters are strictly required under the `[network]` section. If either is missing or the configuration file cannot be read, the init process immediately panics (halts). Upon successful extraction, matching interfaces are renamed to the constants `wan` and `lan`.
 5. **Kernel Module Autoloading**:
    - Probes a set of required kernel modules at startup (`load_required_modules()`) by calling a built-in `modprobe` emulator linked into the same binary.
    - Listens for `NETLINK_KOBJECT_UEVENT` (uevent) broadcasts from the kernel and automatically loads modules matching the received `modalias` string by resolving dependencies from `modules.dep`.
@@ -143,15 +143,24 @@ All services are implemented directly inside the `trimrouter` binary using async
 
 ## 3. Configuration & Startup Parameters
 
-When running as PID 1, `trimrouter` settings are read from `/proc/cmdline` (the kernel command line). 
+When running as PID 1, `trimrouter` settings are read from the TOML configuration file `/boot/config/trimrouter.toml` (located on the boot partition).
 
-Example parameters:
-- `trimrouter.wan_mac=52:54:00:12:34:56` (Required: map WAN interface by MAC and rename to `wan`)
-- `trimrouter.lan_mac=52:54:00:12:34:57` (Required: map LAN interface by MAC and rename to `lan`)
-- `trimrouter.lan_ip=192.168.1.1/24` (Optional: static LAN gateway IP and subnet; defaults to `192.168.1.1/24`)
-- `trimrouter.reboot_delay[=N]` (Optional: on panic or unrecoverable error, reboot after `N` seconds instead of hanging indefinitely; standalone flag without `=N` defaults to 10 seconds)
+Example configuration file layout:
+```toml
+[network]
+# The IP address and mask to assign to the LAN interface
+lan_ip = "192.168.1.1/24" # (Optional: defaults to "192.168.1.1/24")
 
-The `trimrouter.wan_mac` and `trimrouter.lan_mac` parameters are strictly required. If they are missing or if `/proc/cmdline` cannot be read, the init process will print a configuration error and panic (halt).
+# The MAC addresses used to identify and map the WAN and LAN interfaces
+wan_mac = "52:54:00:12:34:56" # (Required: maps WAN interface and renames it to wan)
+lan_mac = "52:54:00:12:34:57" # (Required: maps LAN interface and renames it to lan)
+
+[system]
+# Delay in seconds before auto-rebooting on panic (unset/omitted for infinite hang)
+reboot_delay = 10             # (Optional)
+```
+
+The `wan_mac` and `lan_mac` parameters are strictly required under the `[network]` section. If they are missing or if `/boot/config/trimrouter.toml` cannot be read, the init process will print a configuration error and panic (halt).
 
 ---
 
@@ -164,6 +173,7 @@ The `trimrouter.wan_mac` and `trimrouter.lan_mac` parameters are strictly requir
 - **Kernel Module Loading**: Built-in `modprobe` emulator using the `nix` `kmod` feature and a `NETLINK_KOBJECT_UEVENT` listener for dynamic module autoloading.
 - **DHCP Client & Server**: Raw packet sockets (`AF_PACKET` / `SOCK_RAW`) with a pure-Rust DHCP packet parser/builder.
 - **DNS Resolver/Proxy**: Custom minimal UDP proxy forwarding to parsed WAN DNS addresses.
+- **Configuration Parsing**: `toml` and `serde` (with `derive` feature) for type-safe TOML configuration deserialization.
 
 ---
 

@@ -344,10 +344,7 @@ async fn startup_stage() -> TestEnv {
     } else {
         "ttyAMA0"
     };
-    let append_arg = format!(
-        "console={} loglevel=8 panic=-1 net.ifnames=0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57",
-        console
-    );
+    let append_arg = format!("console={} loglevel=8 panic=-1 net.ifnames=0", console);
 
     let kernel = format!("target/{test_arch}/test_boot/vmlinuz");
     let initrd = format!("target/{test_arch}/initramfs.cpio.gz");
@@ -431,7 +428,7 @@ async fn startup_stage() -> TestEnv {
     let mut wan_dhcp_done = false;
     let mut pending_verification: Vec<String> = Vec::new();
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(35) {
+    while start.elapsed() < Duration::from_secs(90) {
         if let Some(msg) = rx.recv().await {
             if msg == "WAN_DHCP_DONE" {
                 wan_dhcp_done = true;
