@@ -5,7 +5,7 @@ This specification details the architecture for unifying WAN and LAN interface l
 ---
 ## 1. Architectural Overview
 
-The network interface lifecycle management system employs an event-driven architecture utilizing the Linux kernel Netlink subsystem. Rather than relying on a polling watchdog, each monitored interface is managed by a dedicated task that establishes a Netlink socket subscribed to the `RTNLGRP_LINK` multicast group. The task remains suspended until the kernel broadcasts a link state event (`RTM_NEWLINK` or `RTM_DELLINK`).
+The network interface lifecycle management system employs an event-driven architecture utilizing the Linux kernel Netlink subsystem. Rather than relying on a polling watchdog, the system runs a single global Netlink monitoring task that establishes a Netlink socket subscribed to the `RTNLGRP_LINK` multicast group. The task remains suspended until the kernel broadcasts a link state event (`RTM_NEWLINK` or `RTM_DELLINK`), which it then routes to the respective managed interface event handler.
 
 This design eliminates periodic polling wakeups, triggering state machine transitions and service dependency injections only upon physical hardware insertion, removal, or link state changes:
 
@@ -70,7 +70,7 @@ The structure encapsulates:
 - **Active Kernel Index**: The dynamic kernel-level interface index (registered once the device is detected on netlink).
 
 > [!NOTE]
-> `DnsForwarder` is **not** part of the `RouterService` enum. The DNS forwarder is a global singleton started once in `main.rs` before interface monitoring begins. It is not tied to the LAN interface lifecycle.
+> `[DnsForwarder](dns_forwarder_spec.md)` is **not** part of the `RouterService` enum. The DNS forwarder is a global singleton started once in `main.rs` before interface monitoring begins. It is not tied to the LAN interface lifecycle.
 
 ### Dynamic Service Mapping (Dependency Injection)
 
@@ -78,8 +78,8 @@ On interface discovery, the controller instantiates the service suite:
 
 | Interface Type | Configured IP | Dynamic Services Injected |
 | :--- | :--- | :--- |
-| **WAN** (`InterfaceType::Wan`) | None (DHCP Assigned) | 1. `DhcpClient` (retrieves lease)<br>2. `SntpClient` (synchronizes system time) |
-| **LAN** (`InterfaceType::Lan`) | Static (`192.168.1.1/24`) | 1. `DhcpServer` (allocates client leases) |
+| **WAN** (`InterfaceType::Wan`) | None (DHCP Assigned) | 1. `[DhcpClient](dhcp_client_spec.md)` (retrieves lease)<br>2. `[SntpClient](sntp_client_spec.md)` (synchronizes system time) |
+| **LAN** (`InterfaceType::Lan`) | Static (`192.168.1.1/24`) | 1. `[DhcpServer](dhcp_server_spec.md)` (allocates client leases) |
 
 ---
 

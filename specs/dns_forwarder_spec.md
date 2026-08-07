@@ -1,0 +1,72 @@
+# Specification: DNS Forwarder
+
+The DNS Forwarder is a local DNS proxy service in `trimrouter` that resolves DNS queries for LAN clients by forwarding them to upstream DNS resolvers, caching responses, and defending against cache poisoning and port exhaustion.
+
+---
+
+## 1. Network & Socket Architecture
+
+*   **Service Binding**: Binds to port `53` (UDP) on the LAN interface to accept client queries.
+*   **Upstream Client Socket**: Binds a single, long-lived client UDP socket (`0.0.0.0:0`) for all outgoing upstream DNS queries.
+    > [!TIP]
+    > Reusing a single socket avoids binding and closing temporary sockets for each query, preventing ephemeral port exhaustion in high-concurrency environments.
+
+---
+
+## 2. Upstream Forwarding & Security Mechanics
+
+To support concurrent requests over a single socket safely, `trimrouter` implements a transaction mapping and verification pipeline:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Forwarder (Query Loop)
+    participant Upstream Socket (Receiver)
+    participant DNS Server
+
+    Client->>Forwarder (Query Loop): DNS Query (Client XID)
+    Note over Forwarder (Query Loop): Check Cache (Hit/Miss)
+    Note over Forwarder (Query Loop): Generate Random Upstream XID
+    Forwarder (Query Loop)->>DNS Server: Forwarded Query (Upstream XID)
+    DNS Server->>Upstream Socket (Receiver): DNS Reply (Upstream XID)
+    Note over Upstream Socket (Receiver): Verify Upstream Source IP matches DNS Server
+    Note over Upstream Socket (Receiver): Restore Client XID
+    Upstream Socket (Receiver)->>Client: DNS Reply (Client XID)
+```
+
+### 2.1 Transaction ID (XID) Randomization
+For every query forwarded upstream:
+1.  The client's original transaction ID (XID) is saved.
+2.  A new, cryptographically random transaction ID is generated.
+3.  A oneshot channel is registered in the `PendingQueries` registry map, mapping the new transaction ID to the waiting client task.
+
+### 2.2 Cache Poisoning & Spoofing Protection
+*   The background receiver loop listens on the upstream socket.
+*   Upon receiving an upstream response, it extracts the transaction ID and retrieves the pending record.
+*   **Verification**: Validates that the packet's sender IP address matches the expected upstream DNS server IP.
+*   **Discarding**: If the sender IP does not match, the packet is logged as a DNS spoofing attempt and discarded, protecting the local resolver cache from poisoning.
+*   If valid, the oneshot channel sends the response, the original transaction ID is restored, and the reply is returned to the client.
+
+### 2.3 Upstream Target Selection
+*   Retrieves the primary DNS server IP from the WAN interface's active `WanLease` configuration.
+*   If the WAN lease has no DNS servers or is inactive, falls back to `8.8.8.8` (Google DNS).
+
+---
+
+## 3. Cache Design
+
+The forwarder maintains an in-memory cache to reduce external latency and DNS traffic:
+
+*   **Cache Key**: Structured as `domain_name:query_type:query_class` (e.g., `google.com:A:IN`).
+*   **TTL Calculation**:
+    *   Parses response packets using the `dns-parser` crate.
+    *   Finds the minimum TTL among all resource records in the answer section.
+    *   Caps the cache entry duration to a maximum of 3600 seconds (`MAX_TTL_SECS`) and a minimum fallback of 30 seconds (`DEFAULT_TTL_SECS`).
+*   **Cache Cleanup**: Spawns a background task running every 60 seconds (`CLEANUP_INTERVAL`) to prune expired cache entries.
+
+---
+
+## 4. Limitations
+
+*   **UDP Only**: The DNS forwarder supports only UDP DNS queries. TCP DNS queries (such as large zones or DNSSEC fallbacks) are not supported.
+*   **Upstream Timeout**: Upstream queries time out after 3 seconds (`UPSTREAM_TIMEOUT`), at which point the pending query entry is evicted to prevent memory growth.

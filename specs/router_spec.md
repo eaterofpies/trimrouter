@@ -105,40 +105,25 @@ To enable Source NAT (Masquerading), `trimrouter` communicates directly with the
    - **Input Rules**:
      - *Loopback Rule*: Accept all packets where the input interface (`iif`) is `lo`.
      - *LAN Rule*: Accept all packets where the input interface (`iif`) is the LAN interface (allows LAN clients to access DNS, DHCP, and route packets).
+     - *WAN DHCP Client Rule*: Accept incoming DHCP client replies on the WAN interface (UDP destination port `68`).
+     - *ICMP Rule*: Accept ICMP packets on all interfaces (allows external and internal ping requests).
      - *Stateful Connection Rule*: Accept packets with connection-tracking state (`ct state`) equal to `established` or `related`. This allows inbound packets that are part of an outbound connection initiated by a LAN client or the router itself.
      - *Default Fallback*: All other unsolicited inbound packets (including all unsolicited traffic arriving on the WAN interface) are silently dropped.
 
 ---
 
 ### 2.3 Network Services (Embedded)
-All services are implemented directly inside the `trimrouter` binary using async tasks:
-1. **DHCP Client (WAN)**:
-   - Negotiates IP configuration with the upstream DHCP server using raw packet sockets (`AF_PACKET` / `SOCK_RAW`) bound directly to the WAN interface.
-   - This bypasses the kernel TCP/IP stack to send broadcast DISCOVER/REQUEST packets and receive unicast/broadcast OFFER/ACK replies before the interface has an IP address assigned.
-   - Parses the IP/UDP/DHCP headers in userspace.
-   - Extracts network configurations: IP address, subnet mask, default gateway, and DNS servers (Option 6 of the DHCP lease).
-   - Once negotiated, applies the allocated IP, subnet mask, and default gateway to the WAN interface via Netlink, and dynamically updates the DNS Forwarder with the leased DNS server IPs.
-2. **DHCP Server (LAN)**:
-   - Listens for client discovery packets on port 67 of the LAN interface.
-   - Uses raw packet sockets (`AF_PACKET`) to unicast DHCP replies directly to the client's MAC address (since the client does not yet have an IP address and cannot respond to ARP).
-   - **Lease Integrity & Eviction**: Manages an in-memory database of active leases using a synchronized `LeaseTable` module to ensure the lease map and IP allocation index remain aligned. Evicts expired leases automatically to reclaim IPs.
-   - **Address Validation**: Rejects client requests that fall outside the LAN subnet, match the server's own IP, or conflict with another active lease (returns `DHCPNAK` on conflicts).
-   - Hands out IPs to LAN clients, advertising `trimrouter`'s LAN IP as the gateway and DNS resolver.
-3. **DNS Forwarder**:
-   - Listens on port 53 (UDP) on the LAN interface.
-   - By default, forwards client DNS queries to the DNS server IPs dynamically obtained from the WAN interface's DHCP lease.
-   - If no DNS servers are provided in the WAN DHCP lease, falls back to the static DNS servers specified on the kernel command line or a compile-time default (e.g., `8.8.8.8`).
-   - **Cache Poisoning & Ephemeral Port Exhaustion Protections**: Uses a single, long-lived client UDP socket for all upstream queries instead of binding temporary ephemeral sockets per request. Generates unique, randomized transaction IDs and checks replies to match, fully rejecting spoofed packets with mismatched upstream source IPs to prevent Kaminsky-style cache poisoning.
-   - **UDP Only**: Only UDP DNS proxying is supported. TCP DNS queries (including DNSSEC fallback) are unsupported.
-4. **NTP Client (SNTP)**:
-   - Synchronizes router system time periodically using SNTP (Simple Network Time Protocol) from `time.google.com`.
-   - Starts sync loop automatically after a WAN IP and DNS servers are acquired from the DHCP lease.
-   - Updates the system clock using standard clock-setting system calls (`clock_settime` via the `nix` crate).
-   - Retries with backoff on network failures and performs sync checks every 30 minutes.
+All network services are implemented directly inside the `trimrouter` binary as concurrent asynchronous tasks. The detailed specification for each service is documented in its respective sub-specification:
+
+1. **[DHCP Client (WAN)](dhcp_client_spec.md)**: Negotiates dynamic IPv4 address leases, default routes, and DNS resolver configurations on the WAN interface using raw packet sockets (`AF_PACKET`).
+2. **[DHCP Server (LAN)](dhcp_server_spec.md)**: Manages dynamic IP configuration leases, address range validation, and conflict detection for clients on the local network (LAN) interface using raw packet sockets.
+3. **[DNS Forwarder](dns_forwarder_spec.md)**: An embedded UDP-only DNS proxy running on port 53 of the LAN interface that caches records, avoids ephemeral port exhaustion via socket reuse, and blocks cache poisoning spoofing attempts.
+4. **[NTP Client (SNTP)](sntp_client_spec.md)**: Periodically synchronizes the router system clock from time.google.com using the Simple Network Time Protocol (SNTP) and standard system time settings.
+
 
 ### 2.4 Logging & Timestamps
-- All standard output and error logs printed by `trimrouter` must include a standardized timestamp prefix with millisecond resolution.
-- Format: `[YYYY-MM-DD HH:MM:SS.mmm] [module] message` (e.g. `[2026-07-18 15:18:30.123] [init] Mounted /proc successfully.`).
+- All standard output and error logs printed by `trimrouter` must include a standardized timestamp prefix with millisecond resolution in UTC format.
+- Format: `[YYYY-MM-DDTHH:MM:SS.mmmZ] [module] message` (e.g. `[2026-07-18T15:18:30.123Z] [init] Mounted /proc successfully.`).
 ---
 
 ## 3. Configuration & Startup Parameters

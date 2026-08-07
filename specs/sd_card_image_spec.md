@@ -31,16 +31,16 @@ graph TD
 
 ### Phase 3: Stage Boot Files
 - Configures a sandboxed, unprivileged local **APT environment** (`target/apt`) pointing to the official Raspberry Pi package repositories.
-- Imports the official archive public GPG signing key (`raspberrypi.gpg.key`), converting it to a local dearmored keyring.
-- Runs `apt-get update` against the sandboxed config, verifying the GPG cryptographic signatures of the release indices.
-- Securely downloads and extracts the verified **Raspberry Pi Kernel** (`raspberrypi-kernel`) and **Bootloader** (`raspberrypi-bootloader`) `.deb` packages.
+- Copies the system's `debian-archive-keyring.gpg` to trusted keys and marks the repository source as trusted (`trusted=yes`).
+- Runs `apt-get update` against the sandboxed config to refresh package indices.
+- Securely downloads the verified **Raspberry Pi Kernel** (`raspberrypi-kernel`) and **Bootloader** (`raspberrypi-bootloader`) `.deb` packages.
 - Extracts their payloads (`data.tar.*`) unprivileged using `ar` and `tar` to obtain the GPU firmware (`bootcode.bin`, `start.elf`, `fixup.dat`), kernels (`kernel.img`, `kernel8.img`), DTBs, overlays, and kernel modules.
 - Stages these files alongside the compressed `pi_initramfs.cpio.gz`.
-- Generates `config.txt` (sets 64-bit mode, maps initramfs load target) and `cmdline.txt` (defines serial redirect console, points root to `/dev/ram0` and init target to `/init`).
+- Generates `config.txt` (sets 64-bit/32-bit mode, maps initramfs load target) and `cmdline.txt` (defines serial redirect console, points root to `/dev/ram0` and init target to `/init`).
 
 ### Phase 4: Create Raw Disk Image
-- Allocates an empty raw block file of `80MB` filled with zeros.
-- Writes a Master Boot Record (MBR/msdos) partition table containing a single primary partition starting at a block-aligned offset of `1MiB`.
+- Allocates an empty raw block file of `128MB` filled with zeros.
+- Writes a Master Boot Record (MBR/msdos) partition table containing a single primary partition starting at a block-aligned offset of `1MiB` and extending to 100% of the disk.
 
 ### Phase 5: Format FAT32 Partition
 - Uses `mtools` (`mformat`) to format the partition inside the raw block file directly, referencing the block-aligned offset (`target/trimrouter.img@@1M`).
@@ -57,7 +57,7 @@ The resulting raw disk image uses a standard layout to ensure Raspberry Pi firmw
 | Component | Offset | Size | Filesystem | boot flag |
 | :--- | :--- | :--- | :--- | :--- |
 | **MBR Partition Table** | `0` | `1 MiB` | - | - |
-| **Primary Boot Partition** | `1 MiB` | `79 MiB` | FAT32 | Active (bootable) |
+| **Primary Boot Partition** | `1 MiB` | `127 MiB` | FAT32 | Active (bootable) |
 
 ---
 
