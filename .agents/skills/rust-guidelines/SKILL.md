@@ -55,4 +55,10 @@ This skill provides code style and design standards for writing and modifying Ru
 * **Avoid printing `Some(...)` in logs**: Whenever logging a message or diagnostic that contains an `Option` value, do not print it in its raw `Some(value)` representation.
 * **Format Option values cleanly**: Output the value wrapped in quotes (e.g. `"10.0.2.15"`) if it is `Some`, or output `None` if it is empty. Use the `CleanOption` helper or implement custom `Debug`/`Display` manually on structs to formatting options cleanly.
 
+## 12. Division of Concerns (Interface vs. Service)
+* **Interface layer**: Only responsible for link administrative state management (bringing interfaces `UP` or `DOWN`) and executing services. It must not configure IP addresses or know about configurations.
+* **Service layer** (e.g. `LanManager`, `DhcpClient`): Solely responsible for IP address assignment and management. Services must not transition link administrative states.
+* **Generic Interfaces**: Keep the interface management structures (`ManagedInterface`) generic by injecting active services directly instead of branching on interface types.
+
+
 
