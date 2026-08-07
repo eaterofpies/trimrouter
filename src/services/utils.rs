@@ -8,12 +8,43 @@ use std::sync::{Arc, Mutex};
 // =========================================================================
 // Shared WAN Lease Info
 // =========================================================================
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct WanLease {
     pub ip: Option<Ipv4Addr>,
     pub mask: Option<Ipv4Addr>,
     pub gateway: Option<Ipv4Addr>,
     pub dns_servers: Vec<Ipv4Addr>,
+}
+
+pub struct CleanOption<'a, T>(pub &'a Option<T>);
+
+impl<'a, T: std::fmt::Display> std::fmt::Debug for CleanOption<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(val) => write!(f, "\"{}\"", val),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+impl<'a, T: std::fmt::Display> std::fmt::Display for CleanOption<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(val) => write!(f, "\"{}\"", val),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+impl std::fmt::Debug for WanLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WanLease")
+            .field("ip", &CleanOption(&self.ip))
+            .field("mask", &CleanOption(&self.mask))
+            .field("gateway", &CleanOption(&self.gateway))
+            .field("dns_servers", &self.dns_servers)
+            .finish()
+    }
 }
 
 pub type SharedWanLease = Arc<Mutex<WanLease>>;

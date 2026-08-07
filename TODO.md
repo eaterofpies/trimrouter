@@ -6,7 +6,6 @@
 - Support TCP, DNSSEC, etc. in the DNS forwarder
 - Add some basic observability and metrics
 - Clean up logging (maybe add a structured logging library like `tracing`)
-- Clean up option logs so they print clean values instead of `Some(...)`
 - Add logging to file + file rotation
 - Deduplicate dependencies
 - LAN/WAN IP conflict resolution

@@ -223,7 +223,8 @@ impl DhcpClientInternal {
             if let Some(offer) = self.wait_for_offer(xid, timeout).await? {
                 println!(
                     "[dhcp-client] Received DHCPOFFER for IP: {}, server: {:?}",
-                    offer.offered_ip, offer.server_ip
+                    offer.offered_ip,
+                    crate::services::utils::CleanOption(&offer.server_ip)
                 );
                 return Ok((xid, offer));
             }
@@ -839,7 +840,9 @@ async fn configure_wan(
     let prefix_len = mask_to_prefix_len(mask)?;
     println!(
         "[dhcp-client] Configuring WAN interface via netlink: IP={}/{}, Gateway={:?}",
-        ip, prefix_len, gateway
+        ip,
+        prefix_len,
+        crate::services::utils::CleanOption(&gateway)
     );
 
     let (connection, handle, _) = rtnetlink::new_connection()?;

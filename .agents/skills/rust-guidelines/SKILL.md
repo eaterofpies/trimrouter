@@ -51,3 +51,8 @@ This skill provides code style and design standards for writing and modifying Ru
 * Run `cargo fmt` to ensure the codebase is formatted according to the standard style before staging changes.
 * Run `cargo clippy --all-targets` and fix any warnings or errors before committing code. Warnings should be treated as errors where possible to maintain the highest code quality standards.
 
+## 11. Clean Option Logging
+* **Avoid printing `Some(...)` in logs**: Whenever logging a message or diagnostic that contains an `Option` value, do not print it in its raw `Some(value)` representation.
+* **Format Option values cleanly**: Output the value wrapped in quotes (e.g. `"10.0.2.15"`) if it is `Some`, or output `None` if it is empty. Use the `CleanOption` helper or implement custom `Debug`/`Display` manually on structs to formatting options cleanly.
+
+

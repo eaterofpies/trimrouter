@@ -4,12 +4,26 @@ use pnet::util::MacAddr;
 use serde::Deserialize;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RouterConfig {
     pub lan_ip: String,
     pub wan_mac: MacAddr,
     pub lan_mac: MacAddr,
     pub reboot_delay: Option<u32>, // Some(N) = N seconds, None = infinite
+}
+
+impl std::fmt::Debug for RouterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouterConfig")
+            .field("lan_ip", &self.lan_ip)
+            .field("wan_mac", &self.wan_mac)
+            .field("lan_mac", &self.lan_mac)
+            .field(
+                "reboot_delay",
+                &crate::services::utils::CleanOption(&self.reboot_delay),
+            )
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
