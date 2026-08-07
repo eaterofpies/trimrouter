@@ -14,3 +14,4 @@
 - Panic doesn't stop routing / other services. Should it?
 - Service privilege separation
 - Remove RO mount of /boot, storage kernel modules etc and inject config via UEFI?
+- Check if an IP is taken by an existing device before granting a lease (ARP table, ping, etc) - In case the router reboots
