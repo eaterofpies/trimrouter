@@ -1,12 +1,14 @@
 pub mod dhcp_client;
 pub mod dhcp_server;
 pub mod dns_forwarder;
+pub mod lan_manager;
 pub mod sntp_client;
 pub mod utils;
 
 pub use dhcp_client::DhcpClient;
 pub use dhcp_server::DhcpServer;
 pub use dns_forwarder::DnsForwarder;
+pub use lan_manager::LanManager;
 pub use sntp_client::SntpClient;
 pub use utils::WanLease;
 

@@ -1,4 +1,7 @@
-use super::utils::{RawPacketSocket, SharedWanLease, WanLease, get_interface_mac, wait_shutdown};
+use super::utils::{
+    CleanOption, RawPacketSocket, SharedWanLease, WanLease, get_interface_mac,
+    mask_to_prefix_len as utils_mask_to_prefix_len, wait_shutdown,
+};
 use crate::packet::build_raw_packet;
 use futures_util::TryStreamExt;
 use pnet::util::MacAddr;
@@ -224,7 +227,7 @@ impl DhcpClientInternal {
                 println!(
                     "[dhcp-client] Received DHCPOFFER for IP: {}, server: {:?}",
                     offer.offered_ip,
-                    crate::services::utils::CleanOption(&offer.server_ip)
+                    CleanOption(&offer.server_ip)
                 );
                 return Ok((xid, offer));
             }
@@ -710,20 +713,6 @@ fn get_jittered_duration(base_secs: u32) -> std::time::Duration {
     )
 }
 
-fn mask_to_prefix_len(mask: Ipv4Addr) -> Result<u8, DhcpError> {
-    let mask_u32 = u32::from(mask);
-    let leading_ones = mask_u32.leading_ones();
-    let trailing_zeros = mask_u32.trailing_zeros();
-
-    if leading_ones + trailing_zeros != 32 {
-        return Err(DhcpError::Protocol(format!(
-            "Invalid non-contiguous subnet mask: {}",
-            mask
-        )));
-    }
-    Ok(leading_ones as u8)
-}
-
 fn calculate_renewal_params(
     current_elapsed: u32,
     t2_secs: u32,
@@ -790,7 +779,8 @@ async fn deconfigure_wan(
     ip: Ipv4Addr,
     mask: Ipv4Addr,
 ) -> Result<(), DhcpError> {
-    let prefix_len = mask_to_prefix_len(mask)?;
+    let prefix_len =
+        utils_mask_to_prefix_len(mask).map_err(|e| DhcpError::Protocol(e.to_string()))?;
     println!(
         "[dhcp-client] Deconfiguring WAN interface via netlink: removing IP {}/{}",
         ip, prefix_len
@@ -837,12 +827,13 @@ async fn configure_wan(
     mask: Ipv4Addr,
     gateway: Option<Ipv4Addr>,
 ) -> Result<(), DhcpError> {
-    let prefix_len = mask_to_prefix_len(mask)?;
+    let prefix_len =
+        utils_mask_to_prefix_len(mask).map_err(|e| DhcpError::Protocol(e.to_string()))?;
     println!(
         "[dhcp-client] Configuring WAN interface via netlink: IP={}/{}, Gateway={:?}",
         ip,
         prefix_len,
-        crate::services::utils::CleanOption(&gateway)
+        CleanOption(&gateway)
     );
 
     let (connection, handle, _) = rtnetlink::new_connection()?;
@@ -1041,24 +1032,5 @@ mod tests {
         assert_eq!(opts.gateway, None);
         assert!(opts.dns_servers.is_empty());
         assert_eq!(opts.lease_secs, DEFAULT_LEASE_SECS);
-    }
-
-    #[test]
-    fn test_mask_to_prefix_len_valid() {
-        assert_eq!(
-            mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 0)).unwrap(),
-            24
-        );
-        assert_eq!(
-            mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 255)).unwrap(),
-            32
-        );
-        assert_eq!(mask_to_prefix_len(Ipv4Addr::new(0, 0, 0, 0)).unwrap(), 0);
-    }
-
-    #[test]
-    fn test_mask_to_prefix_len_invalid() {
-        assert!(mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 10)).is_err());
-        assert!(mask_to_prefix_len(Ipv4Addr::new(255, 0, 255, 0)).is_err());
     }
 }

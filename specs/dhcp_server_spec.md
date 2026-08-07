@@ -57,3 +57,15 @@ Every successful `DHCPOFFER` and `DHCPACK` includes the following configuration 
 *   **DNS Server** (Option 6): Advertises the server's own LAN IP, since `trimrouter` runs an embedded DNS forwarder on port 53.
 *   **IP Address Lease Time** (Option 51): Configured to 3600 seconds (`LAN_LEASE_SECS`).
 *   **Server Identifier** (Option 54): Set to the LAN interface's IP.
+
+---
+
+## 5. LAN Manager Service & Dynamic Subnet Reconfiguration
+
+The `LanManager` service manages the LAN interface configuration and encapsulates self-healing conflict resolution. It runs the DHCP Server as a child service and reacts to Netlink address and link events:
+1.  **Conflict Detection**: If a conflict/overlap between the WAN subnet and the active LAN subnet is detected, the `LanManager` initiates a dynamic subnet shift.
+2.  **Child DHCP Server Teardown**: The child DHCP Server service is stopped and its active tasks are terminated.
+3.  **Address Cleanup**: The active IPv4 address configurations on the LAN interface are deleted/flushed to ensure clean reinitialization. The interface state (UP/DOWN link state) is left untouched.
+4.  **Reconfiguration**: The LAN interface is configured with the backup IP address specified by the `backup_lan_ip` (e.g. `10.0.0.1/24`).
+5.  **Child DHCP Server Restart**: The child DHCP Server is re-instantiated with the new LAN IP/subnet range and restarted. The active lease table is cleared, forcing existing clients to re-negotiate leases within the updated range (e.g. `10.0.0.2` to `10.0.0.254`).
+

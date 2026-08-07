@@ -49,6 +49,20 @@ impl std::fmt::Debug for WanLease {
 
 pub type SharedWanLease = Arc<Mutex<WanLease>>;
 
+pub fn mask_to_prefix_len(mask: Ipv4Addr) -> Result<u8, RouterError> {
+    let mask_u32 = u32::from(mask);
+    let leading_ones = mask_u32.leading_ones();
+    let trailing_zeros = mask_u32.trailing_zeros();
+
+    if leading_ones + trailing_zeros != 32 {
+        return Err(RouterError::Generic(format!(
+            "Invalid non-contiguous subnet mask: {}",
+            mask
+        )));
+    }
+    Ok(leading_ones as u8)
+}
+
 // =========================================================================
 // Helper Functions for Raw Sockets
 // =========================================================================
@@ -396,5 +410,30 @@ pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>)
         if *shutdown_rx.borrow() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(unused_imports)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mask_to_prefix_len_valid() {
+        assert_eq!(
+            mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 0)).unwrap(),
+            24
+        );
+        assert_eq!(
+            mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 255)).unwrap(),
+            32
+        );
+        assert_eq!(mask_to_prefix_len(Ipv4Addr::new(0, 0, 0, 0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_mask_to_prefix_len_invalid() {
+        assert!(mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 10)).is_err());
+        assert!(mask_to_prefix_len(Ipv4Addr::new(255, 0, 255, 0)).is_err());
     }
 }

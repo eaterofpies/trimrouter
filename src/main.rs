@@ -184,24 +184,34 @@ async fn configure_networking_and_services(
     }
 
     // Create and monitor interfaces via the unified ManagedInterface structure
+    let wan_services = vec![
+        interface::RouterService::DhcpClient(services::DhcpClient::new(
+            network::WAN_INTERFACE.to_string(),
+            lease_state.clone(),
+        )),
+        interface::RouterService::SntpClient(services::SntpClient::new(lease_state.clone())),
+    ];
     let wan_iface = interface::ManagedInterface::new(
         network::WAN_INTERFACE.to_string(),
         config.wan_mac,
-        None,
-        interface::InterfaceType::Wan,
+        wan_services,
     );
 
+    let lan_services = vec![interface::RouterService::LanManager(
+        services::LanManager::new(
+            network::LAN_INTERFACE.to_string(),
+            config.lan_ip.clone(),
+            config.backup_lan_ip.clone(),
+            lease_state.clone(),
+        ),
+    )];
     let lan_iface = interface::ManagedInterface::new(
         network::LAN_INTERFACE.to_string(),
         config.lan_mac,
-        Some(config.lan_ip.clone()),
-        interface::InterfaceType::Lan,
+        lan_services,
     );
 
-    tokio::spawn(interface::monitor_interfaces(
-        vec![wan_iface, lan_iface],
-        lease_state.clone(),
-    ));
+    tokio::spawn(interface::monitor_interfaces(vec![wan_iface, lan_iface]));
 
     println!("[init] System startup completed successfully. Entering main event loop.");
 

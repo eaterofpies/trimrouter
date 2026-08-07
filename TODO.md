@@ -8,7 +8,6 @@
 - Clean up logging (maybe add a structured logging library like `tracing`)
 - Add logging to file + file rotation
 - Deduplicate dependencies
-- LAN/WAN IP conflict resolution
 - Add service stopping notifications
 - Panic doesn't stop routing / other services. Should it?
 - Service privilege separation

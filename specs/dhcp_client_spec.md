@@ -86,3 +86,6 @@ The client requests and parses the following standard DHCP options:
 
 *   **Socket Reinitialization**: If the raw socket encounters persistent read/write errors, the client tears down the socket, waits 5 seconds (`SOCKET_RESTART_DELAY_SECS`), and binds a new socket.
 *   **Unrecoverable Lease Expiry**: To prevent routing blackholes, if the lease expires during rebinding, the client immediately deletes the IP address and the default gateway route from the WAN interface before restarting discovery.
+*   **LAN/WAN Subnet Overlap Handling**: Subnet conflicts and overlaps between WAN and LAN subnets are managed reactively by the dedicated LAN Manager service.
+
+

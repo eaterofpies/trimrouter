@@ -88,3 +88,9 @@ impl From<std::num::ParseIntError> for RouterError {
         Self::ParseInt(err)
     }
 }
+
+impl From<ipnet::AddrParseError> for RouterError {
+    fn from(err: ipnet::AddrParseError) -> Self {
+        Self::Generic(err.to_string())
+    }
+}

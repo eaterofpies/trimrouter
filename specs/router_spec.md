@@ -134,18 +134,21 @@ Example configuration file layout:
 ```toml
 [network]
 # The IP address and mask to assign to the LAN interface
-lan_ip = "192.168.1.1/24" # (Optional: defaults to "192.168.1.1/24")
+lan_ip = "192.168.1.1/24"       # (Optional: defaults to "192.168.1.1/24")
+
+# The backup IP address and mask to shift to when a LAN/WAN subnet conflict is detected
+backup_lan_ip = "10.0.0.1/24"   # (Optional: defaults to "10.0.0.1/24")
 
 # The MAC addresses used to identify and map the WAN and LAN interfaces
-wan_mac = "52:54:00:12:34:56" # (Required: maps WAN interface and renames it to wan)
-lan_mac = "52:54:00:12:34:57" # (Required: maps LAN interface and renames it to lan)
+wan_mac = "52:54:00:12:34:56"   # (Required: maps WAN interface and renames it to wan)
+lan_mac = "52:54:00:12:34:57"   # (Required: maps LAN interface and renames it to lan)
 
 [system]
 # Delay in seconds before auto-rebooting on panic (unset/omitted for infinite hang)
-reboot_delay = 10             # (Optional)
+reboot_delay = 10               # (Optional)
 ```
 
-The `wan_mac` and `lan_mac` parameters are strictly required under the `[network]` section. If they are missing or if `/boot/config/trimrouter.toml` cannot be read, the init process will print a configuration error and panic (halt).
+The `wan_mac` and `lan_mac` parameters are strictly required under the `[network]` section (with `lan_ip` defaulting to `192.168.1.1/24` and `backup_lan_ip` defaulting to `10.0.0.1/24` if omitted). If they are missing or if `/boot/config/trimrouter.toml` cannot be read, the init process will print a configuration error and panic (halt).
 
 ---
 

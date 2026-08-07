@@ -7,6 +7,7 @@ use std::str::FromStr;
 #[derive(Clone, PartialEq, Eq)]
 pub struct RouterConfig {
     pub lan_ip: String,
+    pub backup_lan_ip: String,
     pub wan_mac: MacAddr,
     pub lan_mac: MacAddr,
     pub reboot_delay: Option<u32>, // Some(N) = N seconds, None = infinite
@@ -16,6 +17,7 @@ impl std::fmt::Debug for RouterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RouterConfig")
             .field("lan_ip", &self.lan_ip)
+            .field("backup_lan_ip", &self.backup_lan_ip)
             .field("wan_mac", &self.wan_mac)
             .field("lan_mac", &self.lan_mac)
             .field(
@@ -35,6 +37,7 @@ struct ConfigToml {
 #[derive(Deserialize)]
 struct NetworkSection {
     lan_ip: Option<String>,
+    backup_lan_ip: Option<String>,
     wan_mac: String,
     lan_mac: String,
 }
@@ -70,6 +73,12 @@ impl RouterConfig {
             .lan_ip
             .unwrap_or_else(|| "192.168.1.1/24".to_string());
 
+        let backup_lan_ip = parsed
+            .network
+            .backup_lan_ip
+            .clone()
+            .unwrap_or_else(|| "10.0.0.1/24".to_string());
+
         let reboot_delay = parsed
             .system
             .as_ref()
@@ -77,6 +86,7 @@ impl RouterConfig {
 
         Ok(RouterConfig {
             lan_ip,
+            backup_lan_ip,
             wan_mac,
             lan_mac,
             reboot_delay,
@@ -95,6 +105,7 @@ mod tests {
         sys.config_content = r#"
             [network]
             lan_mac = "52:54:00:12:34:57"
+            backup_lan_ip = "10.0.0.1/24"
         "#
         .to_string();
         let res = RouterConfig::parse(&sys);
@@ -112,6 +123,7 @@ mod tests {
         sys.config_content = r#"
             [network]
             wan_mac = "52:54:00:12:34:56"
+            backup_lan_ip = "10.0.0.1/24"
         "#
         .to_string();
         let res = RouterConfig::parse(&sys);
@@ -124,6 +136,20 @@ mod tests {
     }
 
     #[test]
+    fn test_config_parsing_missing_backup_lan_ip() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+        "#
+        .to_string();
+        let config = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(config.lan_ip, "192.168.1.1/24");
+        assert_eq!(config.backup_lan_ip, "10.0.0.1/24");
+    }
+
+    #[test]
     fn test_config_parsing_with_mac() {
         let mut sys = MockSystem::new();
         sys.config_content = r#"
@@ -131,11 +157,13 @@ mod tests {
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
             lan_ip = "10.0.0.1/24"
+            backup_lan_ip = "10.0.0.1/24"
         "#
         .to_string();
 
         let config = RouterConfig::parse(&sys).unwrap();
         assert_eq!(config.lan_ip, "10.0.0.1/24");
+        assert_eq!(config.backup_lan_ip, "10.0.0.1/24");
         assert_eq!(
             config.wan_mac,
             MacAddr::from_str("52:54:00:12:34:56").unwrap()
@@ -148,12 +176,30 @@ mod tests {
     }
 
     #[test]
+    fn test_config_parsing_with_backup_lan_ip() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+            backup_lan_ip = "172.16.0.1/24"
+        "#
+        .to_string();
+
+        let config = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(config.lan_ip, "192.168.1.1/24");
+        assert_eq!(config.backup_lan_ip, "172.16.0.1/24");
+    }
+
+    #[test]
     fn test_config_parsing_reboot_delay() {
         let mut sys = MockSystem::new();
         sys.config_content = r#"
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
+            backup_lan_ip = "10.0.0.1/24"
             [system]
             reboot_delay = 5
         "#

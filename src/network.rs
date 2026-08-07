@@ -1,5 +1,10 @@
 use crate::error::RouterError;
-use rtnetlink::Handle;
+use futures_util::TryStreamExt;
+use ipnet::Ipv4Net;
+use rtnetlink::packet_route::AddressFamily;
+use rtnetlink::packet_route::address::AddressAttribute;
+use rtnetlink::packet_route::link::LinkFlags;
+use rtnetlink::{Error as NetlinkError, Handle, LinkUnspec};
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -30,7 +35,6 @@ async fn configure_interface(
     ip_cidr: Option<&str>,
 ) -> Result<(), RouterError> {
     // Get link index by name
-    use futures_util::TryStreamExt;
     let mut links = handle.link().get().match_name(name.to_string()).execute();
     let link = match links.try_next().await {
         Ok(Some(l)) => l,
@@ -40,7 +44,7 @@ async fn configure_interface(
     let index = link.header.index;
 
     // Set link state to UP
-    let message = rtnetlink::LinkUnspec::new_with_index(index).up().build();
+    let message = LinkUnspec::new_with_index(index).up().build();
     handle.link().change(message).execute().await?;
 
     // If an IP/CIDR is specified, assign it to the link index
@@ -57,7 +61,7 @@ async fn configure_interface(
         // Attempt to assign the address. If it's already assigned (EEXIST), ignore the error.
         match handle.address().add(index, ip, prefix).execute().await {
             Ok(_) => println!("[network] Successfully assigned {} to {}", cidr, name),
-            Err(rtnetlink::Error::NetlinkError(msg)) if msg.code.map(|c| c.get()) == Some(-17) => {
+            Err(NetlinkError::NetlinkError(msg)) if msg.code.map(|c| c.get()) == Some(-17) => {
                 // Address already exists (EEXIST), ignore silently
             }
             Err(e) => {
@@ -72,76 +76,61 @@ async fn configure_interface(
     Ok(())
 }
 
-pub async fn ensure_interface_up_and_configured(
-    name: &str,
-    ip_cidr: &str,
-) -> Result<bool, RouterError> {
+pub async fn configure_interface_ip(name: &str, ip_cidr: &str) -> Result<bool, RouterError> {
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 
-    use futures_util::TryStreamExt;
     let mut links = handle.link().get().match_name(name.to_string()).execute();
-    let link = match links.try_next().await {
-        Ok(Some(l)) => l,
-        Ok(None) => return Ok(false), // Link does not exist yet (e.g. unplugged)
-        Err(e) => return Err(e.into()),
+    let Some(link) = links.try_next().await? else {
+        return Ok(false); // Link does not exist yet (e.g. unplugged)
     };
     let index = link.header.index;
 
-    // Check if the link is UP and already has the correct IP address
-    let flags = link.header.flags;
-    let is_up = flags.contains(rtnetlink::packet_route::link::LinkFlags::Up);
+    // Parse target IP/subnet
+    let expected_net = ip_cidr.parse::<Ipv4Net>()?;
+    let expected_ip = IpAddr::V4(expected_net.addr());
+    let expected_prefix = expected_net.prefix_len();
 
-    let parts: Vec<&str> = ip_cidr.split('/').collect();
-    let ip_str = parts[0];
-    let expected_ip = std::net::IpAddr::from_str(ip_str)?;
-    let expected_prefix = if parts.len() > 1 {
-        parts[1].parse::<u8>()?
-    } else {
-        24
-    };
-
-    // Check if the address is already assigned
+    // Flush stale IPv4 addresses and check if the expected one is already set
     let mut already_configured = false;
     let mut addrs = handle.address().get().execute();
     while let Some(addr_msg) = addrs.try_next().await? {
-        if addr_msg.header.index == index {
-            for attr in addr_msg.attributes {
-                if let rtnetlink::packet_route::address::AddressAttribute::Local(ip) = attr
-                    && ip == expected_ip
-                    && addr_msg.header.prefix_len == expected_prefix
-                {
-                    already_configured = true;
-                    break;
+        if addr_msg.header.index == index && matches!(addr_msg.header.family, AddressFamily::Inet) {
+            let is_match = addr_msg.attributes.iter().any(|attr| {
+                if let AddressAttribute::Local(ip) = attr {
+                    *ip == expected_ip && addr_msg.header.prefix_len == expected_prefix
+                } else {
+                    false
                 }
+            });
+
+            if is_match {
+                already_configured = true;
+            } else {
+                println!(
+                    "[network] Deleting stale IP address from interface {}: prefix_len={}",
+                    name, addr_msg.header.prefix_len
+                );
+                let _ = handle.address().del(addr_msg).execute().await;
             }
         }
     }
 
-    if is_up && already_configured {
-        return Ok(true); // Already fully configured and UP
+    if already_configured {
+        return Ok(true); // Already fully configured
     }
 
-    // Set link state to UP
-    let message = rtnetlink::LinkUnspec::new_with_index(index).up().build();
-    handle.link().change(message).execute().await?;
-
-    // Attempt to assign the address. If it's already assigned (EEXIST), ignore the error.
-    match handle
-        .address()
-        .add(index, expected_ip, expected_prefix)
-        .execute()
-        .await
-    {
-        Ok(_) => println!("[network] Successfully assigned {} to {}", ip_cidr, name),
-        Err(rtnetlink::Error::NetlinkError(msg)) if msg.code.map(|c| c.get()) == Some(-17) => {
-            // Address already exists (EEXIST), ignore silently
-        }
-        Err(e) => {
-            println!(
-                "[network] Address assignment message for {} ({}): {}",
-                name, ip_cidr, e
-            );
+    // Assign the address if not already present
+    if !already_configured {
+        match handle
+            .address()
+            .add(index, expected_ip, expected_prefix)
+            .execute()
+            .await
+        {
+            Ok(_) => println!("[network] Successfully assigned {} to {}", ip_cidr, name),
+            Err(NetlinkError::NetlinkError(msg)) if msg.code.map(|c| c.get()) == Some(-17) => {}
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -152,22 +141,19 @@ pub async fn ensure_interface_up(name: &str) -> Result<bool, RouterError> {
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 
-    use futures_util::TryStreamExt;
     let mut links = handle.link().get().match_name(name.to_string()).execute();
-    let link = match links.try_next().await {
-        Ok(Some(l)) => l,
-        Ok(None) => return Ok(false), // Link does not exist yet (e.g. unplugged)
-        Err(e) => return Err(e.into()),
+    let Some(link) = links.try_next().await? else {
+        return Ok(false); // Link does not exist yet (e.g. unplugged)
     };
     let index = link.header.index;
     let flags = link.header.flags;
-    let is_up = flags.contains(rtnetlink::packet_route::link::LinkFlags::Up);
+    let is_up = flags.contains(LinkFlags::Up);
 
     if is_up {
         return Ok(true);
     }
 
-    let message = rtnetlink::LinkUnspec::new_with_index(index).up().build();
+    let message = LinkUnspec::new_with_index(index).up().build();
     handle.link().change(message).execute().await?;
     println!(
         "[network] Successfully set interface {} link state to UP",
