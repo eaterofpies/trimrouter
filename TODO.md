@@ -14,3 +14,4 @@
 - Add service stopping notifications
 - Panic doesn't stop routing / other services. Should it?
 - Service privilege separation
+- Remove RO mount of /boot, storage kernel modules etc and inject config via UEFI?
