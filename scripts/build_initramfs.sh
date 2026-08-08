@@ -1,14 +1,16 @@
 #!/bin/bash
 # =========================================================================
-# Initramfs Packager (Supports all architectures)
+# Initramfs Packager (Supports prod/test modes and all architectures)
 # =========================================================================
 set -e
 
 ARCH=$1
+MODE=$2 # "prod" or "test"
 if [ -z "$ARCH" ]; then
-    echo "Usage: $0 <arch>"
+    echo "Usage: $0 <arch> [prod|test]"
     exit 1
 fi
+MODE=${MODE:-prod}
 
 case "$ARCH" in
     x86_64)
@@ -30,13 +32,24 @@ CURDIR=$(pwd)
 STAGING="target/${ARCH}/staging"
 TEST_BOOT="target/${ARCH}/test_boot"
 BINARY="target/${RUST_TARGET}/release/trimrouter"
+TEST_BINARY="target/${RUST_TARGET}/release/integration_test"
 DIRECT_DEPS="virtio_net virtio_pci virtio_mmio virtio_blk usb_storage uas sd_mod mmc_block sdhci sdhci_pci ahci nft_masq nft_chain_nat nft_ct fat vfat nls_cp437 nls_ascii nls_utf8"
 
-echo "[build] Creating initramfs staging area for ${ARCH}..."
+echo "[build] Creating initramfs staging area for ${ARCH} (mode: ${MODE})..."
 rm -rf "$STAGING"
 mkdir -p "$STAGING/proc" "$STAGING/sys" "$STAGING/dev" "$STAGING/run" "$STAGING/etc" "$STAGING/bin"
-cp "$BINARY" "$STAGING/init"
-chmod +x "$STAGING/init"
+
+if [ "$MODE" = "test" ]; then
+    echo "[build] Copying test runner as /init..."
+    cp "$TEST_BINARY" "$STAGING/init"
+    cp "$BINARY" "$STAGING/bin/trimrouter"
+    chmod +x "$STAGING/init" "$STAGING/bin/trimrouter"
+else
+    echo "[build] Copying production trimrouter as /init..."
+    cp "$BINARY" "$STAGING/init"
+    chmod +x "$STAGING/init"
+fi
+
 mknod -m 600 "$STAGING/dev/console" c 5 1 2>/dev/null || true
 mknod -m 666 "$STAGING/dev/null" c 1 3 2>/dev/null || true
 
@@ -94,6 +107,12 @@ fi
 mkdir -p "${STAGING}/sbin"
 ln -sf ../init "${STAGING}/sbin/modprobe"
 
-echo "[build] Packaging initramfs into target/${ARCH}/initramfs.cpio.gz..."
-(cd "$STAGING" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > ../initramfs.cpio.gz)
-echo "[build] Initramfs archived successfully at: target/${ARCH}/initramfs.cpio.gz"
+if [ "$MODE" = "test" ]; then
+    INITRAMFS_NAME="initramfs-test.cpio.gz"
+else
+    INITRAMFS_NAME="initramfs.cpio.gz"
+fi
+
+echo "[build] Packaging initramfs into target/${ARCH}/${INITRAMFS_NAME}..."
+(cd "$STAGING" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > ../${INITRAMFS_NAME})
+echo "[build] Initramfs archived successfully at: target/${ARCH}/${INITRAMFS_NAME}"

@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [[test]]
-name = "wan_dhcp_test"
+name = "integration_test"
 harness = false
 
 [dependencies]

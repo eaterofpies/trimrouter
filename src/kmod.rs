@@ -418,7 +418,9 @@ pub fn run_as_modprobe(args: Vec<String>) -> Result<(), std::io::Error> {
 }
 
 pub fn start_uevent_listener() {
+    println!("[uevent] Spawning uevent listener thread...");
     std::thread::spawn(move || {
+        println!("[uevent] Uevent listener thread spawned.");
         if let Err(e) = run_uevent_listener() {
             eprintln!("[uevent] Error in uevent listener: {}", e);
         }
@@ -441,8 +443,10 @@ fn run_uevent_listener() -> Result<(), Box<dyn std::error::Error>> {
     use kobject_uevent::UEvent;
     use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_KOBJECT_UEVENT};
 
+    println!("[uevent] Creating Netlink socket...");
     let mut socket = Socket::new(NETLINK_KOBJECT_UEVENT)?;
     let addr = SocketAddr::new(0, 1); // Group 1 is the standard multicast group for uevents
+    println!("[uevent] Binding Netlink socket...");
     socket.bind(&addr)?;
 
     println!("[uevent] Netlink uevent listener started successfully.");

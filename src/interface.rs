@@ -376,7 +376,7 @@ async fn handle_del_link(iface: &mut ManagedInterface, index: u32) {
 }
 
 /// Finds the kernel interface index and current name matching the target MAC address.
-async fn find_interface_by_mac(target_mac: MacAddr) -> Option<(u32, String)> {
+pub async fn find_interface_by_mac(target_mac: MacAddr) -> Option<(u32, String)> {
     let Ok((connection, handle, _)) = rtnetlink::new_connection() else {
         return None;
     };
@@ -396,7 +396,7 @@ async fn find_interface_by_mac(target_mac: MacAddr) -> Option<(u32, String)> {
 }
 
 /// Renames the interface to its configured target name and brings it up.
-async fn rename_and_up_interface(
+pub async fn rename_and_up_interface(
     target_name: &str,
     mac: MacAddr,
     index: u32,

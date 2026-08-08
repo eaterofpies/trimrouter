@@ -1,37 +1,12 @@
-#[macro_export]
-macro_rules! println {
-    ($($arg:tt)*) => {{
-        std::print!("{}", $crate::services::utils::get_timestamp_prefix());
-        std::println!($($arg)*);
-    }};
-}
-
-#[macro_export]
-macro_rules! eprintln {
-    ($($arg:tt)*) => {{
-        std::eprint!("{}", $crate::services::utils::get_timestamp_prefix());
-        std::eprintln!($($arg)*);
-    }};
-}
-
-mod config;
-mod error;
-mod interface;
-mod kmod;
-mod netfilter;
-mod network;
-mod packet;
-mod reaper;
-mod services;
-mod signal;
-mod system;
-
-use config::RouterConfig;
 use nix::unistd::Pid;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use system::{
+use trimrouter::config::RouterConfig;
+use trimrouter::system::{
     RealSystem, SystemOps, mount_boot_partition, mount_virtual_filesystems, register_panic_handler,
+};
+use trimrouter::{
+    eprintln, interface, kmod, netfilter, network, println, reaper, services, signal, system,
 };
 
 #[tokio::main]
@@ -65,7 +40,7 @@ async fn run_as_init(sys: Arc<RealSystem>) {
     let _ = sig_handle.await;
 
     println!("[init] Stopping services...");
-    use services::Service;
+    use trimrouter::services::Service;
     let _ = dns_forwarder.stop().await;
 }
 
@@ -177,7 +152,7 @@ async fn configure_networking_and_services(
     let lease_state = Arc::new(std::sync::Mutex::new(services::WanLease::default()));
 
     // Start DNS Forwarder as a global service
-    use services::Service;
+    use trimrouter::services::Service;
     let mut dns_forwarder = services::DnsForwarder::new(lease_state.clone());
     if let Err(e) = dns_forwarder.start().await {
         eprintln!("[init] ERROR: Failed to start DNS forwarder: {}", e);

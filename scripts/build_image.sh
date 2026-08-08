@@ -21,7 +21,11 @@ case "$ARCH" in
         RUST_TARGET="x86_64-unknown-linux-musl"
         BINARY="target/${RUST_TARGET}/release/trimrouter"
         KERNEL="target/x86_64/test_boot/vmlinuz"
-        INITRAMFS="target/x86_64/initramfs.cpio.gz"
+        if [ "$IMAGE_NAME" = "trimrouter-test.img" ]; then
+            INITRAMFS="target/x86_64/initramfs-test.cpio.gz"
+        else
+            INITRAMFS="target/x86_64/initramfs.cpio.gz"
+        fi
 
         echo "[build-image] Building disk image for x86_64..."
         
@@ -42,22 +46,28 @@ case "$ARCH" in
         ;;
 
     arm64|armhf)
+        if [ "$IMAGE_NAME" = "trimrouter-test.img" ]; then
+            RPI_INITRAMFS_NAME="pi_initramfs-test.cpio.gz"
+        else
+            RPI_INITRAMFS_NAME="pi_initramfs.cpio.gz"
+        fi
+
         case "$ARCH" in
             arm64)
                 RUST_TARGET="aarch64-unknown-linux-musl"
                 DEB_ARCH="arm64"
                 KERNEL_FILE="kernel8.img"
-                CONFIG_TXT="kernel=kernel8.img\narm_64bit=1\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=0"
+                CONFIG_TXT="kernel=kernel8.img\narm_64bit=1\n\n[all]\ninitramfs ${RPI_INITRAMFS_NAME} followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=0"
                 ;;
             armhf)
                 RUST_TARGET="arm-unknown-linux-musleabihf"
                 DEB_ARCH="armhf"
                 KERNEL_FILE="kernel.img"
-                CONFIG_TXT="kernel=kernel.img\narm_64bit=0\n\n[all]\ninitramfs pi_initramfs.cpio.gz followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=0"
+                CONFIG_TXT="kernel=kernel.img\narm_64bit=0\n\n[all]\ninitramfs ${RPI_INITRAMFS_NAME} followkernel\nenable_uart=1\ndtparam=audio=off\nhdmi_blanking=0"
                 ;;
         esac
 
-        RPI_INITRAMFS="target/${ARCH}/pi_initramfs.cpio.gz"
+        RPI_INITRAMFS="target/${ARCH}/${RPI_INITRAMFS_NAME}"
         RPI_STAGING="target/${ARCH}/pi_initramfs"
         RPI_BOOT_DIR="target/${ARCH}/pi_boot"
         RPI_DEB_DIR="target/${ARCH}/rpi_deb"
@@ -105,8 +115,14 @@ case "$ARCH" in
         echo "[build-rpi] Creating Pi initramfs staging area for ${ARCH}..."
         rm -rf "$RPI_STAGING"
         mkdir -p "$RPI_STAGING/proc" "$RPI_STAGING/sys" "$RPI_STAGING/dev" "$RPI_STAGING/run" "$RPI_STAGING/etc" "$RPI_STAGING/bin"
-        cp "$BINARY" "$RPI_STAGING/init"
-        chmod +x "$RPI_STAGING/init"
+        if [ "$IMAGE_NAME" = "trimrouter-test.img" ]; then
+            cp "target/${RUST_TARGET}/release/integration_test" "$RPI_STAGING/init"
+            cp "$BINARY" "$RPI_STAGING/bin/trimrouter"
+            chmod +x "$RPI_STAGING/init" "$RPI_STAGING/bin/trimrouter"
+        else
+            cp "$BINARY" "$RPI_STAGING/init"
+            chmod +x "$RPI_STAGING/init"
+        fi
         mknod -m 600 "$RPI_STAGING/dev/console" c 5 1 2>/dev/null || true
         mknod -m 666 "$RPI_STAGING/dev/null" c 1 3 2>/dev/null || true
 
@@ -171,7 +187,7 @@ case "$ARCH" in
         done
 
         echo "[build-rpi] Packaging Pi initramfs into ${RPI_INITRAMFS}..."
-        (cd "$RPI_STAGING" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > ../pi_initramfs.cpio.gz)
+        (cd "$RPI_STAGING" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "../${RPI_INITRAMFS_NAME}")
 
         # 3. Build image
         echo "[build-rpi] Staging boot partition directory for ${ARCH}..."
@@ -203,7 +219,7 @@ case "$ARCH" in
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/start.elf" ::/
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/fixup.dat" ::/
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/${KERNEL_FILE}" ::/
-        mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/pi_initramfs.cpio.gz" ::/
+        mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/${RPI_INITRAMFS_NAME}" ::/
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/config.txt" ::/
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/cmdline.txt" ::/
         mmd -i "${IMAGE}@@1M" ::/config 2>/dev/null || true

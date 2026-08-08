@@ -58,6 +58,7 @@ define ARCH_RULES
 # $(1): Architecture (x86_64, arm64, armhf)
 
 initramfs-$(1): target/$(1)/initramfs.cpio.gz
+initramfs-test-$(1): target/$(1)/initramfs-test.cpio.gz
 
 image-$(1): target/$(1)/trimrouter.img
 
@@ -66,7 +67,7 @@ qemu-$(1): target/$(1)/trimrouter.img
 
 test-$(1): target/$(1)/trimrouter-test.img
 	@echo "[test] Running integration tests for target architecture $(1)..."
-	@TEST_ARCH=$(1) cargo test --test wan_dhcp_test -- --nocapture
+	@TEST_ARCH=$(1) cargo test --test integration_test -- --nocapture
 
 # Rule for building the target static binary
 target/$(RUST_TARGET_$(1))/release/trimrouter: Cargo.toml Cargo.lock $(SRCS)
@@ -75,20 +76,29 @@ target/$(RUST_TARGET_$(1))/release/trimrouter: Cargo.toml Cargo.lock $(SRCS)
 	@echo "[build] Compiling trimrouter (Static $(1) Release)..."
 	@RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld" cargo build --release --target $(RUST_TARGET_$(1))
 
+target/$(RUST_TARGET_$(1))/release/integration_test: Cargo.toml Cargo.lock $(SRCS)
+	@echo "[build] Ensuring $(RUST_TARGET_$(1)) target is installed..."
+	@rustup target add $(RUST_TARGET_$(1))
+	@echo "[build] Compiling integration_test (Static $(1) Release)..."
+	@RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld" cargo build --release --bin integration_test --target $(RUST_TARGET_$(1))
+
 # Rule for downloading and extracting Debian cloud kernel for tests
 target/$(1)/test_boot/.kernel_extracted: scripts/extract_kernel.sh
 	@./scripts/extract_kernel.sh $(1)
 
 # Rule for building the target initramfs cpio archive
 target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/test_boot/.kernel_extracted scripts/build_initramfs.sh
-	@./scripts/build_initramfs.sh $(1)
+	@./scripts/build_initramfs.sh $(1) prod
+
+target/$(1)/initramfs-test.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(RUST_TARGET_$(1))/release/integration_test target/$(1)/test_boot/.kernel_extracted scripts/build_initramfs.sh
+	@./scripts/build_initramfs.sh $(1) test
 
 # Rule for building the raw disk/SD image
 target/$(1)/trimrouter.img: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/initramfs.cpio.gz scripts/build_image.sh $(TRIMROUTER_CONFIG) $(CONFIG_PATH_TRACKER)
 	@./scripts/build_image.sh $(1) $(TRIMROUTER_CONFIG) trimrouter.img
 
 # Rule for building the test raw disk image (always uses repository-default config/trimrouter.toml)
-target/$(1)/trimrouter-test.img: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/initramfs.cpio.gz scripts/build_image.sh config/trimrouter.toml
+target/$(1)/trimrouter-test.img: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/initramfs-test.cpio.gz scripts/build_image.sh config/trimrouter.toml
 	@./scripts/build_image.sh $(1) config/trimrouter.toml trimrouter-test.img
 endef
 

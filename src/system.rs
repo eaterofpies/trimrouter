@@ -233,6 +233,12 @@ pub mod mock {
         pub waitpid_results: Mutex<Vec<Result<WaitStatus, nix::Error>>>,
     }
 
+    impl Default for MockSystem {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockSystem {
         pub fn new() -> Self {
             MockSystem {
