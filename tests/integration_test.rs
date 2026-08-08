@@ -114,8 +114,10 @@ struct TestEnv {
     _qemu_guard: QemuKillGuard,
     _qemu_child: tokio::process::Child,
     _wan_isp_handle: tokio::task::JoinHandle<bool>,
-    wan_verification_rx: tokio::sync::mpsc::Receiver<String>,
+    _lan_client_handle: tokio::task::JoinHandle<()>,
+    verification_rx: tokio::sync::mpsc::Receiver<String>,
     wan_cmd_tx: tokio::sync::mpsc::Sender<String>,
+    lan_cmd_tx: tokio::sync::mpsc::Sender<String>,
 }
 
 impl Drop for TestEnv {
@@ -127,32 +129,13 @@ impl Drop for TestEnv {
 
 #[tokio::main]
 async fn main() {
-    std::println!("\nrunning 7 integration test steps in QEMU VM");
+    std::println!("\nrunning 8 integration test steps in QEMU VM");
 
     let test_timeout = std::time::Duration::from_secs(180);
     let start_time = std::time::Instant::now();
 
     // 1. Build test initramfs and start mocks/QEMU
     let mut env = startup_stage().await;
-
-    // 2. Connect a dummy client to LAN unix socket to bring the guest LAN interface link UP
-    println!("[test-env] Bringing guest LAN link UP...");
-    let _lan_stream = tokio::spawn(async move {
-        // Wait for target/lan.sock to exist (created by QEMU stream server backend)
-        for _ in 0..100 {
-            if std::path::Path::new("target/lan.sock").exists()
-                && let Ok(_stream) = tokio::net::UnixStream::connect("target/lan.sock").await
-            {
-                println!("[test-env] Connected to guest LAN socket.");
-                // Keep stream open to maintain the link state as UP
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        println!("[test-env] ERROR: Failed to connect to guest LAN socket.");
-    });
 
     // 3. Monitor QEMU output and verification signals in parallel
     use tokio::io::AsyncBufReadExt;
@@ -185,6 +168,8 @@ async fn main() {
                                 failed += 1;
                             } else if line.contains("[test-control] TRIGGER_UNSOLICITED_WAN_TRAFFIC") {
                                 let _ = env.wan_cmd_tx.send("SEND_UNSOLICITED_WAN".to_string()).await;
+                            } else if line.contains("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE") {
+                                let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE".to_string()).await;
                             } else if line.contains("[test-control] SUITE_PASSED") {
                                 suite_status = Some(true);
                                 break;
@@ -199,7 +184,7 @@ async fn main() {
                         }
                     }
                 }
-                Some(sig) = env.wan_verification_rx.recv() => {
+                Some(sig) = env.verification_rx.recv() => {
                     println!("[test-env] Received network-level verification signal: {}", sig);
                 }
             }
@@ -262,18 +247,20 @@ async fn startup_stage() -> TestEnv {
     let wan_listener =
         UnixListener::bind("target/wan.sock").expect("Failed to bind WAN UNIX socket");
 
-    // MPSC Channel to coordinate mock WAN ISP
+    // MPSC Channel to coordinate mock WAN ISP and LAN client
     let (verification_tx, verification_rx) = tokio::sync::mpsc::channel::<String>(100);
     let (wan_cmd_tx, wan_cmd_rx) = tokio::sync::mpsc::channel::<String>(100);
+    let (lan_cmd_tx, lan_cmd_rx) = tokio::sync::mpsc::channel::<String>(100);
 
     // C. Start our mock WAN ISP gateway in a background task
+    let verification_tx_wan = verification_tx.clone();
     let wan_isp_handle = tokio::spawn(async move {
         let (stream, _) = wan_listener
             .accept()
             .await
             .expect("Failed to accept WAN connection from QEMU");
         let mock = UnixStreamMock::new(stream);
-        run_mock_wan_isp(mock, verification_tx, wan_cmd_rx).await
+        run_mock_wan_isp(mock, verification_tx_wan, wan_cmd_rx).await
     });
 
     // D. Detect target architecture for simulation
@@ -365,12 +352,33 @@ async fn startup_stage() -> TestEnv {
     // Capture child process ID for RAII kill guard
     let qemu_kill_guard = qemu_child.id().map(QemuKillGuard);
 
+    let verification_tx_clone = verification_tx.clone();
+    let lan_client_handle = tokio::spawn(async move {
+        // Wait for target/lan.sock to exist (created by QEMU stream server backend)
+        let mut stream = None;
+        for _ in 0..100 {
+            if std::path::Path::new("target/lan.sock").exists()
+                && let Ok(s) = tokio::net::UnixStream::connect("target/lan.sock").await
+            {
+                stream = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let stream = stream.expect("Failed to connect to guest LAN socket");
+        println!("[test-env] Connected to guest LAN socket.");
+        let mock = UnixStreamMock::new(stream);
+        run_mock_lan_client(mock, lan_cmd_rx, verification_tx_clone).await;
+    });
+
     TestEnv {
         _qemu_guard: qemu_kill_guard.unwrap(),
         _qemu_child: qemu_child,
         _wan_isp_handle: wan_isp_handle,
-        wan_verification_rx: verification_rx,
+        _lan_client_handle: lan_client_handle,
+        verification_rx,
         wan_cmd_tx,
+        lan_cmd_tx,
     }
 }
 
@@ -1066,4 +1074,207 @@ fn build_icmp_echo_reply(
     }
 
     buf
+}
+
+fn handle_arp_request_for_ip(
+    frame: &[u8],
+    _client_mac: MacAddr,
+    client_ip: Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    use pnet::packet::Packet;
+    let eth = pnet::packet::ethernet::EthernetPacket::new(frame)?;
+    if eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Arp {
+        let arp = pnet::packet::arp::ArpPacket::new(eth.payload())?;
+        if arp.get_operation() == pnet::packet::arp::ArpOperations::Request {
+            let target_ip = arp.get_target_proto_addr();
+            if let Some(ip) = client_ip
+                && target_ip == ip
+            {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
+fn build_dhcp_discover_lan(xid: u32, client_mac: MacAddr) -> Vec<u8> {
+    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
+    use dhcproto::{Encodable, Encoder};
+
+    let mut disc = Message::default();
+    disc.set_opcode(Opcode::BootRequest);
+    disc.set_xid(xid);
+    disc.set_chaddr(&[
+        client_mac.0,
+        client_mac.1,
+        client_mac.2,
+        client_mac.3,
+        client_mac.4,
+        client_mac.5,
+    ]);
+
+    let opts = disc.opts_mut();
+    opts.insert(DhcpOption::MessageType(MessageType::Discover));
+    opts.insert(DhcpOption::ParameterRequestList(vec![
+        dhcproto::v4::OptionCode::SubnetMask,
+        dhcproto::v4::OptionCode::Router,
+        dhcproto::v4::OptionCode::DomainNameServer,
+    ]));
+
+    let mut payload = Vec::new();
+    disc.encode(&mut Encoder::new(&mut payload)).unwrap();
+    payload
+}
+
+fn build_dhcp_request_lan(
+    xid: u32,
+    client_mac: MacAddr,
+    requested_ip: Ipv4Addr,
+    server_ip: Ipv4Addr,
+) -> Vec<u8> {
+    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
+    use dhcproto::{Encodable, Encoder};
+
+    let mut req = Message::default();
+    req.set_opcode(Opcode::BootRequest);
+    req.set_xid(xid);
+    req.set_chaddr(&[
+        client_mac.0,
+        client_mac.1,
+        client_mac.2,
+        client_mac.3,
+        client_mac.4,
+        client_mac.5,
+    ]);
+
+    let opts = req.opts_mut();
+    opts.insert(DhcpOption::MessageType(MessageType::Request));
+    opts.insert(DhcpOption::RequestedIpAddress(requested_ip));
+    opts.insert(DhcpOption::ServerIdentifier(server_ip));
+
+    let mut payload = Vec::new();
+    req.encode(&mut Encoder::new(&mut payload)).unwrap();
+    payload
+}
+
+async fn run_mock_lan_client(
+    mut mock: UnixStreamMock,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<String>,
+    verification_tx: tokio::sync::mpsc::Sender<String>,
+) {
+    let client_mac = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
+    let mut assigned_ip = None;
+
+    loop {
+        tokio::select! {
+            // A. Handle commands from the orchestrator
+            Some(cmd) = cmd_rx.recv() => {
+                if cmd == "TRIGGER_LAN_DHCP_HANDSHAKE" {
+                    println!("[lan-client] Starting DHCP Handshake...");
+                    // Send DHCPDISCOVER
+                    let xid = rand::random::<u32>();
+                    let discover_payload = build_dhcp_discover_lan(xid, client_mac);
+                    let discover_pkt = packet::build_raw_packet(
+                        client_mac,
+                        MacAddr::broadcast(),
+                        Ipv4Addr::UNSPECIFIED,
+                        Ipv4Addr::BROADCAST,
+                        68,
+                        67,
+                        &discover_payload,
+                    );
+                    if let Err(e) = mock.send_frame(&discover_pkt).await {
+                        println!("[lan-client] ERROR sending DHCPDISCOVER: {}", e);
+                    } else {
+                        println!("[lan-client] Sent DHCPDISCOVER (xid: {})", xid);
+                    }
+                }
+            }
+            // B. Handle frame from LAN socket
+            frame_res = mock.recv_frame() => {
+                let frame = match frame_res {
+                    Ok(f) => f,
+                    Err(_) => break, // Socket closed
+                };
+
+                // Check if it's an ARP request to us
+                if let Some(target_ip) = handle_arp_request_for_ip(&frame, client_mac, assigned_ip)
+                    && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame)
+                    && let Some(arp) = pnet::packet::arp::ArpPacket::new(eth.payload())
+                {
+                    println!("[lan-client] Received ARP request for target IP: {}. Replying...", target_ip);
+                    let reply = build_arp_reply(
+                        client_mac,
+                        eth.get_source(),
+                        target_ip,
+                        arp.get_sender_proto_addr(),
+                    );
+                    let _ = mock.send_frame(&reply).await;
+                }
+
+                // Check if it's an ICMP Echo Request to us
+                if let Some((src_ip, dest_ip)) = parse_icmp_request(&frame).ok().flatten()
+                    && Some(dest_ip) == assigned_ip
+                    && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame)
+                {
+                    println!("[lan-client] Received ICMP request from {} to {}. Replying...", src_ip, dest_ip);
+                    let mut icmp_id = 0x4321;
+                    let mut icmp_seq = 1;
+                    if let Some(ip) = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())
+                        && let Some(icmp) = pnet::packet::icmp::echo_request::EchoRequestPacket::new(ip.payload())
+                    {
+                        icmp_id = icmp.get_identifier();
+                        icmp_seq = icmp.get_sequence_number();
+                    }
+                    let reply = build_icmp_echo_reply(
+                        client_mac,
+                        eth.get_source(),
+                        dest_ip,
+                        src_ip,
+                        icmp_id,
+                        icmp_seq,
+                    );
+                    let _ = mock.send_frame(&reply).await;
+                }
+
+                // Check if it's a DHCP packet
+                if let Ok(dhcp_msg) = parse_dhcp_message(&frame) {
+                    let xid = dhcp_msg.xid();
+                    let msg_type = dhcp_msg.opts().get(dhcproto::v4::OptionCode::MessageType);
+
+                    match msg_type {
+                        Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Offer)) => {
+                            let offered_ip = dhcp_msg.yiaddr();
+                            println!("[lan-client] Received DHCPOFFER for IP: {}", offered_ip);
+                            // Send DHCPREQUEST
+                            let request_payload = build_dhcp_request_lan(
+                                xid,
+                                client_mac,
+                                offered_ip,
+                                Ipv4Addr::new(192, 168, 1, 1),
+                            );
+                            let request_pkt = packet::build_raw_packet(
+                                client_mac,
+                                MacAddr::broadcast(),
+                                Ipv4Addr::UNSPECIFIED,
+                                Ipv4Addr::BROADCAST,
+                                68,
+                                67,
+                                &request_payload,
+                            );
+                            let _ = mock.send_frame(&request_pkt).await;
+                            println!("[lan-client] Sent DHCPREQUEST for IP: {}", offered_ip);
+                        }
+                        Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Ack)) => {
+                            let acked_ip = dhcp_msg.yiaddr();
+                            println!("[lan-client] Received DHCPACK! IP: {} assigned.", acked_ip);
+                            assigned_ip = Some(acked_ip);
+                            let _ = verification_tx.send("LAN_DHCP_VERIFIED".to_string()).await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }

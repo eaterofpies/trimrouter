@@ -272,6 +272,19 @@ async fn main() {
         );
     }
 
+    // Test 8: LAN DHCP Server Handshake
+    let handshake_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
+    match lan_manager::test_lan_dhcp_handshake(handshake_lease_state).await {
+        Ok(_) => {
+            std::println!("[test-control] TEST_PASSED lan_dhcp_handshake");
+            passed += 1;
+        }
+        Err(e) => {
+            std::println!("[test-control] TEST_FAILED lan_dhcp_handshake {}", e);
+            failed += 1;
+        }
+    }
+
     // Test 7: LAN/WAN Subnet Overlap
     let conflict_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
     match lan_manager::test_lan_wan_conflict(conflict_lease_state).await {
