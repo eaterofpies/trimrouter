@@ -157,6 +157,19 @@ async fn main() {
             None
         }
     };
+    // Test 8: LAN DHCP Server Handshake
+    let mut lan_manager = None;
+    match lan_manager::test_lan_dhcp_handshake(lease_state.clone()).await {
+        Ok(manager) => {
+            std::println!("[test-control] TEST_PASSED lan_dhcp_handshake");
+            passed += 1;
+            lan_manager = Some(manager);
+        }
+        Err(e) => {
+            std::println!("[test-control] TEST_FAILED lan_dhcp_handshake {}", e);
+            failed += 1;
+        }
+    }
 
     // Test 2: DNS Forwarding (Only run if client bound successfully)
     let mut dns_forwarder = None;
@@ -261,6 +274,12 @@ async fn main() {
         std::println!("[test-control] TEST_FAILED stop_sntp_client {}", e);
         failed += 1;
     }
+    if let Some(mut lan) = lan_manager.take()
+        && let Err(e) = lan.stop().await
+    {
+        std::println!("[test-control] TEST_FAILED stop_lan_manager {}", e);
+        failed += 1;
+    }
 
     // Clean WAN IP configuration
     if let Some(index) = get_interface_index("wan").await
@@ -270,19 +289,6 @@ async fn main() {
             "[test] Warning: Failed to flush WAN IP addresses during cleanup: {}",
             e
         );
-    }
-
-    // Test 8: LAN DHCP Server Handshake
-    let handshake_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
-    match lan_manager::test_lan_dhcp_handshake(handshake_lease_state).await {
-        Ok(_) => {
-            std::println!("[test-control] TEST_PASSED lan_dhcp_handshake");
-            passed += 1;
-        }
-        Err(e) => {
-            std::println!("[test-control] TEST_FAILED lan_dhcp_handshake {}", e);
-            failed += 1;
-        }
     }
 
     // Test 7: LAN/WAN Subnet Overlap

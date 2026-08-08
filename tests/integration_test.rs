@@ -170,6 +170,8 @@ async fn main() {
                                 let _ = env.wan_cmd_tx.send("SEND_UNSOLICITED_WAN".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE") {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE".to_string()).await;
+                            } else if line.contains("[test-control] TRIGGER_FORWARDED_NAT_TEST") {
+                                let _ = env.lan_cmd_tx.send("TRIGGER_FORWARDED_NAT_TEST".to_string()).await;
                             } else if line.contains("[test-control] SUITE_PASSED") {
                                 suite_status = Some(true);
                                 break;
@@ -1188,6 +1190,23 @@ async fn run_mock_lan_client(
                     } else {
                         println!("[lan-client] Sent DHCPDISCOVER (xid: {})", xid);
                     }
+                } else if cmd == "TRIGGER_FORWARDED_NAT_TEST" {
+                    println!("[lan-client] Starting Forwarded NAT test...");
+                    let payload = b"NAT_PING_TEST";
+                    let pkt = packet::build_raw_packet(
+                        client_mac,
+                        MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+                        Ipv4Addr::new(192, 168, 1, 2),
+                        Ipv4Addr::new(8, 8, 8, 8),
+                        23456,
+                        23456,
+                        payload,
+                    );
+                    if let Err(e) = mock.send_frame(&pkt).await {
+                        println!("[lan-client] ERROR sending NAT Ping: {}", e);
+                    } else {
+                        println!("[lan-client] Sent NAT Ping to 8.8.8.8:23456");
+                    }
                 }
             }
             // B. Handle frame from LAN socket
@@ -1237,6 +1256,27 @@ async fn run_mock_lan_client(
                     let _ = mock.send_frame(&reply).await;
                 }
 
+                // Check if it's a UDP response for us (Forwarded NAT verification)
+                if let Some((src_ip, src_port, dest_port, payload)) = parse_udp_payload(&frame)
+                    && src_ip == Ipv4Addr::new(8, 8, 8, 8)
+                    && src_port == 23456
+                    && dest_port == 23456
+                    && payload == b"NAT_PONG_TEST"
+                {
+                    println!("[lan-client] Received NAT_PONG_TEST from 8.8.8.8! NAT verified.");
+                    // Send confirmation to the guest's UDP socket (192.168.1.1:23457)
+                    let confirm_pkt = packet::build_raw_packet(
+                        client_mac,
+                        MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+                        Ipv4Addr::new(192, 168, 1, 2),
+                        Ipv4Addr::new(192, 168, 1, 1),
+                        23456,
+                        23457,
+                        b"FORWARDED_NAT_OK",
+                    );
+                    let _ = mock.send_frame(&confirm_pkt).await;
+                }
+
                 // Check if it's a DHCP packet
                 if let Ok(dhcp_msg) = parse_dhcp_message(&frame) {
                     let xid = dhcp_msg.xid();
@@ -1277,4 +1317,22 @@ async fn run_mock_lan_client(
             }
         }
     }
+}
+
+fn parse_udp_payload(frame: &[u8]) -> Option<(Ipv4Addr, u16, u16, Vec<u8>)> {
+    use pnet::packet::Packet;
+    let eth = pnet::packet::ethernet::EthernetPacket::new(frame)?;
+    if eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4 {
+        let ip = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())?;
+        if ip.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Udp {
+            let udp = pnet::packet::udp::UdpPacket::new(ip.payload())?;
+            return Some((
+                ip.get_source(),
+                udp.get_source(),
+                udp.get_destination(),
+                udp.payload().to_vec(),
+            ));
+        }
+    }
+    None
 }

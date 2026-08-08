@@ -126,7 +126,7 @@ async fn get_interface_ips(name: &str) -> Result<Vec<Ipv4Addr>, String> {
     Ok(ips)
 }
 
-pub async fn test_lan_dhcp_handshake(lease_state: SharedWanLease) -> Result<(), String> {
+pub async fn test_lan_dhcp_handshake(lease_state: SharedWanLease) -> Result<LanManager, String> {
     std::println!("[test] Starting LAN DHCP Server Handshake test...");
 
     // 1. Start LanManager service on "lan" (which starts the LAN DHCP server)
@@ -201,12 +201,10 @@ pub async fn test_lan_dhcp_handshake(lease_state: SharedWanLease) -> Result<(), 
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // Stop LAN manager to clean up
-    if let Err(e) = lan_manager.stop().await {
-        return Err(format!("Failed to stop LanManager during cleanup: {}", e));
-    }
-
     if !success {
+        if let Err(e) = lan_manager.stop().await {
+            std::eprintln!("[test] Warning: Failed to stop LanManager during cleanup: {}", e);
+        }
         return Err(
             "LAN DHCP handshake test failed: did not receive ICMP reply from leased client"
                 .to_string(),
@@ -214,7 +212,7 @@ pub async fn test_lan_dhcp_handshake(lease_state: SharedWanLease) -> Result<(), 
     }
 
     std::println!("[test] LAN DHCP Server Handshake verified successfully.");
-    Ok(())
+    Ok(lan_manager)
 }
 
 fn build_icmp_echo_request(id: u16, seq: u16) -> Vec<u8> {
