@@ -35,8 +35,12 @@ When the server receives a message from a client, it processes it according to t
 
 ### 3.1 DISCOVER Processing
 1.  Filters and checks if the client MAC already has an active lease. If yes, offers that IP address.
-2.  If no lease exists, calls `next_available_ip()` to find the first unused host IP in the LAN subnet (excluding the server's own gateway IP).
-3.  Returns a `DHCPOFFER` to the client.
+2.  If no lease exists, calls `next_available_ip()` to find a candidate host IP in the LAN subnet (excluding the server's own gateway IP).
+3.  **Active Verification**: Performs active verification using kernel-assisted ARP probing by sending a dummy UDP packet to target the IP and sleeping for 100ms.
+    *   **Dynamic Netlink Watcher**: A long-running background task subscribes to the kernel's `MulticastGroup::Neigh` Netlink group. It reactively parses neighbor (`NewNeighbour`) events to register IP/MAC mappings directly into the shared lease table.
+    *   If a conflict is detected (the IP is resolved under a different MAC in the lease table), the candidate IP is marked as temporarily reserved (5-minute hold), and the search continues for the next available IP.
+    *   If no conflict is detected, the IP is offered.
+4.  Returns a `DHCPOFFER` to the client.
 
 ### 3.2 REQUEST Processing
 1.  **Request Type Validation**: Inspects the requested IP address and the Server Identifier (Option 54).
@@ -44,7 +48,8 @@ When the server receives a message from a client, it processes it according to t
     *   Verifies the requested IP is within the LAN subnet scope.
     *   Verifies the requested IP does not conflict with the server's own gateway IP address.
     *   Verifies the requested IP is not already leased to another client MAC.
-3.  **Conflict Response**: If any validation check fails, the server responds with a `DHCPNAK` to force the client to restart the negotiation.
+    *   **Active Verification**: Triggers an active kernel-assisted ARP probe (sending a dummy UDP packet and sleeping for 100ms). If the background Netlink watcher resolves a different MAC address for this IP, a conflict is registered.
+3.  **Conflict Response**: If any validation check or active Netlink/ARP verification fails, the server responds with a `DHCPNAK` to force the client to restart the negotiation.
 4.  **Successful Lease**: If valid, the server inserts/updates the lease in the `LeaseTable` (applying a default duration of 3600 seconds), and returns a `DHCPACK`.
 
 ---

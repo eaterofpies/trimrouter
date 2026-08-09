@@ -11,4 +11,4 @@
 - Add service stopping notifications
 - Panic doesn't stop routing / other services. Should it?
 - Service privilege separation
-- Check if an IP is taken by an existing device before granting a lease (ARP table, ping, etc) - In case the router reboots
+- Remove compressed module loading support if the kernel can do it

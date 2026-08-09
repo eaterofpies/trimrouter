@@ -3,10 +3,16 @@ use super::utils::{
     wait_shutdown,
 };
 use crate::packet::build_raw_packet;
+use futures_util::StreamExt;
 use pnet::packet::ethernet::EthernetPacket;
 use pnet::util::MacAddr;
+use rtnetlink::MulticastGroup;
+use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
+use rtnetlink::packet_route::RouteNetlinkMessage;
+use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 
@@ -106,6 +112,14 @@ mod lease_table {
             self.evict_expired();
             net.hosts()
                 .find(|&ip| ip != server_ip && self.is_ip_available(ip))
+        }
+
+        /// Finds the MAC address that currently holds the lease for `ip`.
+        pub fn get_mac_by_ip(&self, ip: Ipv4Addr) -> Option<MacAddr> {
+            self.by_mac
+                .iter()
+                .find(|(_, lease)| lease.ip == ip && lease.expiry > Instant::now())
+                .map(|(&mac, _)| mac)
         }
 
         /// Number of active (non-expired) leases. Used in tests.
@@ -250,7 +264,13 @@ async fn run_dhcp_server(
         println!("[dhcp-server] Dynamic lease pool: (empty)");
     }
 
-    let mut leases = LeaseTable::new();
+    let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
+
+    let arp_leases = Arc::clone(&leases);
+    let arp_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        start_arp_listener(arp_leases, arp_shutdown_rx).await;
+    });
 
     loop {
         if *shutdown_rx.borrow() {
@@ -261,7 +281,7 @@ async fn run_dhcp_server(
             server_ip,
             subnet_mask,
             net,
-            &mut leases,
+            Arc::clone(&leases),
             &mut shutdown_rx,
         )
         .await
@@ -276,7 +296,7 @@ async fn run_server_iteration(
     server_ip: std::net::Ipv4Addr,
     subnet_mask: std::net::Ipv4Addr,
     net: ipnet::Ipv4Net,
-    leases: &mut LeaseTable,
+    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let setup_res = tokio::select! {
@@ -294,14 +314,16 @@ async fn run_server_iteration(
         }
     };
 
-    let config = ServerConfig {
+    let config = Arc::new(ServerConfig {
         server_ip,
         subnet_mask,
         server_mac: mac,
         net,
-    };
+    });
 
-    let loop_res = run_server_loop(&async_sock, &config, leases, shutdown_rx).await;
+    let async_sock_shared = Arc::new(async_sock);
+
+    let loop_res = run_server_loop(async_sock_shared, config, leases, shutdown_rx).await;
 
     unsafe {
         libc::close(raw_fd);
@@ -359,9 +381,9 @@ async fn receive_next_packet(
 }
 
 async fn run_server_loop(
-    async_sock: &AsyncFd<RawFd>,
-    config: &ServerConfig,
-    leases: &mut LeaseTable,
+    async_sock: Arc<AsyncFd<RawFd>>,
+    config: Arc<ServerConfig>,
+    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 2048];
@@ -370,22 +392,29 @@ async fn run_server_loop(
             return Ok(());
         }
 
-        let Some(bytes_read) = receive_next_packet(async_sock, shutdown_rx, &mut buf).await? else {
+        let Some(bytes_read) = receive_next_packet(&async_sock, shutdown_rx, &mut buf).await?
+        else {
             return Ok(());
         };
 
-        process_incoming_packet(bytes_read, &buf, async_sock, config, leases).await;
+        let pkt_data = buf[..bytes_read].to_vec();
+        let async_sock_clone = Arc::clone(&async_sock);
+        let config_clone = Arc::clone(&config);
+        let leases_clone = Arc::clone(&leases);
+
+        tokio::spawn(async move {
+            process_incoming_packet(pkt_data, async_sock_clone, config_clone, leases_clone).await;
+        });
     }
 }
 
 async fn process_incoming_packet(
-    bytes_read: usize,
-    buf: &[u8; 2048],
-    async_sock: &AsyncFd<RawFd>,
-    config: &ServerConfig,
-    leases: &mut LeaseTable,
+    buf: Vec<u8>,
+    async_sock: Arc<AsyncFd<RawFd>>,
+    config: Arc<ServerConfig>,
+    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
 ) {
-    let dhcp = match parse_dhcp_payload(&buf[..bytes_read], dhcproto::v4::SERVER_PORT) {
+    let dhcp = match parse_dhcp_payload(&buf, dhcproto::v4::SERVER_PORT) {
         Some(d) => d,
         None => return,
     };
@@ -401,7 +430,7 @@ async fn process_incoming_packet(
     };
 
     // Server-side anti-spoofing MAC check
-    let eth = match EthernetPacket::new(&buf[..bytes_read]) {
+    let eth = match EthernetPacket::new(&buf) {
         Some(e) => e,
         None => return,
     };
@@ -421,16 +450,18 @@ async fn process_incoming_packet(
 
     match msg_type {
         dhcproto::v4::MessageType::Discover => {
-            handle_dhcp_discover(async_sock, config, &dhcp, client_mac, leases).await;
+            handle_dhcp_discover(async_sock, &config, &dhcp, client_mac, leases).await;
         }
         dhcproto::v4::MessageType::Request => {
-            handle_dhcp_request(async_sock, config, &dhcp, client_mac, leases).await;
+            handle_dhcp_request(async_sock, &config, &dhcp, client_mac, leases).await;
         }
         dhcproto::v4::MessageType::Decline => {
-            handle_dhcp_decline(client_mac, leases);
+            let mut leases_guard = leases.lock().await;
+            handle_dhcp_decline(client_mac, &mut leases_guard);
         }
         dhcproto::v4::MessageType::Release => {
-            handle_dhcp_release(client_mac, leases);
+            let mut leases_guard = leases.lock().await;
+            handle_dhcp_release(client_mac, &mut leases_guard);
         }
         _ => {}
     }
@@ -535,35 +566,197 @@ async fn send_dhcp_nak(
     send_raw_packet(async_sock, &frame).await;
 }
 
+async fn trigger_arp_resolution(server_ip: Ipv4Addr, target_ip: Ipv4Addr) {
+    if let Ok(socket) = std::net::UdpSocket::bind((server_ip, 0)) {
+        let _ = socket.send_to(&[0u8], (target_ip, 9));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+/// Process incoming Netlink neighbour table events (ARP additions/updates).
+/// Maps active MAC-to-IP pairings directly into the DHCP lease table dynamically.
+async fn handle_neigh_message(msg: NeighbourMessage, leases: &Arc<tokio::sync::Mutex<LeaseTable>>) {
+    let mut ip_opt = None;
+    let mut mac_opt = None;
+
+    // Parse out IP and MAC addresses from the Netlink message attributes
+    for nla in msg.attributes {
+        match nla {
+            NeighbourAttribute::Destination(NeighbourAddress::Inet(ip)) => {
+                ip_opt = Some(ip);
+            }
+            NeighbourAttribute::LinkLayerAddress(mac_bytes) if mac_bytes.len() == 6 => {
+                let bytes: [u8; 6] = mac_bytes.try_into().unwrap();
+                mac_opt = Some(MacAddr::from(bytes));
+            }
+            _ => {}
+        }
+    }
+
+    // Ignore messages lacking both IP and MAC attributes
+    let (Some(ip), Some(mac)) = (ip_opt, mac_opt) else {
+        return;
+    };
+
+    // Filter out invalid/special hardware address entries
+    if mac == MacAddr::zero() || mac == MacAddr::broadcast() {
+        return;
+    }
+
+    let mut leases_guard = leases.lock().await;
+    // Record or update this device's lease status based on the ARP event
+    if let Some(existing) = leases_guard.get(&mac) {
+        // If a device's IP has changed, update it with a temporary hold
+        if existing.ip != ip {
+            leases_guard.insert(
+                mac,
+                ClientLease {
+                    ip,
+                    expiry: Instant::now() + Duration::from_secs(300), // 5 minute dynamic hold
+                },
+            );
+        }
+    } else {
+        // Register newly discovered devices with a dynamic hold lease
+        leases_guard.insert(
+            mac,
+            ClientLease {
+                ip,
+                expiry: Instant::now() + Duration::from_secs(300), // 5 minute dynamic hold
+            },
+        );
+    }
+}
+
+async fn process_netlink_message(
+    message: NetlinkMessage<RouteNetlinkMessage>,
+    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
+) {
+    if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg)) = message.payload {
+        handle_neigh_message(msg, leases).await;
+    }
+}
+
+async fn start_arp_listener(
+    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let (connection, _handle, mut messages) =
+        match rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("[dhcp-server] Failed to start Netlink ARP listener: {}", e);
+                return;
+            }
+        };
+    tokio::spawn(connection);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            Some((message, _addr)) = messages.next() => {
+                process_netlink_message(message, &leases).await;
+            }
+        }
+    }
+}
+
+async fn get_next_candidate(
+    config: &ServerConfig,
+    client_mac: MacAddr,
+    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
+) -> Option<Ipv4Addr> {
+    let mut leases_guard = leases.lock().await;
+    let ip = leases_guard.next_available_ip(config.net, config.server_ip)?;
+    leases_guard.insert(
+        client_mac,
+        ClientLease {
+            ip,
+            expiry: Instant::now() + Duration::from_secs(10), // 10 second hold
+        },
+    );
+    Some(ip)
+}
+
+async fn probe_and_allocate_ip(
+    config: &ServerConfig,
+    client_mac: MacAddr,
+    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
+) -> Option<Ipv4Addr> {
+    loop {
+        let ip = get_next_candidate(config, client_mac, leases).await?;
+
+        println!(
+            "[dhcp-server] Probing if IP {} is already in use on the LAN...",
+            ip
+        );
+        trigger_arp_resolution(config.server_ip, ip).await;
+
+        let mut leases_guard = leases.lock().await;
+        if let Some(owner_mac) = leases_guard.get_mac_by_ip(ip) {
+            if owner_mac == client_mac {
+                return Some(ip);
+            }
+            println!(
+                "[dhcp-server] CONFLICT DETECTED: IP {} is active on LAN with MAC {}. Marking as temporarily reserved.",
+                ip, owner_mac
+            );
+            leases_guard.insert(
+                MacAddr::zero(),
+                ClientLease {
+                    ip,
+                    expiry: Instant::now() + Duration::from_secs(300),
+                },
+            );
+        } else {
+            return Some(ip);
+        }
+    }
+}
+
 async fn handle_dhcp_discover(
-    async_sock: &AsyncFd<RawFd>,
+    async_sock: Arc<AsyncFd<RawFd>>,
     config: &ServerConfig,
     dhcp: &dhcproto::v4::Message,
     client_mac: MacAddr,
-    leases: &mut LeaseTable,
+    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
 ) {
     println!(
         "[dhcp-server] Received DHCPDISCOVER from client MAC: {}",
         client_mac
     );
 
-    // Re-offer the same IP if this client already has a live lease.
-    let leased_ip = if let Some(existing) = leases.get(&client_mac) {
-        existing.ip
-    } else {
-        let Some(ip) = leases.next_available_ip(config.net, config.server_ip) else {
-            eprintln!("[dhcp-server] DHCP IP pool exhausted!");
-            return;
-        };
-        leases.insert(
+    let mut leased_ip = None;
+    {
+        let leases_guard = leases.lock().await;
+        if let Some(existing) = leases_guard.get(&client_mac) {
+            leased_ip = Some(existing.ip);
+        }
+    }
+
+    if leased_ip.is_none() {
+        leased_ip = probe_and_allocate_ip(config, client_mac, &leases).await;
+    }
+
+    let Some(leased_ip) = leased_ip else {
+        eprintln!("[dhcp-server] DHCP IP pool exhausted!");
+        return;
+    };
+
+    {
+        let mut leases_guard = leases.lock().await;
+        leases_guard.insert(
             client_mac,
             ClientLease {
-                ip,
+                ip: leased_ip,
                 expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
             },
         );
-        ip
-    };
+    }
 
     let payload =
         match build_dhcp_reply_payload(dhcproto::v4::MessageType::Offer, dhcp, leased_ip, config) {
@@ -585,57 +778,95 @@ async fn handle_dhcp_discover(
         &payload,
     );
 
-    send_raw_packet(async_sock, &frame).await;
+    send_raw_packet(&async_sock, &frame).await;
     println!(
         "[dhcp-server] Sent DHCPOFFER of IP: {} to client.",
         leased_ip
     );
 }
 
-async fn handle_dhcp_request(
-    async_sock: &AsyncFd<RawFd>,
-    config: &ServerConfig,
+async fn get_requested_or_existing_ip(
     dhcp: &dhcproto::v4::Message,
     client_mac: MacAddr,
-    leases: &mut LeaseTable,
-) {
+    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
+) -> Option<Ipv4Addr> {
     use dhcproto::v4::{DhcpOption, OptionCode};
-
-    println!(
-        "[dhcp-server] Received DHCPREQUEST from client MAC: {}",
-        client_mac
-    );
-
     let requested_ip_opt = match dhcp.opts().get(OptionCode::RequestedIpAddress) {
         Some(DhcpOption::RequestedIpAddress(ip)) => Some(*ip),
         _ => None,
     };
-
-    let leased_ip = if let Some(req_ip) = requested_ip_opt {
-        req_ip
-    } else if let Some(existing) = leases.get(&client_mac) {
-        existing.ip
+    if let Some(req_ip) = requested_ip_opt {
+        Some(req_ip)
     } else {
-        return;
-    };
-
-    if !validate_requested_ip(leased_ip, client_mac, config, leases) {
-        eprintln!(
-            "[dhcp-server] WARNING: Client {} requested invalid or conflicting IP {}. Sending NAK.",
-            client_mac, leased_ip
-        );
-        send_dhcp_nak(async_sock, dhcp, client_mac, config).await;
-        return;
+        let leases_guard = leases.lock().await;
+        leases_guard.get(&client_mac).map(|l| l.ip)
     }
+}
 
-    leases.insert(
+async fn validate_requested_ip_lock(
+    leased_ip: Ipv4Addr,
+    client_mac: MacAddr,
+    config: &ServerConfig,
+    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
+) -> bool {
+    let leases_guard = leases.lock().await;
+    validate_requested_ip(leased_ip, client_mac, config, &leases_guard)
+}
+
+async fn verify_arp_conflict(
+    leased_ip: Ipv4Addr,
+    client_mac: MacAddr,
+    config: &ServerConfig,
+    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
+) -> bool {
+    println!(
+        "[dhcp-server] Performing ARP verification for requested IP {}...",
+        leased_ip
+    );
+    trigger_arp_resolution(config.server_ip, leased_ip).await;
+
+    let mut leases_guard = leases.lock().await;
+    if let Some(owner_mac) = leases_guard.get_mac_by_ip(leased_ip)
+        && owner_mac != client_mac
+    {
+        eprintln!(
+            "[dhcp-server] CONFLICT DETECTED: IP {} is active on LAN with MAC {} (requested by {}).",
+            leased_ip, owner_mac, client_mac
+        );
+        leases_guard.insert(
+            MacAddr::zero(),
+            ClientLease {
+                ip: leased_ip,
+                expiry: Instant::now() + Duration::from_secs(300),
+            },
+        );
+        return true;
+    }
+    false
+}
+
+async fn confirm_lease(
+    leased_ip: Ipv4Addr,
+    client_mac: MacAddr,
+    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
+) {
+    let mut leases_guard = leases.lock().await;
+    leases_guard.insert(
         client_mac,
         ClientLease {
             ip: leased_ip,
             expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
         },
     );
+}
 
+async fn send_dhcp_ack(
+    async_sock: &AsyncFd<RawFd>,
+    dhcp: &dhcproto::v4::Message,
+    client_mac: MacAddr,
+    leased_ip: Ipv4Addr,
+    config: &ServerConfig,
+) {
     let payload =
         match build_dhcp_reply_payload(dhcproto::v4::MessageType::Ack, dhcp, leased_ip, config) {
             Ok(p) => p,
@@ -658,6 +889,40 @@ async fn handle_dhcp_request(
 
     send_raw_packet(async_sock, &frame).await;
     println!("[dhcp-server] Sent DHCPACK of IP: {} to client.", leased_ip);
+}
+
+async fn handle_dhcp_request(
+    async_sock: Arc<AsyncFd<RawFd>>,
+    config: &ServerConfig,
+    dhcp: &dhcproto::v4::Message,
+    client_mac: MacAddr,
+    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
+) {
+    println!(
+        "[dhcp-server] Received DHCPREQUEST from client MAC: {}",
+        client_mac
+    );
+
+    let Some(leased_ip) = get_requested_or_existing_ip(dhcp, client_mac, &leases).await else {
+        return;
+    };
+
+    if !validate_requested_ip_lock(leased_ip, client_mac, config, &leases).await {
+        eprintln!(
+            "[dhcp-server] WARNING: Client {} requested invalid or conflicting IP {}. Sending NAK.",
+            client_mac, leased_ip
+        );
+        send_dhcp_nak(&async_sock, dhcp, client_mac, config).await;
+        return;
+    }
+
+    if verify_arp_conflict(leased_ip, client_mac, config, &leases).await {
+        send_dhcp_nak(&async_sock, dhcp, client_mac, config).await;
+        return;
+    }
+
+    confirm_lease(leased_ip, client_mac, &leases).await;
+    send_dhcp_ack(&async_sock, dhcp, client_mac, leased_ip, config).await;
 }
 
 /// Returns true if `leased_ip` is valid for the requesting client:
@@ -943,5 +1208,89 @@ mod tests {
             &config,
             &leases
         ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_neigh_message() {
+        use rtnetlink::packet_route::neighbour::NeighbourMessage;
+        let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
+        let mut msg = NeighbourMessage::default();
+        msg.attributes = vec![
+            NeighbourAttribute::Destination(NeighbourAddress::Inet(Ipv4Addr::new(192, 168, 1, 50))),
+            NeighbourAttribute::LinkLayerAddress(vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+        ];
+
+        handle_neigh_message(msg, &leases).await;
+
+        let leases_guard = leases.lock().await;
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let lease = leases_guard.get(&mac).unwrap();
+        assert_eq!(lease.ip, Ipv4Addr::new(192, 168, 1, 50));
+    }
+
+    #[tokio::test]
+    async fn test_verify_arp_conflict_detects_conflict() {
+        let config = make_config("192.168.1.1/24");
+        let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
+
+        let client_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let owner_mac = MacAddr::new(0x52, 0x54, 0x00, 0x12, 0x34, 0x56);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+
+        // Pre-populate lease table with another owner for the target IP (simulating Netlink catching it)
+        {
+            let mut guard = leases.lock().await;
+            guard.insert(
+                owner_mac,
+                ClientLease {
+                    ip: target_ip,
+                    expiry: Instant::now() + Duration::from_secs(300),
+                },
+            );
+        }
+
+        // Running verify_arp_conflict for client_mac should return true (conflict)
+        let is_conflict = verify_arp_conflict(target_ip, client_mac, &config, &leases).await;
+        assert!(is_conflict);
+
+        // Verify that a 5-minute temporary reservation was recorded for this IP under MacAddr::zero()
+        let guard = leases.lock().await;
+        let reservation = guard.get(&MacAddr::zero()).unwrap();
+        assert_eq!(reservation.ip, target_ip);
+    }
+
+    #[tokio::test]
+    async fn test_handle_neigh_message_preserves_longer_lease() {
+        let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let ip = Ipv4Addr::new(192, 168, 1, 50);
+        let long_expiry = Instant::now() + Duration::from_secs(3600);
+
+        // Pre-populate with a long lease
+        {
+            let mut guard = leases.lock().await;
+            guard.insert(
+                mac,
+                ClientLease {
+                    ip,
+                    expiry: long_expiry,
+                },
+            );
+        }
+
+        // Send a NeighbourMessage with the same MAC and IP
+        let mut msg = NeighbourMessage::default();
+        msg.attributes = vec![
+            NeighbourAttribute::Destination(NeighbourAddress::Inet(ip)),
+            NeighbourAttribute::LinkLayerAddress(vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+        ];
+
+        handle_neigh_message(msg, &leases).await;
+
+        // Verify the long expiry is preserved and NOT shortened
+        let guard = leases.lock().await;
+        let lease = guard.get(&mac).unwrap();
+        assert_eq!(lease.ip, ip);
+        assert_eq!(lease.expiry, long_expiry);
     }
 }
