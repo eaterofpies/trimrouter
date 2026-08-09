@@ -85,7 +85,7 @@ case "$ARCH" in
             touch "${APT_DIR}/var/lib/apt/status"
             cp /usr/share/keyrings/debian-archive-keyring.gpg "${APT_DIR}/etc/apt/trusted.gpg.d/debian.gpg"
 
-            echo "deb [arch=${DEB_ARCH} trusted=yes] https://archive.raspberrypi.org/debian/ bookworm main" > "${APT_DIR}/etc/apt/sources.list"
+            echo "deb [arch=${DEB_ARCH} trusted=yes] https://archive.raspberrypi.org/debian/ trixie main" > "${APT_DIR}/etc/apt/sources.list"
 
             APT_OPTS="-o Dir=${CURDIR}/${APT_DIR} -o Dir::Etc::main=/dev/null -o Dir::Etc::parts=/dev/null"
 

@@ -48,6 +48,9 @@ async fn main() {
     std::println!("Starting trimrouter Integration Test Suite (PID 1)");
     std::println!("====================================================");
 
+    let mut passed = 0;
+    let mut failed = 0;
+
     // 2. Initialize guest environment (similar to early_boot)
     if sys.getpid() == Pid::from_raw(1) {
         if let Err(e) = mount_virtual_filesystems(sys.as_ref()) {
@@ -67,50 +70,58 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        // Rename WAN interface based on config MAC mapping
-        if let Some((index, current_name)) =
-            trimrouter::interface::find_interface_by_mac(config.wan_mac).await
-        {
-            if let Err(e) = trimrouter::interface::rename_and_up_interface(
-                "wan",
-                config.wan_mac,
-                index,
-                &current_name,
-            )
-            .await
-            {
-                std::eprintln!("[test] FATAL: Failed to rename/up WAN interface: {}", e);
-                std::process::exit(1);
+
+        // Test 0: Network Device Discovery (Waiting for interfaces to appear via MAC)
+        std::println!("[test] Starting Network Device Discovery test...");
+        let mut devices_ready = false;
+        let discovery_timeout = Duration::from_secs(15);
+        let wan_mac = config.wan_mac;
+        let lan_mac = config.lan_mac;
+        let mut wan_info = None;
+        let mut lan_info = None;
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < discovery_timeout {
+            if wan_info.is_none() {
+                wan_info = trimrouter::interface::find_interface_by_mac(wan_mac).await;
             }
+            if lan_info.is_none() {
+                lan_info = trimrouter::interface::find_interface_by_mac(lan_mac).await;
+            }
+            if wan_info.is_some() && lan_info.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        if let (Some((wan_idx, wan_name)), Some((lan_idx, lan_name))) = (wan_info, lan_info) {
+            let wan_rename =
+                trimrouter::interface::rename_and_up_interface("wan", wan_mac, wan_idx, &wan_name)
+                    .await;
+            let lan_rename =
+                trimrouter::interface::rename_and_up_interface("lan", lan_mac, lan_idx, &lan_name)
+                    .await;
+            if wan_rename.is_ok() && lan_rename.is_ok() {
+                devices_ready = true;
+            } else {
+                std::eprintln!(
+                    "[test] Failed to rename network devices: wan={:?}, lan={:?}",
+                    wan_rename,
+                    lan_rename
+                );
+            }
+        }
+
+        if devices_ready {
+            std::println!("[test-control] TEST_PASSED network_discovery");
+            passed += 1;
         } else {
-            std::eprintln!(
-                "[test] FATAL: Failed to find WAN interface by MAC {}",
-                config.wan_mac
+            std::println!(
+                "[test-control] TEST_FAILED network_discovery Network devices failed to appear or be renamed"
             );
             std::process::exit(1);
         }
-        // Rename LAN interface based on config MAC mapping
-        if let Some((index, current_name)) =
-            trimrouter::interface::find_interface_by_mac(config.lan_mac).await
-        {
-            if let Err(e) = trimrouter::interface::rename_and_up_interface(
-                "lan",
-                config.lan_mac,
-                index,
-                &current_name,
-            )
-            .await
-            {
-                std::eprintln!("[test] FATAL: Failed to rename/up LAN interface: {}", e);
-                std::process::exit(1);
-            }
-        } else {
-            std::eprintln!(
-                "[test] FATAL: Failed to find LAN interface by MAC {}",
-                config.lan_mac
-            );
-            std::process::exit(1);
-        }
+
         if let Err(e) = network::configure_network_init().await {
             std::eprintln!("[test] FATAL: Failed to init loopback: {}", e);
             std::process::exit(1);
@@ -135,9 +146,6 @@ async fn main() {
         std::eprintln!("[test] FATAL: Failed to bring lan interface UP: {}", e);
         std::process::exit(1);
     }
-
-    let mut passed = 0;
-    let mut failed = 0;
 
     std::println!("[test] Running integration tests...");
 

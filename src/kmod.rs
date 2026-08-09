@@ -417,10 +417,39 @@ pub fn run_as_modprobe(args: Vec<String>) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+pub fn trigger_uevents() {
+    println!("[uevent] Triggering coldplug uevents...");
+    let sys_devices = Path::new("/sys/devices");
+    if !sys_devices.exists() {
+        return;
+    }
+
+    fn traverse_and_trigger(dir: &Path) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(ft) = entry.file_type() {
+                    let path = entry.path();
+                    if ft.is_dir() {
+                        traverse_and_trigger(&path);
+                    } else if path.file_name().is_some_and(|name| name == "uevent") {
+                        let _ = fs::write(&path, "add");
+                    }
+                }
+            }
+        }
+    }
+
+    traverse_and_trigger(sys_devices);
+}
+
 pub fn start_uevent_listener() {
     println!("[uevent] Spawning uevent listener thread...");
     std::thread::spawn(move || {
         println!("[uevent] Uevent listener thread spawned.");
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            trigger_uevents();
+        });
         if let Err(e) = run_uevent_listener() {
             eprintln!("[uevent] Error in uevent listener: {}", e);
         }

@@ -25,7 +25,9 @@ This skill provides code style and design standards for writing and modifying Ru
 * Refactor deep matching blocks, socket read/write setups, and complex state changes by extracting them into dedicated, flat functions.
 
 ## 5. Small, Single-Purpose Functions
-* Write small, highly focused functions that perform a single task.
+* **Explicit Size Limits**: Write small, highly focused functions that perform a single task. Functions should not exceed **50 lines** of code (excluding comments and blank lines).
+* **Nesting and Cognitive Limits**: Keep control flow nesting to a maximum of **2 layers**. Large event loops, nested `match`, or `if let` blocks must be decomposed by delegating to separate single-purpose helper functions.
+* **Enforce via Clippy Lint**: Enable `#![deny(clippy::too_many_lines)]` at the crate level, or configure `too-many-lines-threshold = 50` in `clippy.toml` to catch oversized functions at build/test time.
 * Deconstruct long event loops into simple sequential function calls.
 
 ## 6. Strict Error Handling

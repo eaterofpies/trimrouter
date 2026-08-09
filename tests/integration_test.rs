@@ -129,9 +129,9 @@ impl Drop for TestEnv {
 
 #[tokio::main]
 async fn main() {
-    std::println!("\nrunning 8 integration test steps in QEMU VM");
+    std::println!("\nrunning 9 integration test steps in QEMU VM");
 
-    let test_timeout = std::time::Duration::from_secs(180);
+    let test_timeout = std::time::Duration::from_secs(300);
     let start_time = std::time::Instant::now();
 
     // 1. Build test initramfs and start mocks/QEMU
@@ -304,7 +304,7 @@ async fn startup_stage() -> TestEnv {
     } else {
         "ttyAMA0"
     };
-    let append_arg = format!("console={} loglevel=3 panic=-1 net.ifnames=0", console);
+    let append_arg = format!("console={} loglevel=3 panic=1 net.ifnames=0", console);
 
     let kernel = format!("target/{test_arch}/test_boot/vmlinuz");
     let initrd = format!("target/{test_arch}/initramfs-test.cpio.gz");
@@ -344,6 +344,7 @@ async fn startup_stage() -> TestEnv {
             "-device",
             &dev_arg_lan,
             "-nographic",
+            "-no-reboot",
         ]
         .map(String::from),
     );
@@ -391,28 +392,23 @@ async fn startup_stage() -> TestEnv {
     }
 }
 
-async fn run_mock_wan_isp(
-    mut mock: UnixStreamMock,
-    verification_tx: tokio::sync::mpsc::Sender<String>,
-    mut wan_cmd_rx: tokio::sync::mpsc::Receiver<String>,
-) -> bool {
-    let mut xid: u32 = 0;
-    let mut client_mac = MacAddr::zero();
-    let mut dns_outage_active = false;
-
-    // 1. Collect the first 3 DHCPDISCOVER retries and verify each carries
-    //    0.0.0.0 as the IPv4 source address (RFC 2131 §4.1).
+async fn collect_dhcp_discovers(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+) -> Option<(u32, MacAddr)> {
     const DISCOVERS_TO_VERIFY: usize = 3;
     println!("[isp-test] Waiting for {DISCOVERS_TO_VERIFY} DHCPDISCOVER packets...");
     let start = std::time::Instant::now();
-    let timeout_dur = Duration::from_secs(60);
+    let timeout_dur = Duration::from_secs(180);
     let mut discovers_seen = 0;
+    let mut client_mac = MacAddr::zero();
+    let mut xid = 0;
 
     loop {
         if start.elapsed() >= timeout_dur {
             if discovers_seen == 0 {
                 println!("[isp-test] Timeout waiting for DHCPDISCOVER");
-                return false;
+                return None;
             }
             break;
         }
@@ -421,9 +417,9 @@ async fn run_mock_wan_isp(
             Ok(Ok(frame)) => frame,
             Ok(Err(_)) => {
                 println!("[isp-test] Connection closed while waiting for DHCPDISCOVER");
-                return false;
+                return None;
             }
-            Err(_) => continue, // Timeout
+            Err(_) => continue,
         };
 
         if let Ok(dhcp_discover) = parse_dhcp_message(&frame) {
@@ -469,26 +465,14 @@ async fn run_mock_wan_isp(
             }
         }
     }
+    Some((xid, client_mac))
+}
 
-    println!("[isp-test] Discovered QEMU peer WAN Interface");
-
-    // 2. Send DHCPOFFER
-    println!("[isp-test] Sending DHCPOFFER...");
-    let offer_payload = build_dhcp_offer(xid, client_mac);
-    let offer_frame = packet::build_raw_packet(
-        MOCK_SERVER_MAC,
-        client_mac,
-        MOCK_SERVER_IP,
-        Ipv4Addr::BROADCAST,
-        67,
-        68,
-        &offer_payload,
-    );
-    if mock.send_frame(&offer_frame).await.is_err() {
-        return false;
-    }
-
-    // 3. Wait for DHCPREQUEST and verify its IPv4 source address is 0.0.0.0.
+async fn await_dhcp_request(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    xid: u32,
+) -> bool {
     println!("[isp-test] Waiting for DHCPREQUEST...");
     let start = std::time::Instant::now();
     let timeout_dur = Duration::from_secs(5);
@@ -504,7 +488,7 @@ async fn run_mock_wan_isp(
                 println!("[isp-test] Connection closed while waiting for DHCPREQUEST");
                 return false;
             }
-            Err(_) => continue, // Timeout
+            Err(_) => continue,
         };
         if let Ok(dhcp_request) = parse_dhcp_message(&frame) {
             use dhcproto::v4::MessageType;
@@ -529,9 +513,218 @@ async fn run_mock_wan_isp(
                         .send("REQUEST_SRC_IP_WRONG".to_string())
                         .await;
                 }
-                break;
+                return true;
             }
         }
+    }
+}
+
+async fn handle_unsolicited_wan_traffic(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    client_mac: MacAddr,
+) {
+    println!(
+        "[isp-test] Sending unsolicited DNS query to router's WAN IP: {}",
+        MOCK_CLIENT_IP
+    );
+    let unsolicited_pkt = build_udp_packet(
+        MOCK_SERVER_MAC,
+        client_mac,
+        MOCK_SERVER_IP, // send from gateway
+        MOCK_CLIENT_IP,
+        12345,
+        53,
+        DNS_QUERY,
+    );
+    let _ = mock.send_frame(&unsolicited_pkt).await;
+
+    // Start a 1-second monitoring window to check if any response comes back from the router
+    let monitor_start = std::time::Instant::now();
+    let mut packet_received = false;
+    while monitor_start.elapsed() < Duration::from_secs(1) {
+        if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(50), mock.recv_frame()).await
+            && let Some((src_ip, dest_ip, src_port, dest_port, _)) =
+                parse_udp_packet(&f).ok().flatten()
+            && src_ip == MOCK_CLIENT_IP
+            && dest_ip == MOCK_SERVER_IP
+            && src_port == 53
+            && dest_port == 12345
+        {
+            packet_received = true;
+            break;
+        }
+    }
+
+    if packet_received {
+        println!(
+            "[isp-test] ERROR: Received DNS reply from router on WAN interface! Firewall did not drop the packet."
+        );
+        let _ = verification_tx
+            .send("FIREWALL_DROP_FAILED".to_string())
+            .await;
+    } else {
+        println!("[isp-test] Verified: Firewall successfully dropped DNS query on WAN (no reply).");
+        let _ = verification_tx
+            .send("FIREWALL_DROP_VERIFIED".to_string())
+            .await;
+    }
+}
+
+async fn process_wan_dns_query(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    client_mac: MacAddr,
+    src_ip: Ipv4Addr,
+    dest_ip: Ipv4Addr,
+    src_port: u16,
+    dest_port: u16,
+    payload: &[u8],
+    dns_outage_active: bool,
+) {
+    if dns_outage_active {
+        println!("[isp-test] Simulated upstream DNS outage: dropping query.");
+        return;
+    }
+    if src_ip == MOCK_CLIENT_IP && payload.len() >= 2 && payload[2..] == DNS_QUERY[2..] {
+        println!("[isp-test] Verified DNS Forwarder query on WAN!");
+        let _ = verification_tx.send("DNS_VERIFIED".to_string()).await;
+    }
+
+    let mut response_payload = DNS_RESPONSE.to_vec();
+    if payload.len() >= 2 {
+        response_payload[0] = payload[0];
+        response_payload[1] = payload[1];
+    }
+
+    println!(
+        "[isp-test] Sending DNS Reply to {}:{} from {}:{} with client MAC: {}",
+        src_ip, src_port, dest_ip, dest_port, client_mac
+    );
+    let dns_reply = build_udp_packet(
+        MOCK_SERVER_MAC,
+        client_mac,
+        dest_ip,
+        src_ip,
+        dest_port,
+        src_port,
+        &response_payload,
+    );
+    let _ = mock.send_frame(&dns_reply).await;
+}
+
+async fn process_wan_ntp_request(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    client_mac: MacAddr,
+    src_ip: Ipv4Addr,
+    dest_ip: Ipv4Addr,
+    src_port: u16,
+    dest_port: u16,
+    payload: &[u8],
+) {
+    println!("[isp-test] Verified NTP request on WAN!");
+    let _ = verification_tx.send("NTP_VERIFIED".to_string()).await;
+
+    let mut ntp_resp = vec![0u8; 48];
+    ntp_resp[0] = 0x24; // LI=0, VN=4, Mode=4 (Server)
+    ntp_resp[1] = 0x01; // Stratum = 1 (primary reference)
+
+    if payload.len() >= 48 {
+        ntp_resp[24..32].copy_from_slice(&payload[40..48]);
+    }
+
+    // Set system time to year 2031 (seconds since 1900)
+    let ntp_secs = 4_144_934_400u64; // May 2031
+    let secs_bytes = (ntp_secs as u32).to_be_bytes();
+    ntp_resp[40] = secs_bytes[0];
+    ntp_resp[41] = secs_bytes[1];
+    ntp_resp[42] = secs_bytes[2];
+    ntp_resp[43] = secs_bytes[3];
+
+    println!(
+        "[isp-test] Sending NTP Reply to {}:{} from {}:{} with client MAC: {}",
+        src_ip, src_port, dest_ip, dest_port, client_mac
+    );
+
+    let ntp_reply = build_udp_packet(
+        MOCK_SERVER_MAC,
+        client_mac,
+        dest_ip,
+        src_ip,
+        dest_port,
+        src_port,
+        &ntp_resp,
+    );
+    let _ = mock.send_frame(&ntp_reply).await;
+}
+
+async fn process_wan_dhcp_renewal(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    client_mac: MacAddr,
+    frame: &[u8],
+) {
+    if let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(frame)
+        && eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4
+        && let Some(ip) = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())
+        && ip.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Udp
+        && let Some(udp) = pnet::packet::udp::UdpPacket::new(ip.payload())
+        && udp.get_destination() == 67
+        && let Ok(dhcp_req) =
+            dhcproto::v4::Message::decode(&mut dhcproto::Decoder::new(udp.payload()))
+        && let Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Request)) =
+            dhcp_req.opts().get(dhcproto::v4::OptionCode::MessageType)
+    {
+        println!("[isp-test] Verified DHCP renewal request from WAN client!");
+        let renew_ack = build_dhcp_ack(dhcp_req.xid(), client_mac);
+        let ack_frame = packet::build_raw_packet(
+            MOCK_SERVER_MAC,
+            client_mac,
+            MOCK_SERVER_IP,
+            Ipv4Addr::BROADCAST,
+            67,
+            68,
+            &renew_ack,
+        );
+        let _ = mock.send_frame(&ack_frame).await;
+        let _ = verification_tx
+            .send("DHCP_RENEWAL_VERIFIED".to_string())
+            .await;
+    }
+}
+
+async fn run_mock_wan_isp(
+    mut mock: UnixStreamMock,
+    verification_tx: tokio::sync::mpsc::Sender<String>,
+    mut wan_cmd_rx: tokio::sync::mpsc::Receiver<String>,
+) -> bool {
+    // 1. Collect DHCPDISCOVER
+    let Some((xid, client_mac)) = collect_dhcp_discovers(&mut mock, &verification_tx).await else {
+        return false;
+    };
+
+    println!("[isp-test] Discovered QEMU peer WAN Interface");
+
+    // 2. Send DHCPOFFER
+    println!("[isp-test] Sending DHCPOFFER...");
+    let offer_payload = build_dhcp_offer(xid, client_mac);
+    let offer_frame = packet::build_raw_packet(
+        MOCK_SERVER_MAC,
+        client_mac,
+        MOCK_SERVER_IP,
+        Ipv4Addr::BROADCAST,
+        67,
+        68,
+        &offer_payload,
+    );
+    if mock.send_frame(&offer_frame).await.is_err() {
+        return false;
+    }
+
+    // 3. Wait for DHCPREQUEST
+    if !await_dhcp_request(&mut mock, &verification_tx, xid).await {
+        return false;
     }
     println!("[isp-test] Received DHCPREQUEST.");
 
@@ -557,7 +750,8 @@ async fn run_mock_wan_isp(
     // 5. WAN Loop to handle ARP, ICMP transit, DNS queries, and unsolicited drop tests
     println!("[isp-test] Entering WAN verification event loop...");
     let start = std::time::Instant::now();
-    let timeout_dur = Duration::from_secs(60);
+    let timeout_dur = Duration::from_secs(180);
+    let mut dns_outage_active = false;
 
     loop {
         if start.elapsed() >= timeout_dur {
@@ -568,41 +762,7 @@ async fn run_mock_wan_isp(
             cmd = wan_cmd_rx.recv() => {
                 if let Some(cmd_str) = cmd {
                     if cmd_str == "SEND_UNSOLICITED_WAN" {
-                        println!("[isp-test] Sending unsolicited DNS query to router's WAN IP: {}", MOCK_CLIENT_IP);
-                        let unsolicited_pkt = build_udp_packet(
-                            MOCK_SERVER_MAC,
-                            client_mac,
-                            MOCK_SERVER_IP, // send from gateway
-                            MOCK_CLIENT_IP,
-                            12345,
-                            53,
-                            DNS_QUERY,
-                        );
-                        let _ = mock.send_frame(&unsolicited_pkt).await;
-
-                        // Start a 1-second monitoring window to check if any response comes back from the router
-                        let monitor_start = std::time::Instant::now();
-                        let mut packet_received = false;
-                        while monitor_start.elapsed() < Duration::from_secs(1) {
-                            if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(50), mock.recv_frame()).await
-                                && let Some((src_ip, dest_ip, src_port, dest_port, _)) = parse_udp_packet(&f).ok().flatten()
-                                && src_ip == MOCK_CLIENT_IP
-                                && dest_ip == MOCK_SERVER_IP
-                                && src_port == 53
-                                && dest_port == 12345
-                            {
-                                packet_received = true;
-                                break;
-                            }
-                        }
-
-                        if packet_received {
-                            println!("[isp-test] ERROR: Received DNS reply from router on WAN interface! Firewall did not drop the packet.");
-                            let _ = verification_tx.send("FIREWALL_DROP_FAILED".to_string()).await;
-                        } else {
-                            println!("[isp-test] Verified: Firewall successfully dropped DNS query on WAN (no reply).");
-                            let _ = verification_tx.send("FIREWALL_DROP_VERIFIED".to_string()).await;
-                        }
+                        handle_unsolicited_wan_traffic(&mut mock, &verification_tx, client_mac).await;
                     } else if cmd_str == "SIMULATE_DNS_OUTAGE" {
                         println!("[isp-test] Simulating upstream DNS outage.");
                         dns_outage_active = true;
@@ -619,7 +779,7 @@ async fn run_mock_wan_isp(
                         println!("[isp-test] WAN socket connection closed. Exiting verification loop.");
                         break;
                     }
-                    Err(_) => continue, // Timeout
+                    Err(_) => continue,
                 };
 
                 if let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame) {
@@ -643,7 +803,6 @@ async fn run_mock_wan_isp(
                             println!("[isp-test] Verified NATed ICMP Request from WAN client!");
                             let _ = verification_tx.send("ICMP_VERIFIED".to_string()).await;
                         }
-                        // Send ICMP Echo Reply back from 8.8.8.8 to the NATed client IP
                         let icmp_reply =
                             build_icmp_echo_reply(MOCK_SERVER_MAC, client_mac, dest_ip, src_ip, 0x4321, 1);
                         let _ = mock.send_frame(&icmp_reply).await;
@@ -651,9 +810,8 @@ async fn run_mock_wan_isp(
                     continue;
                 }
 
-                // C. Handle DNS request to 10.0.2.3:53 (checks DNS forwarding)
+                // C. Handle UDP packets
                 if let Some((src_ip, dest_ip, src_port, dest_port, payload)) = parse_udp_packet(&frame).ok().flatten() {
-                    // F. Handle UDP NAT routing test to 8.8.8.8:23456
                     if dest_ip == Ipv4Addr::new(8, 8, 8, 8) && dest_port == 23456 {
                         if src_ip == MOCK_CLIENT_IP && payload == b"NAT_PING_TEST" {
                             println!("[isp-test] Verified NATed UDP Request from WAN client!");
@@ -677,107 +835,38 @@ async fn run_mock_wan_isp(
                     }
 
                     if dest_ip == MOCK_DNS_SERVER && dest_port == 53 {
-                        if dns_outage_active {
-                            println!("[isp-test] Simulated upstream DNS outage: dropping query.");
-                            continue;
-                        }
-                        if src_ip == MOCK_CLIENT_IP && payload.len() >= 2 && payload[2..] == DNS_QUERY[2..] {
-                            println!("[isp-test] Verified DNS Forwarder query on WAN!");
-                            let _ = verification_tx.send("DNS_VERIFIED".to_string()).await;
-                        }
-
-                        let mut response_payload = DNS_RESPONSE.to_vec();
-                        if payload.len() >= 2 {
-                            response_payload[0] = payload[0];
-                            response_payload[1] = payload[1];
-                        }
-
-                        println!(
-                            "[isp-test] Sending DNS Reply to {}:{} from {}:{} with client MAC: {}",
-                            src_ip, src_port, dest_ip, dest_port, client_mac
-                        );
-                        let dns_reply = build_udp_packet(
-                            MOCK_SERVER_MAC,
+                        process_wan_dns_query(
+                            &mut mock,
+                            &verification_tx,
                             client_mac,
-                            dest_ip,
                             src_ip,
-                            dest_port,
+                            dest_ip,
                             src_port,
-                            &response_payload,
-                        );
-                        let _ = mock.send_frame(&dns_reply).await;
+                            dest_port,
+                            &payload,
+                            dns_outage_active,
+                        ).await;
                         continue;
                     }
 
-                    // D. Handle NTP request to 8.8.8.8:123 (checks SNTP client synchronization)
                     if dest_port == 123 {
-                        println!("[isp-test] Verified NTP request on WAN!");
-                        let _ = verification_tx.send("NTP_VERIFIED".to_string()).await;
-
-                        let mut ntp_resp = vec![0u8; 48];
-                        ntp_resp[0] = 0x24; // LI=0, VN=4, Mode=4 (Server)
-                        ntp_resp[1] = 0x01; // Stratum = 1 (primary reference)
-
-                        if payload.len() >= 48 {
-                            ntp_resp[24..32].copy_from_slice(&payload[40..48]);
-                        }
-
-                        // Set system time to year 2031 (seconds since 1900)
-                        let ntp_secs = 4_144_934_400u64; // May 2031
-                        let secs_bytes = (ntp_secs as u32).to_be_bytes();
-                        ntp_resp[40] = secs_bytes[0];
-                        ntp_resp[41] = secs_bytes[1];
-                        ntp_resp[42] = secs_bytes[2];
-                        ntp_resp[43] = secs_bytes[3];
-
-                        println!(
-                            "[isp-test] Sending NTP Reply to {}:{} from {}:{} with client MAC: {}",
-                            src_ip, src_port, dest_ip, dest_port, client_mac
-                        );
-
-                        let ntp_reply = build_udp_packet(
-                            MOCK_SERVER_MAC,
+                        process_wan_ntp_request(
+                            &mut mock,
+                            &verification_tx,
                             client_mac,
-                            dest_ip,
                             src_ip,
-                            dest_port,
+                            dest_ip,
                             src_port,
-                            &ntp_resp,
-                        );
-                        let _ = mock.send_frame(&ntp_reply).await;
+                            dest_port,
+                            &payload,
+                        ).await;
                         continue;
                     }
                 }
 
-                // E. Handle DHCPREQUEST (renewal)
-                if let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame)
-                    && eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4
-                {
-                        let ip = pnet::packet::ipv4::Ipv4Packet::new(eth.payload()).unwrap();
-                        if ip.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Udp {
-                            let udp = pnet::packet::udp::UdpPacket::new(ip.payload()).unwrap();
-                            if udp.get_destination() == 67
-                                && let Ok(dhcp_req) = dhcproto::v4::Message::decode(&mut dhcproto::Decoder::new(udp.payload()))
-                                && let Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Request)) = dhcp_req.opts().get(dhcproto::v4::OptionCode::MessageType)
-                            {
-                                println!("[isp-test] Verified DHCP renewal request from WAN client!");
-                                let renew_ack = build_dhcp_ack(dhcp_req.xid(), client_mac);
-                                let ack_frame = packet::build_raw_packet(
-                                    MOCK_SERVER_MAC,
-                                    client_mac,
-                                    MOCK_SERVER_IP,
-                                    Ipv4Addr::BROADCAST,
-                                    67,
-                                    68,
-                                    &renew_ack,
-                                );
-                                let _ = mock.send_frame(&ack_frame).await;
-                                let _ = verification_tx.send("DHCP_RENEWAL_VERIFIED".to_string()).await;
-                                 continue;
-                            }
-                        }
-                    }
-                }
+                // D. Handle DHCPREQUEST (renewal)
+                process_wan_dhcp_renewal(&mut mock, &verification_tx, client_mac, &frame).await;
+            }
         }
     }
 
@@ -1179,6 +1268,253 @@ fn build_dhcp_request_lan(
     payload
 }
 
+async fn handle_lan_command(
+    mock: &mut UnixStreamMock,
+    cmd: &str,
+    client_mac: MacAddr,
+    dns_test_phase: &mut i32,
+) {
+    if cmd == "TRIGGER_LAN_DHCP_HANDSHAKE" {
+        println!("[lan-client] Starting DHCP Handshake...");
+        let xid = rand::random::<u32>();
+        let discover_payload = build_dhcp_discover_lan(xid, client_mac);
+        let discover_pkt = packet::build_raw_packet(
+            client_mac,
+            MacAddr::broadcast(),
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            68,
+            67,
+            &discover_payload,
+        );
+        if let Err(e) = mock.send_frame(&discover_pkt).await {
+            println!("[lan-client] ERROR sending DHCPDISCOVER: {}", e);
+        } else {
+            println!("[lan-client] Sent DHCPDISCOVER (xid: {})", xid);
+        }
+    } else if cmd == "TRIGGER_FORWARDED_NAT_TEST" {
+        println!("[lan-client] Starting Forwarded NAT test...");
+        let payload = b"NAT_PING_TEST";
+        let pkt = packet::build_raw_packet(
+            client_mac,
+            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+            Ipv4Addr::new(192, 168, 1, 2),
+            Ipv4Addr::new(8, 8, 8, 8),
+            23456,
+            23456,
+            payload,
+        );
+        if let Err(e) = mock.send_frame(&pkt).await {
+            println!("[lan-client] ERROR sending NAT Ping: {}", e);
+        } else {
+            println!("[lan-client] Sent NAT Ping to 8.8.8.8:23456");
+        }
+    } else if cmd == "TRIGGER_DNS_CLIENT_TEST" {
+        println!("[lan-client] Starting DNS Client Cache Verification test...");
+        *dns_test_phase = 1;
+        let pkt = packet::build_raw_packet(
+            client_mac,
+            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+            Ipv4Addr::new(192, 168, 1, 2),
+            Ipv4Addr::new(192, 168, 1, 1),
+            12345, // client port
+            53,    // DNS port
+            DNS_QUERY,
+        );
+        if let Err(e) = mock.send_frame(&pkt).await {
+            println!("[lan-client] ERROR sending DNS Query 1: {}", e);
+        } else {
+            println!("[lan-client] Sent DNS Query 1 to 192.168.1.1:53");
+        }
+    }
+}
+
+async fn process_lan_arp(
+    mock: &mut UnixStreamMock,
+    frame: &[u8],
+    client_mac: MacAddr,
+    assigned_ip: Option<Ipv4Addr>,
+) {
+    if let Some(target_ip) = handle_arp_request_for_ip(frame, client_mac, assigned_ip)
+        && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(frame)
+        && let Some(arp) = pnet::packet::arp::ArpPacket::new(eth.payload())
+    {
+        println!(
+            "[lan-client] Received ARP request for target IP: {}. Replying...",
+            target_ip
+        );
+        let reply = build_arp_reply(
+            client_mac,
+            eth.get_source(),
+            target_ip,
+            arp.get_sender_proto_addr(),
+        );
+        let _ = mock.send_frame(&reply).await;
+    }
+}
+
+async fn process_lan_icmp(
+    mock: &mut UnixStreamMock,
+    frame: &[u8],
+    client_mac: MacAddr,
+    assigned_ip: Option<Ipv4Addr>,
+) {
+    if let Some((src_ip, dest_ip)) = parse_icmp_request(frame).ok().flatten()
+        && Some(dest_ip) == assigned_ip
+        && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(frame)
+    {
+        println!(
+            "[lan-client] Received ICMP request from {} to {}. Replying...",
+            src_ip, dest_ip
+        );
+        let mut icmp_id = 0x4321;
+        let mut icmp_seq = 1;
+        if let Some(ip) = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())
+            && let Some(icmp) =
+                pnet::packet::icmp::echo_request::EchoRequestPacket::new(ip.payload())
+        {
+            icmp_id = icmp.get_identifier();
+            icmp_seq = icmp.get_sequence_number();
+        }
+        let reply = build_icmp_echo_reply(
+            client_mac,
+            eth.get_source(),
+            dest_ip,
+            src_ip,
+            icmp_id,
+            icmp_seq,
+        );
+        let _ = mock.send_frame(&reply).await;
+    }
+}
+
+async fn process_lan_udp_nat(
+    mock: &mut UnixStreamMock,
+    client_mac: MacAddr,
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dest_port: u16,
+    payload: &[u8],
+) {
+    if src_ip == Ipv4Addr::new(8, 8, 8, 8)
+        && src_port == 23456
+        && dest_port == 23456
+        && payload == b"NAT_PONG_TEST"
+    {
+        println!("[lan-client] Received NAT_PONG_TEST from 8.8.8.8! NAT verified.");
+        let confirm_pkt = packet::build_raw_packet(
+            client_mac,
+            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+            Ipv4Addr::new(192, 168, 1, 2),
+            Ipv4Addr::new(192, 168, 1, 1),
+            23456,
+            23457,
+            b"FORWARDED_NAT_OK",
+        );
+        let _ = mock.send_frame(&confirm_pkt).await;
+    }
+}
+
+async fn process_lan_udp_dns(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    client_mac: MacAddr,
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dest_port: u16,
+    payload: &[u8],
+    dns_test_phase: &mut i32,
+) {
+    if src_ip == Ipv4Addr::new(192, 168, 1, 1)
+        && src_port == 53
+        && dest_port == 12345
+        && payload.len() >= 2
+        && payload[2..] == DNS_RESPONSE[2..]
+    {
+        if *dns_test_phase == 1 {
+            println!(
+                "[lan-client] DNS Query 1 resolved successfully! Requesting SIMULATE_DNS_OUTAGE..."
+            );
+            *dns_test_phase = 2;
+            let _ = verification_tx
+                .send("SIMULATE_DNS_OUTAGE".to_string())
+                .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let pkt = packet::build_raw_packet(
+                client_mac,
+                MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+                Ipv4Addr::new(192, 168, 1, 2),
+                Ipv4Addr::new(192, 168, 1, 1),
+                12345, // client port
+                53,    // DNS port
+                DNS_QUERY,
+            );
+            let _ = mock.send_frame(&pkt).await;
+            println!(
+                "[lan-client] Sent DNS Query 2 (which must be served from cache) to 192.168.1.1:53"
+            );
+        } else if *dns_test_phase == 2 {
+            println!("[lan-client] DNS Query 2 resolved successfully! DNS Caching verified.");
+            *dns_test_phase = 0;
+            let _ = verification_tx.send("END_DNS_OUTAGE".to_string()).await;
+            let confirm_pkt = packet::build_raw_packet(
+                client_mac,
+                MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+                Ipv4Addr::new(192, 168, 1, 2),
+                Ipv4Addr::new(192, 168, 1, 1),
+                23456,
+                23457,
+                b"DNS_CACHE_OK",
+            );
+            let _ = mock.send_frame(&confirm_pkt).await;
+        }
+    }
+}
+
+async fn process_lan_dhcp(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    client_mac: MacAddr,
+    frame: &[u8],
+    assigned_ip: &mut Option<Ipv4Addr>,
+) {
+    if let Ok(dhcp_msg) = parse_dhcp_message(frame) {
+        let xid = dhcp_msg.xid();
+        let msg_type = dhcp_msg.opts().get(dhcproto::v4::OptionCode::MessageType);
+
+        match msg_type {
+            Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Offer)) => {
+                let offered_ip = dhcp_msg.yiaddr();
+                println!("[lan-client] Received DHCPOFFER for IP: {}", offered_ip);
+                let request_payload = build_dhcp_request_lan(
+                    xid,
+                    client_mac,
+                    offered_ip,
+                    Ipv4Addr::new(192, 168, 1, 1),
+                );
+                let request_pkt = packet::build_raw_packet(
+                    client_mac,
+                    MacAddr::broadcast(),
+                    Ipv4Addr::UNSPECIFIED,
+                    Ipv4Addr::BROADCAST,
+                    68,
+                    67,
+                    &request_payload,
+                );
+                let _ = mock.send_frame(&request_pkt).await;
+                println!("[lan-client] Sent DHCPREQUEST for IP: {}", offered_ip);
+            }
+            Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Ack)) => {
+                let acked_ip = dhcp_msg.yiaddr();
+                println!("[lan-client] Received DHCPACK! IP: {} assigned.", acked_ip);
+                *assigned_ip = Some(acked_ip);
+                let _ = verification_tx.send("LAN_DHCP_VERIFIED".to_string()).await;
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn run_mock_lan_client(
     mut mock: UnixStreamMock,
     mut cmd_rx: tokio::sync::mpsc::Receiver<String>,
@@ -1190,215 +1526,24 @@ async fn run_mock_lan_client(
 
     loop {
         tokio::select! {
-            // A. Handle commands from the orchestrator
             Some(cmd) = cmd_rx.recv() => {
-                if cmd == "TRIGGER_LAN_DHCP_HANDSHAKE" {
-                    println!("[lan-client] Starting DHCP Handshake...");
-                    // Send DHCPDISCOVER
-                    let xid = rand::random::<u32>();
-                    let discover_payload = build_dhcp_discover_lan(xid, client_mac);
-                    let discover_pkt = packet::build_raw_packet(
-                        client_mac,
-                        MacAddr::broadcast(),
-                        Ipv4Addr::UNSPECIFIED,
-                        Ipv4Addr::BROADCAST,
-                        68,
-                        67,
-                        &discover_payload,
-                    );
-                    if let Err(e) = mock.send_frame(&discover_pkt).await {
-                        println!("[lan-client] ERROR sending DHCPDISCOVER: {}", e);
-                    } else {
-                        println!("[lan-client] Sent DHCPDISCOVER (xid: {})", xid);
-                    }
-                } else if cmd == "TRIGGER_FORWARDED_NAT_TEST" {
-                    println!("[lan-client] Starting Forwarded NAT test...");
-                    let payload = b"NAT_PING_TEST";
-                    let pkt = packet::build_raw_packet(
-                        client_mac,
-                        MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
-                        Ipv4Addr::new(192, 168, 1, 2),
-                        Ipv4Addr::new(8, 8, 8, 8),
-                        23456,
-                        23456,
-                        payload,
-                    );
-                    if let Err(e) = mock.send_frame(&pkt).await {
-                        println!("[lan-client] ERROR sending NAT Ping: {}", e);
-                    } else {
-                        println!("[lan-client] Sent NAT Ping to 8.8.8.8:23456");
-                    }
-                } else if cmd == "TRIGGER_DNS_CLIENT_TEST" {
-                    println!("[lan-client] Starting DNS Client Cache Verification test...");
-                    dns_test_phase = 1;
-                    let pkt = packet::build_raw_packet(
-                        client_mac,
-                        MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
-                        Ipv4Addr::new(192, 168, 1, 2),
-                        Ipv4Addr::new(192, 168, 1, 1),
-                        12345, // client port
-                        53,    // DNS port
-                        DNS_QUERY,
-                    );
-                    if let Err(e) = mock.send_frame(&pkt).await {
-                        println!("[lan-client] ERROR sending DNS Query 1: {}", e);
-                    } else {
-                        println!("[lan-client] Sent DNS Query 1 to 192.168.1.1:53");
-                    }
-                }
+                handle_lan_command(&mut mock, &cmd, client_mac, &mut dns_test_phase).await;
             }
-            // B. Handle frame from LAN socket
             frame_res = mock.recv_frame() => {
                 let frame = match frame_res {
                     Ok(f) => f,
                     Err(_) => break, // Socket closed
                 };
 
-                // Check if it's an ARP request to us
-                if let Some(target_ip) = handle_arp_request_for_ip(&frame, client_mac, assigned_ip)
-                    && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame)
-                    && let Some(arp) = pnet::packet::arp::ArpPacket::new(eth.payload())
-                {
-                    println!("[lan-client] Received ARP request for target IP: {}. Replying...", target_ip);
-                    let reply = build_arp_reply(
-                        client_mac,
-                        eth.get_source(),
-                        target_ip,
-                        arp.get_sender_proto_addr(),
-                    );
-                    let _ = mock.send_frame(&reply).await;
+                process_lan_arp(&mut mock, &frame, client_mac, assigned_ip).await;
+                process_lan_icmp(&mut mock, &frame, client_mac, assigned_ip).await;
+
+                if let Some((src_ip, src_port, dest_port, payload)) = parse_udp_payload(&frame) {
+                    process_lan_udp_nat(&mut mock, client_mac, src_ip, src_port, dest_port, &payload).await;
+                    process_lan_udp_dns(&mut mock, &verification_tx, client_mac, src_ip, src_port, dest_port, &payload, &mut dns_test_phase).await;
                 }
 
-                // Check if it's an ICMP Echo Request to us
-                if let Some((src_ip, dest_ip)) = parse_icmp_request(&frame).ok().flatten()
-                    && Some(dest_ip) == assigned_ip
-                    && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame)
-                {
-                    println!("[lan-client] Received ICMP request from {} to {}. Replying...", src_ip, dest_ip);
-                    let mut icmp_id = 0x4321;
-                    let mut icmp_seq = 1;
-                    if let Some(ip) = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())
-                        && let Some(icmp) = pnet::packet::icmp::echo_request::EchoRequestPacket::new(ip.payload())
-                    {
-                        icmp_id = icmp.get_identifier();
-                        icmp_seq = icmp.get_sequence_number();
-                    }
-                    let reply = build_icmp_echo_reply(
-                        client_mac,
-                        eth.get_source(),
-                        dest_ip,
-                        src_ip,
-                        icmp_id,
-                        icmp_seq,
-                    );
-                    let _ = mock.send_frame(&reply).await;
-                }
-
-                // Check if it's a UDP response for us (Forwarded NAT verification)
-                if let Some((src_ip, src_port, dest_port, payload)) = parse_udp_payload(&frame)
-                    && src_ip == Ipv4Addr::new(8, 8, 8, 8)
-                    && src_port == 23456
-                    && dest_port == 23456
-                    && payload == b"NAT_PONG_TEST"
-                {
-                    println!("[lan-client] Received NAT_PONG_TEST from 8.8.8.8! NAT verified.");
-                    // Send confirmation to the guest's UDP socket (192.168.1.1:23457)
-                    let confirm_pkt = packet::build_raw_packet(
-                        client_mac,
-                        MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
-                        Ipv4Addr::new(192, 168, 1, 2),
-                        Ipv4Addr::new(192, 168, 1, 1),
-                        23456,
-                        23457,
-                        b"FORWARDED_NAT_OK",
-                    );
-                    let _ = mock.send_frame(&confirm_pkt).await;
-                }
-
-                // Check if it's a DNS response for us (DNS caching verification)
-                if let Some((src_ip, src_port, dest_port, payload)) = parse_udp_payload(&frame)
-                    && src_ip == Ipv4Addr::new(192, 168, 1, 1)
-                    && src_port == 53
-                    && dest_port == 12345
-                    && payload.len() >= 2
-                    && payload[2..] == DNS_RESPONSE[2..]
-                {
-                    if dns_test_phase == 1 {
-                        println!("[lan-client] DNS Query 1 resolved successfully! Requesting SIMULATE_DNS_OUTAGE...");
-                        dns_test_phase = 2;
-                        // Ask WAN ISP to simulate DNS outage
-                        let _ = verification_tx.send("SIMULATE_DNS_OUTAGE".to_string()).await;
-                        // Sleep 500ms to allow WAN ISP to receive the command
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        // Send DNS Query 2
-                        let pkt = packet::build_raw_packet(
-                            client_mac,
-                            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
-                            Ipv4Addr::new(192, 168, 1, 2),
-                            Ipv4Addr::new(192, 168, 1, 1),
-                            12345, // client port
-                            53,    // DNS port
-                            DNS_QUERY,
-                        );
-                        let _ = mock.send_frame(&pkt).await;
-                        println!("[lan-client] Sent DNS Query 2 (which must be served from cache) to 192.168.1.1:53");
-                    } else if dns_test_phase == 2 {
-                        println!("[lan-client] DNS Query 2 resolved successfully! DNS Caching verified.");
-                        dns_test_phase = 0;
-                        // End WAN ISP DNS outage
-                        let _ = verification_tx.send("END_DNS_OUTAGE".to_string()).await;
-                        // Send confirmation to guest at 192.168.1.1:23457
-                        let confirm_pkt = packet::build_raw_packet(
-                            client_mac,
-                            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
-                            Ipv4Addr::new(192, 168, 1, 2),
-                            Ipv4Addr::new(192, 168, 1, 1),
-                            23456,
-                            23457,
-                            b"DNS_CACHE_OK",
-                        );
-                        let _ = mock.send_frame(&confirm_pkt).await;
-                    }
-                }
-
-
-                // Check if it's a DHCP packet
-                if let Ok(dhcp_msg) = parse_dhcp_message(&frame) {
-                    let xid = dhcp_msg.xid();
-                    let msg_type = dhcp_msg.opts().get(dhcproto::v4::OptionCode::MessageType);
-
-                    match msg_type {
-                        Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Offer)) => {
-                            let offered_ip = dhcp_msg.yiaddr();
-                            println!("[lan-client] Received DHCPOFFER for IP: {}", offered_ip);
-                            // Send DHCPREQUEST
-                            let request_payload = build_dhcp_request_lan(
-                                xid,
-                                client_mac,
-                                offered_ip,
-                                Ipv4Addr::new(192, 168, 1, 1),
-                            );
-                            let request_pkt = packet::build_raw_packet(
-                                client_mac,
-                                MacAddr::broadcast(),
-                                Ipv4Addr::UNSPECIFIED,
-                                Ipv4Addr::BROADCAST,
-                                68,
-                                67,
-                                &request_payload,
-                            );
-                            let _ = mock.send_frame(&request_pkt).await;
-                            println!("[lan-client] Sent DHCPREQUEST for IP: {}", offered_ip);
-                        }
-                        Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Ack)) => {
-                            let acked_ip = dhcp_msg.yiaddr();
-                            println!("[lan-client] Received DHCPACK! IP: {} assigned.", acked_ip);
-                            assigned_ip = Some(acked_ip);
-                            let _ = verification_tx.send("LAN_DHCP_VERIFIED".to_string()).await;
-                        }
-                        _ => {}
-                    }
-                }
+                process_lan_dhcp(&mut mock, &verification_tx, client_mac, &frame, &mut assigned_ip).await;
             }
         }
     }

@@ -44,7 +44,7 @@ touch "$APT_DIR/var/lib/apt/status"
 # Copy host keyring for Debian verification
 cp /usr/share/keyrings/debian-archive-keyring.gpg "$APT_DIR/etc/apt/trusted.gpg.d/debian.gpg"
 
-echo "deb [arch=${DEB_ARCH}] http://deb.debian.org/debian/ bookworm main" > "$APT_DIR/etc/apt/sources.list"
+echo "deb [arch=${DEB_ARCH}] http://deb.debian.org/debian/ trixie main" > "$APT_DIR/etc/apt/sources.list"
 
 APT_OPTS="-o Dir=${CURDIR}/${APT_DIR} -o Dir::Etc::main=/dev/null -o Dir::Etc::parts=/dev/null"
 
@@ -73,4 +73,10 @@ done
 
 echo "Locating and copying kernel image..."
 cp boot/vmlinuz-* ./vmlinuz
+
+# Support usr-merged directory layout in trixie release
+if [ -d usr/lib ] && [ ! -d lib ]; then
+    ln -s usr/lib lib
+fi
+
 touch .kernel_extracted
