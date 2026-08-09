@@ -172,6 +172,8 @@ async fn main() {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_FORWARDED_NAT_TEST") {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_FORWARDED_NAT_TEST".to_string()).await;
+                            } else if line.contains("[test-control] TRIGGER_DNS_CLIENT_TEST") {
+                                let _ = env.lan_cmd_tx.send("TRIGGER_DNS_CLIENT_TEST".to_string()).await;
                             } else if line.contains("[test-control] SUITE_PASSED") {
                                 suite_status = Some(true);
                                 break;
@@ -188,6 +190,11 @@ async fn main() {
                 }
                 Some(sig) = env.verification_rx.recv() => {
                     println!("[test-env] Received network-level verification signal: {}", sig);
+                    if sig == "SIMULATE_DNS_OUTAGE" {
+                        let _ = env.wan_cmd_tx.send("SIMULATE_DNS_OUTAGE".to_string()).await;
+                    } else if sig == "END_DNS_OUTAGE" {
+                        let _ = env.wan_cmd_tx.send("END_DNS_OUTAGE".to_string()).await;
+                    }
                 }
             }
         }
@@ -391,6 +398,7 @@ async fn run_mock_wan_isp(
 ) -> bool {
     let mut xid: u32 = 0;
     let mut client_mac = MacAddr::zero();
+    let mut dns_outage_active = false;
 
     // 1. Collect the first 3 DHCPDISCOVER retries and verify each carries
     //    0.0.0.0 as the IPv4 source address (RFC 2131 §4.1).
@@ -558,41 +566,49 @@ async fn run_mock_wan_isp(
 
         tokio::select! {
             cmd = wan_cmd_rx.recv() => {
-                if let Some(cmd_str) = cmd && cmd_str == "SEND_UNSOLICITED_WAN" {
-                    println!("[isp-test] Sending unsolicited DNS query to router's WAN IP: {}", MOCK_CLIENT_IP);
-                    let unsolicited_pkt = build_udp_packet(
-                        MOCK_SERVER_MAC,
-                        client_mac,
-                        MOCK_SERVER_IP, // send from gateway
-                        MOCK_CLIENT_IP,
-                        12345,
-                        53,
-                        DNS_QUERY,
-                    );
-                    let _ = mock.send_frame(&unsolicited_pkt).await;
+                if let Some(cmd_str) = cmd {
+                    if cmd_str == "SEND_UNSOLICITED_WAN" {
+                        println!("[isp-test] Sending unsolicited DNS query to router's WAN IP: {}", MOCK_CLIENT_IP);
+                        let unsolicited_pkt = build_udp_packet(
+                            MOCK_SERVER_MAC,
+                            client_mac,
+                            MOCK_SERVER_IP, // send from gateway
+                            MOCK_CLIENT_IP,
+                            12345,
+                            53,
+                            DNS_QUERY,
+                        );
+                        let _ = mock.send_frame(&unsolicited_pkt).await;
 
-                    // Start a 1-second monitoring window to check if any response comes back from the router
-                    let monitor_start = std::time::Instant::now();
-                    let mut packet_received = false;
-                    while monitor_start.elapsed() < Duration::from_secs(1) {
-                        if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(50), mock.recv_frame()).await
-                            && let Some((src_ip, dest_ip, src_port, dest_port, _)) = parse_udp_packet(&f).ok().flatten()
-                            && src_ip == MOCK_CLIENT_IP
-                            && dest_ip == MOCK_SERVER_IP
-                            && src_port == 53
-                            && dest_port == 12345
-                        {
-                            packet_received = true;
-                            break;
+                        // Start a 1-second monitoring window to check if any response comes back from the router
+                        let monitor_start = std::time::Instant::now();
+                        let mut packet_received = false;
+                        while monitor_start.elapsed() < Duration::from_secs(1) {
+                            if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(50), mock.recv_frame()).await
+                                && let Some((src_ip, dest_ip, src_port, dest_port, _)) = parse_udp_packet(&f).ok().flatten()
+                                && src_ip == MOCK_CLIENT_IP
+                                && dest_ip == MOCK_SERVER_IP
+                                && src_port == 53
+                                && dest_port == 12345
+                            {
+                                packet_received = true;
+                                break;
+                            }
                         }
-                    }
 
-                    if packet_received {
-                        println!("[isp-test] ERROR: Received DNS reply from router on WAN interface! Firewall did not drop the packet.");
-                        let _ = verification_tx.send("FIREWALL_DROP_FAILED".to_string()).await;
-                    } else {
-                        println!("[isp-test] Verified: Firewall successfully dropped DNS query on WAN (no reply).");
-                        let _ = verification_tx.send("FIREWALL_DROP_VERIFIED".to_string()).await;
+                        if packet_received {
+                            println!("[isp-test] ERROR: Received DNS reply from router on WAN interface! Firewall did not drop the packet.");
+                            let _ = verification_tx.send("FIREWALL_DROP_FAILED".to_string()).await;
+                        } else {
+                            println!("[isp-test] Verified: Firewall successfully dropped DNS query on WAN (no reply).");
+                            let _ = verification_tx.send("FIREWALL_DROP_VERIFIED".to_string()).await;
+                        }
+                    } else if cmd_str == "SIMULATE_DNS_OUTAGE" {
+                        println!("[isp-test] Simulating upstream DNS outage.");
+                        dns_outage_active = true;
+                    } else if cmd_str == "END_DNS_OUTAGE" {
+                        println!("[isp-test] Ending simulated upstream DNS outage.");
+                        dns_outage_active = false;
                     }
                 }
             }
@@ -661,6 +677,10 @@ async fn run_mock_wan_isp(
                     }
 
                     if dest_ip == MOCK_DNS_SERVER && dest_port == 53 {
+                        if dns_outage_active {
+                            println!("[isp-test] Simulated upstream DNS outage: dropping query.");
+                            continue;
+                        }
                         if src_ip == MOCK_CLIENT_IP && payload.len() >= 2 && payload[2..] == DNS_QUERY[2..] {
                             println!("[isp-test] Verified DNS Forwarder query on WAN!");
                             let _ = verification_tx.send("DNS_VERIFIED".to_string()).await;
@@ -1166,6 +1186,7 @@ async fn run_mock_lan_client(
 ) {
     let client_mac = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
     let mut assigned_ip = None;
+    let mut dns_test_phase = 0;
 
     loop {
         tokio::select! {
@@ -1206,6 +1227,23 @@ async fn run_mock_lan_client(
                         println!("[lan-client] ERROR sending NAT Ping: {}", e);
                     } else {
                         println!("[lan-client] Sent NAT Ping to 8.8.8.8:23456");
+                    }
+                } else if cmd == "TRIGGER_DNS_CLIENT_TEST" {
+                    println!("[lan-client] Starting DNS Client Cache Verification test...");
+                    dns_test_phase = 1;
+                    let pkt = packet::build_raw_packet(
+                        client_mac,
+                        MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+                        Ipv4Addr::new(192, 168, 1, 2),
+                        Ipv4Addr::new(192, 168, 1, 1),
+                        12345, // client port
+                        53,    // DNS port
+                        DNS_QUERY,
+                    );
+                    if let Err(e) = mock.send_frame(&pkt).await {
+                        println!("[lan-client] ERROR sending DNS Query 1: {}", e);
+                    } else {
+                        println!("[lan-client] Sent DNS Query 1 to 192.168.1.1:53");
                     }
                 }
             }
@@ -1276,6 +1314,53 @@ async fn run_mock_lan_client(
                     );
                     let _ = mock.send_frame(&confirm_pkt).await;
                 }
+
+                // Check if it's a DNS response for us (DNS caching verification)
+                if let Some((src_ip, src_port, dest_port, payload)) = parse_udp_payload(&frame)
+                    && src_ip == Ipv4Addr::new(192, 168, 1, 1)
+                    && src_port == 53
+                    && dest_port == 12345
+                    && payload.len() >= 2
+                    && payload[2..] == DNS_RESPONSE[2..]
+                {
+                    if dns_test_phase == 1 {
+                        println!("[lan-client] DNS Query 1 resolved successfully! Requesting SIMULATE_DNS_OUTAGE...");
+                        dns_test_phase = 2;
+                        // Ask WAN ISP to simulate DNS outage
+                        let _ = verification_tx.send("SIMULATE_DNS_OUTAGE".to_string()).await;
+                        // Sleep 500ms to allow WAN ISP to receive the command
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        // Send DNS Query 2
+                        let pkt = packet::build_raw_packet(
+                            client_mac,
+                            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+                            Ipv4Addr::new(192, 168, 1, 2),
+                            Ipv4Addr::new(192, 168, 1, 1),
+                            12345, // client port
+                            53,    // DNS port
+                            DNS_QUERY,
+                        );
+                        let _ = mock.send_frame(&pkt).await;
+                        println!("[lan-client] Sent DNS Query 2 (which must be served from cache) to 192.168.1.1:53");
+                    } else if dns_test_phase == 2 {
+                        println!("[lan-client] DNS Query 2 resolved successfully! DNS Caching verified.");
+                        dns_test_phase = 0;
+                        // End WAN ISP DNS outage
+                        let _ = verification_tx.send("END_DNS_OUTAGE".to_string()).await;
+                        // Send confirmation to guest at 192.168.1.1:23457
+                        let confirm_pkt = packet::build_raw_packet(
+                            client_mac,
+                            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+                            Ipv4Addr::new(192, 168, 1, 2),
+                            Ipv4Addr::new(192, 168, 1, 1),
+                            23456,
+                            23457,
+                            b"DNS_CACHE_OK",
+                        );
+                        let _ = mock.send_frame(&confirm_pkt).await;
+                    }
+                }
+
 
                 // Check if it's a DHCP packet
                 if let Ok(dhcp_msg) = parse_dhcp_message(&frame) {

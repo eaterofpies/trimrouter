@@ -203,7 +203,10 @@ pub async fn test_lan_dhcp_handshake(lease_state: SharedWanLease) -> Result<LanM
 
     if !success {
         if let Err(e) = lan_manager.stop().await {
-            std::eprintln!("[test] Warning: Failed to stop LanManager during cleanup: {}", e);
+            std::eprintln!(
+                "[test] Warning: Failed to stop LanManager during cleanup: {}",
+                e
+            );
         }
         return Err(
             "LAN DHCP handshake test failed: did not receive ICMP reply from leased client"
