@@ -4,9 +4,9 @@ use rtnetlink::packet_route::address::AddressAttribute;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
+use trimrouter::managers::utils::SharedWanLease;
+use trimrouter::managers::{LanManager, Service};
 use trimrouter::network;
-use trimrouter::services::utils::SharedWanLease;
-use trimrouter::services::{LanManager, Service};
 
 pub async fn test_lan_wan_conflict(lease_state: SharedWanLease) -> Result<(), String> {
     std::println!("[test] Starting LAN/WAN Subnet Overlap test...");

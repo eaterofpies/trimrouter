@@ -1,10 +1,10 @@
-use super::dhcp_client::DhcpError;
 use super::ipc::{DhcpClientToParentMsg, recv_msg};
 use super::utils::{
     CleanOption, SharedWanLease, WanLease, get_interface_mac, mask_to_prefix_len,
     prefix_len_to_mask, setup_worker_sockets, spawn_worker, terminate_worker,
 };
 use super::{DHCP_CLIENT_SERVICE_NAME, Service, ServiceError};
+use crate::workers::dhcp_client::DhcpError;
 use futures_util::TryStreamExt;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;

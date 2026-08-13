@@ -15,7 +15,7 @@ mod error;
 #[path = "../src/packet.rs"]
 mod packet;
 
-#[path = "../src/services/utils.rs"]
+#[path = "../src/managers/utils.rs"]
 mod utils;
 
 macro_rules! println {

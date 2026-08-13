@@ -5,8 +5,8 @@
 //! and orchestrates starting/stopping dependent network services when links appear or disappear.
 
 use crate::error::RouterError;
+use crate::managers::{self, Service};
 use crate::network;
-use crate::services::{self, Service};
 use futures_util::{StreamExt, TryStreamExt};
 use pnet::util::MacAddr;
 use rtnetlink::packet_core::NetlinkPayload;
@@ -17,16 +17,16 @@ use rtnetlink::{LinkUnspec, MulticastGroup};
 /// Dynamic Router Service wrapper for execution management.
 pub enum RouterService {
     /// WAN DHCP Client service.
-    DhcpClient(services::DhcpClient),
+    DhcpClient(managers::DhcpClient),
     /// SNTP Client time synchronization service.
-    SntpClient(services::SntpClient),
+    SntpClient(managers::SntpClient),
     /// LAN Manager service.
-    LanManager(services::LanManager),
+    LanManager(managers::LanManager),
 }
 
 impl RouterService {
     /// Starts the encapsulated router service.
-    pub async fn start(&mut self) -> Result<(), services::ServiceError> {
+    pub async fn start(&mut self) -> Result<(), managers::ServiceError> {
         match self {
             RouterService::DhcpClient(s) => s.start().await,
             RouterService::SntpClient(s) => s.start().await,
@@ -35,7 +35,7 @@ impl RouterService {
     }
 
     /// Stops the encapsulated router service.
-    pub async fn stop(&mut self) -> Result<(), services::ServiceError> {
+    pub async fn stop(&mut self) -> Result<(), managers::ServiceError> {
         match self {
             RouterService::DhcpClient(s) => s.stop().await,
             RouterService::SntpClient(s) => s.stop().await,
@@ -205,7 +205,7 @@ fn parse_link_attributes(attributes: Vec<LinkAttribute>) -> (Option<String>, Opt
         match nla {
             LinkAttribute::IfName(n) => name = Some(n),
             LinkAttribute::Address(addr) => {
-                address = services::utils::mac_from_slice(&addr).ok();
+                address = managers::utils::mac_from_slice(&addr).ok();
             }
             _ => {}
         }

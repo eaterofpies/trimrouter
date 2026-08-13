@@ -1,7 +1,7 @@
 use crate::error::RouterError;
+use crate::managers::utils::{SharedWanLease, mask_to_prefix_len};
+use crate::managers::{DhcpServer, Service, ServiceError};
 use crate::network;
-use crate::services::utils::{SharedWanLease, mask_to_prefix_len};
-use crate::services::{DhcpServer, Service, ServiceError};
 use futures_util::{StreamExt, TryStreamExt};
 use ipnet::Ipv4Net;
 use rtnetlink::MulticastGroup;

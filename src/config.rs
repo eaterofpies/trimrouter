@@ -22,7 +22,7 @@ impl std::fmt::Debug for RouterConfig {
             .field("lan_mac", &self.lan_mac)
             .field(
                 "reboot_delay",
-                &crate::services::utils::CleanOption(&self.reboot_delay),
+                &crate::managers::utils::CleanOption(&self.reboot_delay),
             )
             .finish()
     }

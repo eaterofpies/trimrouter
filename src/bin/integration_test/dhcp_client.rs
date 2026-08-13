@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
-use trimrouter::services::utils::SharedWanLease;
-use trimrouter::services::{DhcpClient, Service};
+use trimrouter::managers::utils::SharedWanLease;
+use trimrouter::managers::{DhcpClient, Service};
 
 pub async fn test_dhcp_client_binding(lease_state: SharedWanLease) -> Result<DhcpClient, String> {
     std::println!("[test] Starting DHCP Client binding test...");

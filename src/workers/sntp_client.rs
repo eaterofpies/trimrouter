@@ -1,5 +1,5 @@
-use super::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
-use super::utils::{drop_privileges, wait_shutdown};
+use crate::managers::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
+use crate::managers::utils::{drop_privileges, resolve_dns_a_record, wait_shutdown};
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -164,7 +164,7 @@ async fn sleep_or_shutdown(
 
 async fn sync_time() -> Result<chrono::DateTime<chrono::Utc>, String> {
     // Resolve time.google.com manually via local DNS forwarder
-    let ntp_server_ip = super::utils::resolve_dns_a_record("time.google.com").await?;
+    let ntp_server_ip = resolve_dns_a_record("time.google.com").await?;
     let ntp_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ntp_server_ip), NTP_PORT);
 
     // Synchronize using standard rsntp client

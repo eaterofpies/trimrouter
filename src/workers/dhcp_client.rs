@@ -1,7 +1,8 @@
-use super::dhcp_client_parent::{configure_wan, deconfigure_wan};
-use super::utils::{
+use crate::managers::dhcp_client::{configure_wan, deconfigure_wan};
+use crate::managers::ipc::{DhcpClientToParentMsg, send_msg};
+use crate::managers::utils::{
     CleanOption, RawPacketSocket, SharedWanLease, WanLease, drop_privileges, get_interface_mac,
-    mask_to_prefix_len as utils_mask_to_prefix_len, wait_shutdown,
+    mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload, wait_shutdown,
 };
 use crate::packet::build_raw_packet;
 use pnet::util::MacAddr;
@@ -141,9 +142,7 @@ impl DhcpClientSocket {
                 return Ok(None);
             };
 
-            if let Some(dhcp) =
-                super::utils::parse_dhcp_payload(&raw_buf[..n], dhcproto::v4::CLIENT_PORT)
-            {
+            if let Some(dhcp) = parse_dhcp_payload(&raw_buf[..n], dhcproto::v4::CLIENT_PORT) {
                 return Ok(Some(dhcp));
             }
         }
@@ -430,14 +429,14 @@ impl DhcpClientInternal {
     ) -> Result<(), DhcpError> {
         if let Some(ref writer_mutex) = self.ipc_writer {
             let prefix_len = utils_mask_to_prefix_len(mask).unwrap_or(24);
-            let msg = super::ipc::DhcpClientToParentMsg::ApplyWanLease {
+            let msg = DhcpClientToParentMsg::ApplyWanLease {
                 ip_address: ip,
                 prefix_len,
                 gateway: gateway.unwrap_or(Ipv4Addr::UNSPECIFIED),
                 dns_servers: dns_servers.to_vec(),
             };
             let mut writer = writer_mutex.lock().await;
-            super::ipc::send_msg(&mut *writer, &msg)
+            send_msg(&mut *writer, &msg)
                 .await
                 .map_err(|e| DhcpError::Io(e))?;
             Ok(())
@@ -468,9 +467,9 @@ impl DhcpClientInternal {
 
     async fn deconfigure(&self) {
         if let Some(ref writer_mutex) = self.ipc_writer {
-            let msg = super::ipc::DhcpClientToParentMsg::ClearWanLease;
+            let msg = DhcpClientToParentMsg::ClearWanLease;
             let mut writer = writer_mutex.lock().await;
-            let _ = super::ipc::send_msg(&mut *writer, &msg).await;
+            let _ = send_msg(&mut *writer, &msg).await;
         } else {
             let (ip, mask) = {
                 let mut lease = self.lease_state.lock().unwrap();

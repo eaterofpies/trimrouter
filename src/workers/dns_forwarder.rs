@@ -1,5 +1,5 @@
-use super::ipc::{DnsParentToWorkerMsg, recv_msg};
-use super::utils::{drop_privileges, wait_shutdown};
+use crate::managers::ipc::{DnsParentToWorkerMsg, recv_msg};
+use crate::managers::utils::{drop_privileges, wait_shutdown};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;

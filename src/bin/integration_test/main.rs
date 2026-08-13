@@ -2,9 +2,9 @@ use nix::unistd::Pid;
 use std::sync::Arc;
 use std::time::Duration;
 use trimrouter::kmod;
+use trimrouter::managers::{Service, WanLease};
 use trimrouter::netfilter;
 use trimrouter::network;
-use trimrouter::services::{Service, WanLease};
 use trimrouter::system::{RealSystem, SystemOps, mount_boot_partition, mount_virtual_filesystems};
 
 mod dhcp_client;
@@ -20,10 +20,7 @@ async fn main() {
         || args.get(1).is_some_and(|arg1| arg1 == "modprobe");
 
     if is_modprobe {
-        if let Err(e) = kmod::run_as_modprobe(args) {
-            std::eprintln!("[modprobe] ERROR: {}", e);
-            std::process::exit(1);
-        }
+        trimrouter::modes::run(args).await;
         std::process::exit(0);
     }
 

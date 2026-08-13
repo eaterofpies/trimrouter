@@ -233,7 +233,7 @@ fn load_module_with_dep_map(
     any_success
 }
 
-fn load_module_with_dependencies(mod_name: &str) {
+pub fn load_module_with_dependencies(mod_name: &str) {
     let kdir = get_kernel_release();
     if kdir.is_empty() {
         let candidates = resolve_alias(mod_name);
@@ -324,19 +324,6 @@ pub fn load_required_modules() {
     }
 }
 
-fn parse_args_for_mod_name(args: &[String]) -> Option<String> {
-    let mut iter = args.iter().skip(1);
-    while let Some(arg) = iter.next() {
-        if arg == "--" {
-            return iter.next().cloned();
-        }
-        if !arg.starts_with('-') && arg != "modprobe" {
-            return Some(arg.clone());
-        }
-    }
-    None
-}
-
 fn wildcard_match(pattern: &[char], input: &[char]) -> bool {
     if pattern.is_empty() {
         return input.is_empty();
@@ -399,22 +386,6 @@ fn resolve_alias(alias_or_name: &str) -> Vec<String> {
         matches.push(alias_or_name.to_string());
     }
     matches
-}
-
-pub fn run_as_modprobe(args: Vec<String>) -> Result<(), std::io::Error> {
-    let raw_name = match parse_args_for_mod_name(&args) {
-        Some(name) => name,
-        None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Missing module name",
-            ));
-        }
-    };
-
-    println!("[modprobe] Request to load module: {}", raw_name);
-    load_module_with_dependencies(&raw_name);
-    Ok(())
 }
 
 pub fn trigger_uevents() {

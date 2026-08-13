@@ -1,13 +1,9 @@
 pub mod dhcp_client;
-pub mod dhcp_client_parent;
 pub mod dhcp_server;
-pub mod dhcp_server_parent;
 pub mod dns_forwarder;
-pub mod dns_forwarder_parent;
 pub mod ipc;
 pub mod lan_manager;
 pub mod sntp_client;
-pub mod sntp_client_parent;
 pub mod utils;
 
 pub use crate::network::{LAN_INTERFACE, WAN_INTERFACE};
@@ -19,14 +15,14 @@ pub const SNTP_CLIENT_SERVICE_NAME: &str = "sntp-client";
 
 pub use utils::{CHROOT_JAIL_PATH, NOBODY_GID, NOBODY_UID, ROUTER_BINARY_PATH, SELF_EXE_PATH};
 
-pub use dhcp_client_parent::DhcpClient;
-pub use dhcp_server_parent::DhcpServer;
-pub use dns_forwarder_parent::DnsForwarder;
+pub use dhcp_client::DhcpClient;
+pub use dhcp_server::DhcpServer;
+pub use dns_forwarder::DnsForwarder;
 pub use ipc::{
     DhcpClientToParentMsg, DhcpServerParentToWorkerMsg, DnsParentToWorkerMsg, SntpParentToWorkerMsg,
 };
 pub use lan_manager::LanManager;
-pub use sntp_client_parent::SntpClient;
+pub use sntp_client::SntpClient;
 pub use utils::WanLease;
 
 #[derive(Debug)]

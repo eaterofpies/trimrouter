@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(disable_help_flag = true, disable_version_flag = true)]
+#[command(name = "trimrouter-multicall", multicall = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -9,13 +9,68 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    #[command(
+        name = "modprobe",
+        ignore_errors = true,
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Modprobe {
+        #[arg(short = 'q')]
+        quiet: bool,
+
+        #[arg(short = 's')]
+        syslog: bool,
+
+        #[arg(short = 'b')]
+        use_blacklist: bool,
+
+        module_name: String,
+
+        #[arg(trailing_var_arg = true)]
+        params: Vec<String>,
+    },
+    Worker {
+        #[command(subcommand)]
+        service: WorkerService,
+    },
+    #[command(name = "trimrouter")]
+    Trimrouter {
+        #[command(subcommand)]
+        sub: Option<TrimrouterSubcommands>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TrimrouterSubcommands {
+    #[command(
+        name = "modprobe",
+        ignore_errors = true,
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Modprobe {
+        #[arg(short = 'q')]
+        quiet: bool,
+
+        #[arg(short = 's')]
+        syslog: bool,
+
+        #[arg(short = 'b')]
+        use_blacklist: bool,
+
+        module_name: String,
+
+        #[arg(trailing_var_arg = true)]
+        params: Vec<String>,
+    },
     Worker {
         #[command(subcommand)]
         service: WorkerService,
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum WorkerService {
     #[command(name = "sntp-client")]
     SntpClient { ipc_fd: i32 },
@@ -38,4 +93,35 @@ pub enum WorkerService {
         dns_socket_fd: i32,
         upstream_socket_fd: i32,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multicall_parsing() {
+        let args1 = vec![
+            "trimrouter".to_string(),
+            "worker".to_string(),
+            "dhcp-client".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "eth0".to_string(),
+        ];
+        assert!(Cli::try_parse_from(&args1).is_ok());
+
+        let args2 = vec![
+            "/bin/trimrouter".to_string(),
+            "worker".to_string(),
+            "dhcp-client".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "eth0".to_string(),
+        ];
+        assert!(Cli::try_parse_from(&args2).is_ok());
+
+        let args3 = vec!["modprobe".to_string(), "net-pf-10".to_string()];
+        assert!(Cli::try_parse_from(&args3).is_ok());
+    }
 }
