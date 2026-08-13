@@ -26,13 +26,40 @@ async fn main() {
     let is_worker = args.get(1).is_some_and(|arg| arg == "worker");
     if is_worker {
         let service_name = args.get(2).expect("Worker service name required");
-        let ipc_fd = args.get(3).expect("IPC socket FD required").parse::<i32>().expect("Invalid FD");
-        let raw_socket_fd = args.get(4).expect("Raw socket FD required").parse::<i32>().expect("Invalid FD");
+        let ipc_fd = args
+            .get(3)
+            .expect("IPC socket FD required")
+            .parse::<i32>()
+            .expect("Invalid FD");
+        let raw_socket_fd = args
+            .get(4)
+            .expect("Raw socket FD required")
+            .parse::<i32>()
+            .expect("Invalid FD");
         let wan_interface = args.get(5).expect("WAN interface name required").clone();
 
         if service_name == "dhcp-client" {
-            if let Err(e) = trimrouter::services::dhcp_client::run_dhcp_client_worker(ipc_fd, raw_socket_fd, wan_interface).await {
+            if let Err(e) = trimrouter::services::dhcp_client::run_dhcp_client_worker(
+                ipc_fd,
+                raw_socket_fd,
+                wan_interface,
+            )
+            .await
+            {
                 eprintln!("[dhcp-client-worker] ERROR: {}", e);
+                std::process::exit(1);
+            }
+        } else if service_name == "dhcp-server" {
+            let lan_ip = args.get(6).expect("LAN IP required").clone();
+            if let Err(e) = trimrouter::services::dhcp_server::run_dhcp_server_worker(
+                ipc_fd,
+                raw_socket_fd,
+                wan_interface,
+                lan_ip,
+            )
+            .await
+            {
+                eprintln!("[dhcp-server-worker] ERROR: {}", e);
                 std::process::exit(1);
             }
         }

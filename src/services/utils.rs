@@ -420,6 +420,74 @@ pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>)
     }
 }
 
+pub fn drop_privileges() -> Result<(), std::io::Error> {
+    use nix::unistd::{Gid, Uid, setgid, setuid};
+
+    let _ = std::fs::create_dir_all("/run/empty");
+    if let Ok(metadata) = std::fs::metadata("/run/empty") {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o555);
+        let _ = std::fs::set_permissions("/run/empty", perms);
+    }
+
+    let chroot_path = std::ffi::CString::new("/run/empty").unwrap();
+    let res = unsafe { libc::chroot(chroot_path.as_ptr()) };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let chdir_path = std::ffi::CString::new("/").unwrap();
+    let res = unsafe { libc::chdir(chdir_path.as_ptr()) };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    caps::clear(None, caps::CapSet::Bounding).map_err(std::io::Error::other)?;
+
+    setgid(Gid::from_raw(65534)).map_err(std::io::Error::other)?;
+
+    setuid(Uid::from_raw(65534)).map_err(std::io::Error::other)?;
+
+    let _ = caps::clear(None, caps::CapSet::Inheritable);
+    let _ = caps::clear(None, caps::CapSet::Effective);
+    let _ = caps::clear(None, caps::CapSet::Permitted);
+
+    Ok(())
+}
+
+pub fn setup_worker_sockets(interface: &str) -> std::io::Result<(RawFd, RawFd, RawFd)> {
+    let raw_socket_fd = open_raw_socket(interface).map_err(std::io::Error::other)?;
+
+    let mut fds = [0; 2];
+    let res = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    if res < 0 {
+        unsafe {
+            libc::close(raw_socket_fd);
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((raw_socket_fd, fds[0], fds[1]))
+}
+
+pub async fn terminate_worker(pid: u32) {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+
+    let start = std::time::Instant::now();
+    loop {
+        match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                if start.elapsed() > std::time::Duration::from_secs(1) {
+                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            _ => break,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {

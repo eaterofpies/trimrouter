@@ -1,15 +1,16 @@
+use super::ipc::{DhcpClientToParentMsg, recv_msg};
 use super::utils::{
-    CleanOption, RawPacketSocket, SharedWanLease, WanLease, get_interface_mac,
-    mask_to_prefix_len as utils_mask_to_prefix_len, wait_shutdown, open_raw_socket,
+    CleanOption, RawPacketSocket, SharedWanLease, WanLease, drop_privileges, get_interface_mac,
+    mask_to_prefix_len as utils_mask_to_prefix_len, setup_worker_sockets,
+    terminate_worker, wait_shutdown,
 };
 use crate::packet::build_raw_packet;
 use futures_util::TryStreamExt;
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::os::unix::io::{FromRawFd, RawFd};
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
-use super::ipc::{recv_msg, DhcpClientToParentMsg};
 
 const DEFAULT_LEASE_SECS: u32 = 3600;
 const MAX_RETRY_DELAY_SECS: u32 = 64;
@@ -458,7 +459,8 @@ impl DhcpClientInternal {
                 dns_servers: dns_servers.to_vec(),
             };
             let mut writer = writer_mutex.lock().await;
-            super::ipc::send_msg(&mut *writer, &msg).await
+            super::ipc::send_msg(&mut *writer, &msg)
+                .await
                 .map_err(|e| DhcpError::Io(e))?;
             Ok(())
         } else {
@@ -582,9 +584,6 @@ impl DhcpClientInternal {
 
 use super::{Service, ServiceError};
 
-const NOBODY_UID: u32 = 65534;
-const NOBODY_GID: u32 = 65534;
-
 pub struct DhcpClient {
     wan_interface: String,
     lease_state: SharedWanLease,
@@ -612,31 +611,13 @@ fn prefix_len_to_mask(prefix_len: u8) -> Ipv4Addr {
     Ipv4Addr::from(mask_u32)
 }
 
-fn setup_worker_sockets(wan_interface: &str) -> Result<(RawFd, RawFd, RawFd), ServiceError> {
-    let raw_socket_fd = open_raw_socket(wan_interface)
-        .map_err(|e| ServiceError::FailedToStart(e))?;
-
-    let mut fds = [0; 2];
-    let res = unsafe {
-        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
-    };
-    if res < 0 {
-        unsafe { libc::close(raw_socket_fd); }
-        return Err(ServiceError::FailedToStart(format!(
-            "socketpair failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok((raw_socket_fd, fds[0], fds[1]))
-}
-
 fn spawn_worker_process(
     child_ipc_fd: RawFd,
     raw_socket_fd: RawFd,
     wan_interface: &str,
 ) -> Result<std::process::Child, ServiceError> {
-    use std::process::Command;
     use std::os::unix::process::CommandExt;
+    use std::process::Command;
 
     let binary_path = if std::path::Path::new("/bin/trimrouter").exists() {
         "/bin/trimrouter"
@@ -659,7 +640,8 @@ fn spawn_worker_process(
         });
     }
 
-    cmd.spawn().map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
+    cmd.spawn()
+        .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
 }
 
 async fn apply_parent_lease(
@@ -710,7 +692,10 @@ async fn clear_parent_lease(lease_state: &SharedWanLease, wan_interface: &str) {
         && let Some(mask) = mask
     {
         if let Err(e) = deconfigure_wan(wan_interface, ip, mask).await {
-            eprintln!("[dhcp-client-parent] ERROR: Failed to deconfigure WAN: {}", e);
+            eprintln!(
+                "[dhcp-client-parent] ERROR: Failed to deconfigure WAN: {}",
+                e
+            );
         }
     }
 }
@@ -725,7 +710,8 @@ fn start_parent_supervisor_task(
 
     let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
     std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
-    let mut parent_ipc_stream = tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let mut parent_ipc_stream =
+        tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
 
     let handle = tokio::spawn(async move {
         println!(
@@ -778,10 +764,13 @@ impl Service for DhcpClient {
             return Err(ServiceError::AlreadyRunning);
         }
 
-        let _ = get_interface_mac(&self.wan_interface).await
+        let _ = get_interface_mac(&self.wan_interface)
+            .await
             .map_err(|e| ServiceError::FailedToStart(e))?;
 
-        let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) = setup_worker_sockets(&self.wan_interface)?;
+        let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) =
+            setup_worker_sockets(&self.wan_interface)
+                .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
 
         let child = match spawn_worker_process(child_ipc_fd, raw_socket_fd, &self.wan_interface) {
             Ok(c) => c,
@@ -817,22 +806,11 @@ impl Service for DhcpClient {
         let child_pid = self.child_pid.take().ok_or(ServiceError::NotRunning)?;
         let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
 
-        println!("[dhcp-client-parent] Stopping worker process PID {}", child_pid);
-        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
-
-        let start = std::time::Instant::now();
-        loop {
-            match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-                Ok(nix::sys::wait::WaitStatus::StillAlive) => {
-                    if start.elapsed() > std::time::Duration::from_secs(1) {
-                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                _ => break,
-            }
-        }
+        println!(
+            "[dhcp-client-parent] Stopping worker process PID {}",
+            child_pid
+        );
+        terminate_worker(child_pid).await;
 
         let _ = handle.await;
         Ok(())
@@ -881,10 +859,15 @@ pub async fn run_dhcp_client_worker(
     let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
 
     if let Err(e) = drop_privileges() {
-        eprintln!("[dhcp-client-worker] FATAL: Failed to drop privileges: {}", e);
+        eprintln!(
+            "[dhcp-client-worker] FATAL: Failed to drop privileges: {}",
+            e
+        );
         std::process::exit(1);
     }
-    println!("[dhcp-client-worker] Privileges dropped successfully (running as nobody inside chroot jail).");
+    println!(
+        "[dhcp-client-worker] Privileges dropped successfully (running as nobody inside chroot jail)."
+    );
 
     let dummy_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
     let client = DhcpClientInternal {
@@ -899,42 +882,6 @@ pub async fn run_dhcp_client_worker(
     tokio::spawn(monitor_parent_ipc(ipc_reader, shutdown_tx));
 
     client.run(shutdown_rx).await;
-    Ok(())
-}
-
-fn drop_privileges() -> Result<(), std::io::Error> {
-    use nix::unistd::{setuid, setgid, Uid, Gid};
-
-    let _ = std::fs::create_dir_all("/run/empty");
-    if let Ok(metadata) = std::fs::metadata("/run/empty") {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o555);
-        let _ = std::fs::set_permissions("/run/empty", perms);
-    }
-
-    let chroot_path = std::ffi::CString::new("/run/empty").unwrap();
-    let res = unsafe { libc::chroot(chroot_path.as_ptr()) };
-    if res != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let chdir_path = std::ffi::CString::new("/").unwrap();
-    let res = unsafe { libc::chdir(chdir_path.as_ptr()) };
-    if res != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    caps::clear(None, caps::CapSet::Bounding).map_err(std::io::Error::other)?;
-
-    setgid(Gid::from_raw(NOBODY_GID)).map_err(std::io::Error::other)?;
-
-    setuid(Uid::from_raw(NOBODY_UID)).map_err(std::io::Error::other)?;
-
-    let _ = caps::clear(None, caps::CapSet::Inheritable);
-    let _ = caps::clear(None, caps::CapSet::Effective);
-    let _ = caps::clear(None, caps::CapSet::Permitted);
-
     Ok(())
 }
 

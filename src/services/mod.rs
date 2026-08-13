@@ -1,18 +1,18 @@
 pub mod dhcp_client;
 pub mod dhcp_server;
 pub mod dns_forwarder;
+pub mod ipc;
 pub mod lan_manager;
 pub mod sntp_client;
 pub mod utils;
-pub mod ipc;
 
 pub use dhcp_client::DhcpClient;
 pub use dhcp_server::DhcpServer;
 pub use dns_forwarder::DnsForwarder;
+pub use ipc::{DhcpClientToParentMsg, ParentToWorkerMsg};
 pub use lan_manager::LanManager;
 pub use sntp_client::SntpClient;
 pub use utils::WanLease;
-pub use ipc::{ParentToWorkerMsg, DhcpClientToParentMsg};
 
 #[derive(Debug)]
 pub enum ServiceError {

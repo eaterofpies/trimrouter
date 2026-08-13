@@ -1,13 +1,14 @@
+use super::ipc::{ParentToWorkerMsg, recv_msg};
 use super::utils::{
-    get_interface_mac, open_raw_socket, parse_dhcp_payload, read_raw_packet, send_raw_packet,
-    wait_shutdown,
+    drop_privileges, get_interface_mac, parse_dhcp_payload, read_raw_packet,
+    send_raw_packet, setup_worker_sockets, terminate_worker, wait_shutdown,
 };
 use crate::packet::build_raw_packet;
 use futures_util::StreamExt;
 use pnet::packet::ethernet::EthernetPacket;
 use pnet::util::MacAddr;
 use rtnetlink::MulticastGroup;
-use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
+use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
 use std::net::Ipv4Addr;
@@ -17,7 +18,6 @@ use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 
 const LAN_LEASE_SECS: u32 = 3600;
-const SERVER_RESTART_DELAY_SECS: u64 = 5;
 
 // =========================================================================
 // Lease Table
@@ -136,28 +136,6 @@ use lease_table::{ClientLease, LeaseTable};
 // DHCP Server (LAN)
 // =========================================================================
 
-/// Typed errors for server socket setup, replacing opaque `String` returns.
-#[derive(Debug)]
-enum ServerError {
-    MacAddress(String),
-    RawSocket(String),
-    AsyncSocket(String),
-}
-
-impl std::fmt::Display for ServerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ServerError::MacAddress(e) => write!(f, "Failed to get MAC address: {}", e),
-            ServerError::RawSocket(e) => write!(f, "Failed to open raw socket: {}", e),
-            ServerError::AsyncSocket(e) => {
-                write!(f, "Failed to wrap raw socket in async fd: {}", e)
-            }
-        }
-    }
-}
-
-impl std::error::Error for ServerError {}
-
 /// Fixed server configuration derived from the LAN interface at startup.
 /// Passed by reference throughout the server loop to avoid repeating
 /// individual fields as function arguments.
@@ -168,23 +146,6 @@ struct ServerConfig {
     net: ipnet::Ipv4Net,
 }
 
-async fn setup_server_socket(
-    lan_interface: &str,
-) -> Result<(MacAddr, RawFd, AsyncFd<RawFd>), ServerError> {
-    let mac = get_interface_mac(lan_interface)
-        .await
-        .map_err(|e| ServerError::MacAddress(e.to_string()))?;
-    let raw_fd =
-        open_raw_socket(lan_interface).map_err(|e| ServerError::RawSocket(e.to_string()))?;
-    let async_sock = AsyncFd::new(raw_fd).map_err(|e| {
-        unsafe {
-            libc::close(raw_fd);
-        }
-        ServerError::AsyncSocket(e.to_string())
-    })?;
-    Ok((mac, raw_fd, async_sock))
-}
-
 use super::{Service, ServiceError};
 
 pub struct DhcpServer {
@@ -192,6 +153,7 @@ pub struct DhcpServer {
     lan_ip: String,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    child_pid: Option<u32>,
 }
 
 impl DhcpServer {
@@ -201,8 +163,118 @@ impl DhcpServer {
             lan_ip,
             shutdown_tx: None,
             task_handle: None,
+            child_pid: None,
         }
     }
+}
+
+fn spawn_server_worker_process(
+    child_ipc_fd: RawFd,
+    raw_socket_fd: RawFd,
+    lan_interface: &str,
+    lan_ip: &str,
+) -> Result<std::process::Child, ServiceError> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let binary_path = if std::path::Path::new("/bin/trimrouter").exists() {
+        "/bin/trimrouter"
+    } else {
+        "/proc/self/exe"
+    };
+
+    let mut cmd = Command::new(binary_path);
+    cmd.arg("worker");
+    cmd.arg("dhcp-server");
+    cmd.arg(child_ipc_fd.to_string());
+    cmd.arg(raw_socket_fd.to_string());
+    cmd.arg(lan_interface);
+    cmd.arg(lan_ip);
+
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::fcntl(child_ipc_fd, libc::F_SETFD, 0);
+            libc::fcntl(raw_socket_fd, libc::F_SETFD, 0);
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
+        .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
+}
+
+fn start_parent_arp_listener(
+    parent_ipc_fd: RawFd,
+    child_pid: u32,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<tokio::task::JoinHandle<()>, ServiceError> {
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
+    std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
+    let ipc_stream = tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let (_, ipc_writer) = ipc_stream.into_split();
+    let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
+
+    let connection_fut = rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]);
+    let (connection, _handle, mut messages) = match connection_fut {
+        Ok(res) => res,
+        Err(e) => {
+            return Err(ServiceError::FailedToStart(format!(
+                "Failed to start Netlink ARP listener connection: {}",
+                e
+            )));
+        }
+    };
+    tokio::spawn(connection);
+
+    let handle = tokio::spawn(async move {
+        println!(
+            "[dhcp-server-parent] Supervising DHCP server worker (PID {})",
+            child_pid
+        );
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                Some((message, _addr)) = messages.next() => {
+                    if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg)) = message.payload {
+                        let mut ip_opt = None;
+                        let mut mac_opt = None;
+                        for nla in msg.attributes {
+                            match nla {
+                                NeighbourAttribute::Destination(NeighbourAddress::Inet(ip)) => {
+                                    ip_opt = Some(ip);
+                                }
+                                NeighbourAttribute::LinkLayerAddress(mac_bytes) if mac_bytes.len() == 6 => {
+                                    let bytes: [u8; 6] = mac_bytes.try_into().unwrap();
+                                    mac_opt = Some(bytes);
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let (Some(ip), Some(mac)) = (ip_opt, mac_opt) {
+                            let ipc_msg = super::ipc::ParentToWorkerMsg::AddNeighbor {
+                                ip_address: ip,
+                                mac_address: mac,
+                            };
+                            let mut writer = shared_ipc_writer.lock().await;
+                            let _ = super::ipc::send_msg(&mut *writer, &ipc_msg).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    });
+
+    Ok(handle)
 }
 
 impl Service for DhcpServer {
@@ -214,105 +286,166 @@ impl Service for DhcpServer {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
-        let lan_interface = self.lan_interface.clone();
-        let lan_ip = self.lan_ip.clone();
+        let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) =
+            setup_worker_sockets(&self.lan_interface)
+                .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
 
-        // Parse LAN configuration IP net first to fail early
-        let net: ipnet::Ipv4Net = lan_ip.parse().map_err(|e| {
-            ServiceError::FailedToStart(format!("Invalid LAN IP configuration '{}': {}", lan_ip, e))
-        })?;
+        let child = match spawn_server_worker_process(
+            child_ipc_fd,
+            raw_socket_fd,
+            &self.lan_interface,
+            &self.lan_ip,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                unsafe {
+                    libc::close(raw_socket_fd);
+                    libc::close(parent_ipc_fd);
+                    libc::close(child_ipc_fd);
+                }
+                return Err(e);
+            }
+        };
 
-        let server_ip = net.addr();
-        let subnet_mask = net.netmask();
+        unsafe {
+            libc::close(child_ipc_fd);
+            libc::close(raw_socket_fd);
+        }
 
-        let handle = tokio::spawn(async move {
-            run_dhcp_server(lan_interface, server_ip, subnet_mask, net, shutdown_rx).await;
-        });
+        let child_pid = child.id();
+        let handle = start_parent_arp_listener(parent_ipc_fd, child_pid, shutdown_rx)?;
 
+        self.child_pid = Some(child_pid);
         self.task_handle = Some(handle);
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
+        let child_pid = self.child_pid.take().ok_or(ServiceError::NotRunning)?;
         let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
+        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
 
+        println!(
+            "[dhcp-server-parent] Stopping worker process PID {}",
+            child_pid
+        );
         let _ = tx.send(true);
+        terminate_worker(child_pid).await;
+
         let _ = handle.await;
         Ok(())
     }
 }
 
-async fn run_dhcp_server(
-    lan_interface: String,
-    server_ip: std::net::Ipv4Addr,
-    subnet_mask: std::net::Ipv4Addr,
-    net: ipnet::Ipv4Net,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+async fn update_lease_from_neighbor(
+    mac: MacAddr,
+    ip: Ipv4Addr,
+    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
 ) {
+    if mac == MacAddr::zero() || mac == MacAddr::broadcast() {
+        return;
+    }
+
+    let mut leases_guard = leases.lock().await;
+    if let Some(existing) = leases_guard.get(&mac) {
+        if existing.ip != ip {
+            leases_guard.insert(
+                mac,
+                ClientLease {
+                    ip,
+                    expiry: Instant::now() + Duration::from_secs(300),
+                },
+            );
+        }
+    } else {
+        leases_guard.insert(
+            mac,
+            ClientLease {
+                ip,
+                expiry: Instant::now() + Duration::from_secs(300),
+            },
+        );
+    }
+}
+
+pub async fn run_dhcp_server_worker(
+    ipc_fd: RawFd,
+    raw_socket_fd: RawFd,
+    lan_interface: String,
+    lan_ip: String,
+) -> Result<(), std::io::Error> {
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
     println!(
-        "[dhcp-server] Starting LAN DHCP server on {}...",
+        "[dhcp-server-worker] Starting unprivileged LAN DHCP server worker on {}...",
         lan_interface
     );
+
+    let std_stream = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
+    std_stream.set_nonblocking(true)?;
+    let ipc_stream = tokio::net::UnixStream::from_std(std_stream)?;
+    let (ipc_reader, _ipc_writer) = ipc_stream.into_split();
+
+    let net: ipnet::Ipv4Net = lan_ip.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid LAN IP: {}", e),
+        )
+    })?;
+    let server_ip = net.addr();
+    let subnet_mask = net.netmask();
 
     let mut hosts = net.hosts();
     let start_ip = hosts.next();
     let end_ip = hosts.next_back();
     if let (Some(start), Some(end)) = (start_ip, end_ip) {
-        println!("[dhcp-server] Dynamic lease pool: {} to {}", start, end);
-    } else {
-        println!("[dhcp-server] Dynamic lease pool: (empty)");
+        println!(
+            "[dhcp-server-worker] Dynamic lease pool: {} to {}",
+            start, end
+        );
     }
+
+    if let Err(e) = drop_privileges() {
+        eprintln!(
+            "[dhcp-server-worker] FATAL: Failed to drop privileges: {}",
+            e
+        );
+        std::process::exit(1);
+    }
+    println!(
+        "[dhcp-server-worker] Privileges dropped successfully (running as nobody inside chroot jail)."
+    );
+
+    let mac = get_interface_mac(&lan_interface)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let async_sock = AsyncFd::new(raw_socket_fd)?;
 
     let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
+    let leases_clone = Arc::clone(&leases);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let arp_leases = Arc::clone(&leases);
-    let arp_shutdown_rx = shutdown_rx.clone();
+    let mut reader = ipc_reader;
     tokio::spawn(async move {
-        start_arp_listener(arp_leases, arp_shutdown_rx).await;
+        loop {
+            match recv_msg::<ParentToWorkerMsg, _>(&mut reader).await {
+                Ok(Some(ParentToWorkerMsg::AddNeighbor {
+                    ip_address,
+                    mac_address,
+                })) => {
+                    let mac = MacAddr::from(mac_address);
+                    update_lease_from_neighbor(mac, ip_address, &leases_clone).await;
+                }
+                Ok(Some(ParentToWorkerMsg::SetUpstreamResolvers { .. })) => {}
+                Ok(None) | Err(_) => {
+                    println!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
+            }
+        }
     });
-
-    loop {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-        if !run_server_iteration(
-            &lan_interface,
-            server_ip,
-            subnet_mask,
-            net,
-            Arc::clone(&leases),
-            &mut shutdown_rx,
-        )
-        .await
-        {
-            break;
-        }
-    }
-}
-
-async fn run_server_iteration(
-    lan_interface: &str,
-    server_ip: std::net::Ipv4Addr,
-    subnet_mask: std::net::Ipv4Addr,
-    net: ipnet::Ipv4Net,
-    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
-) -> bool {
-    let setup_res = tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => {
-            return false;
-        }
-        res = setup_server_socket(lan_interface) => res,
-    };
-
-    let (mac, raw_fd, async_sock) = match setup_res {
-        Ok(res) => res,
-        Err(e) => {
-            handle_setup_error(e, shutdown_rx).await;
-            return true;
-        }
-    };
 
     let config = Arc::new(ServerConfig {
         server_ip,
@@ -322,40 +455,9 @@ async fn run_server_iteration(
     });
 
     let async_sock_shared = Arc::new(async_sock);
-
-    let loop_res = run_server_loop(async_sock_shared, config, leases, shutdown_rx).await;
-
-    unsafe {
-        libc::close(raw_fd);
-    }
-
-    if loop_res.is_err() {
-        let is_ok = handle_loop_error(shutdown_rx).await.is_ok();
-        return is_ok;
-    }
-    false
-}
-
-async fn handle_setup_error(e: ServerError, shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
-    eprintln!(
-        "[dhcp-server] ERROR: {}. Retrying in {}s...",
-        e, SERVER_RESTART_DELAY_SECS
-    );
-    tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => {}
-        _ = tokio::time::sleep(Duration::from_secs(SERVER_RESTART_DELAY_SECS)) => {}
-    }
-}
-
-async fn handle_loop_error(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) -> Result<(), ()> {
-    println!(
-        "[dhcp-server] Socket closed. Restarting server loop in {}s...",
-        SERVER_RESTART_DELAY_SECS
-    );
-    tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => Err(()),
-        _ = tokio::time::sleep(Duration::from_secs(SERVER_RESTART_DELAY_SECS)) => Ok(()),
-    }
+    let mut shutdown_rx_clone = shutdown_rx.clone();
+    let _ = run_server_loop(async_sock_shared, config, leases, &mut shutdown_rx_clone).await;
+    Ok(())
 }
 
 async fn receive_next_packet(
@@ -575,6 +677,7 @@ async fn trigger_arp_resolution(server_ip: Ipv4Addr, target_ip: Ipv4Addr) {
 
 /// Process incoming Netlink neighbour table events (ARP additions/updates).
 /// Maps active MAC-to-IP pairings directly into the DHCP lease table dynamically.
+#[allow(dead_code)]
 async fn handle_neigh_message(msg: NeighbourMessage, leases: &Arc<tokio::sync::Mutex<LeaseTable>>) {
     let mut ip_opt = None;
     let mut mac_opt = None;
@@ -625,43 +728,6 @@ async fn handle_neigh_message(msg: NeighbourMessage, leases: &Arc<tokio::sync::M
                 expiry: Instant::now() + Duration::from_secs(300), // 5 minute dynamic hold
             },
         );
-    }
-}
-
-async fn process_netlink_message(
-    message: NetlinkMessage<RouteNetlinkMessage>,
-    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
-) {
-    if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg)) = message.payload {
-        handle_neigh_message(msg, leases).await;
-    }
-}
-
-async fn start_arp_listener(
-    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    let (connection, _handle, mut messages) =
-        match rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]) {
-            Ok(res) => res,
-            Err(e) => {
-                eprintln!("[dhcp-server] Failed to start Netlink ARP listener: {}", e);
-                return;
-            }
-        };
-    tokio::spawn(connection);
-
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    break;
-                }
-            }
-            Some((message, _addr)) = messages.next() => {
-                process_netlink_message(message, &leases).await;
-            }
-        }
     }
 }
 
