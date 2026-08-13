@@ -63,6 +63,15 @@ pub fn mask_to_prefix_len(mask: Ipv4Addr) -> Result<u8, RouterError> {
     Ok(leading_ones as u8)
 }
 
+pub fn prefix_len_to_mask(prefix_len: u8) -> Ipv4Addr {
+    if prefix_len == 0 || prefix_len > 32 {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        let mask_u32 = u32::MAX << (32 - prefix_len);
+        Ipv4Addr::from(mask_u32)
+    }
+}
+
 // =========================================================================
 // Helper Functions for Raw Sockets
 // =========================================================================
