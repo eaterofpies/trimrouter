@@ -1,12 +1,13 @@
 use super::ipc::{DhcpServerParentToWorkerMsg, send_msg};
-use super::utils::{setup_worker_sockets, terminate_worker};
-use super::{Service, ServiceError};
+use super::utils::{setup_worker_sockets, spawn_worker, terminate_worker};
+use super::{DHCP_SERVER_SERVICE_NAME, Service, ServiceError};
 use futures_util::StreamExt;
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
 use std::os::unix::io::RawFd;
+use std::process::Child;
 use std::sync::Arc;
 
 pub struct DhcpServer {
@@ -34,34 +35,21 @@ fn spawn_server_worker_process(
     raw_socket_fd: RawFd,
     lan_interface: &str,
     lan_ip: &str,
-) -> Result<std::process::Child, ServiceError> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    let binary_path = if std::path::Path::new("/bin/trimrouter").exists() {
-        "/bin/trimrouter"
-    } else {
-        "/proc/self/exe"
-    };
-
-    let mut cmd = Command::new(binary_path);
-    cmd.arg("worker");
-    cmd.arg("dhcp-server");
-    cmd.arg(child_ipc_fd.to_string());
-    cmd.arg(raw_socket_fd.to_string());
-    cmd.arg(lan_interface);
-    cmd.arg(lan_ip);
-
-    unsafe {
-        cmd.pre_exec(move || {
-            libc::fcntl(child_ipc_fd, libc::F_SETFD, 0);
-            libc::fcntl(raw_socket_fd, libc::F_SETFD, 0);
-            Ok(())
-        });
-    }
-
-    cmd.spawn()
-        .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
+) -> Result<Child, ServiceError> {
+    let child_ipc_str = child_ipc_fd.to_string();
+    let raw_socket_str = raw_socket_fd.to_string();
+    let args = &[
+        child_ipc_str.as_str(),
+        raw_socket_str.as_str(),
+        lan_interface,
+        lan_ip,
+    ];
+    spawn_worker(
+        DHCP_SERVER_SERVICE_NAME,
+        args,
+        &[child_ipc_fd, raw_socket_fd],
+    )
+    .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
 }
 
 fn start_parent_arp_listener(

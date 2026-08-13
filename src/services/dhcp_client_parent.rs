@@ -2,12 +2,13 @@ use super::dhcp_client::DhcpError;
 use super::ipc::{DhcpClientToParentMsg, recv_msg};
 use super::utils::{
     CleanOption, SharedWanLease, WanLease, get_interface_mac, mask_to_prefix_len,
-    prefix_len_to_mask, setup_worker_sockets, terminate_worker,
+    prefix_len_to_mask, setup_worker_sockets, spawn_worker, terminate_worker,
 };
-use super::{Service, ServiceError};
+use super::{DHCP_CLIENT_SERVICE_NAME, Service, ServiceError};
 use futures_util::TryStreamExt;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
+use std::process::Child;
 
 pub struct DhcpClient {
     pub(super) wan_interface: String,
@@ -31,33 +32,20 @@ fn spawn_worker_process(
     child_ipc_fd: RawFd,
     raw_socket_fd: RawFd,
     wan_interface: &str,
-) -> Result<std::process::Child, ServiceError> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    let binary_path = if std::path::Path::new("/bin/trimrouter").exists() {
-        "/bin/trimrouter"
-    } else {
-        "/proc/self/exe"
-    };
-
-    let mut cmd = Command::new(binary_path);
-    cmd.arg("worker");
-    cmd.arg("dhcp-client");
-    cmd.arg(child_ipc_fd.to_string());
-    cmd.arg(raw_socket_fd.to_string());
-    cmd.arg(wan_interface);
-
-    unsafe {
-        cmd.pre_exec(move || {
-            libc::fcntl(child_ipc_fd, libc::F_SETFD, 0);
-            libc::fcntl(raw_socket_fd, libc::F_SETFD, 0);
-            Ok(())
-        });
-    }
-
-    cmd.spawn()
-        .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
+) -> Result<Child, ServiceError> {
+    let child_ipc_str = child_ipc_fd.to_string();
+    let raw_socket_str = raw_socket_fd.to_string();
+    let args = &[
+        child_ipc_str.as_str(),
+        raw_socket_str.as_str(),
+        wan_interface,
+    ];
+    spawn_worker(
+        DHCP_CLIENT_SERVICE_NAME,
+        args,
+        &[child_ipc_fd, raw_socket_fd],
+    )
+    .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
 }
 
 async fn apply_parent_lease(

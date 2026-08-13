@@ -1,8 +1,9 @@
 use super::ipc::{DnsParentToWorkerMsg, send_msg};
-use super::utils::{SharedWanLease, terminate_worker};
-use super::{Service, ServiceError};
+use super::utils::{SharedWanLease, spawn_worker, terminate_worker};
+use super::{DNS_FORWARDER_SERVICE_NAME, Service, ServiceError};
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
+use std::process::Child;
 use std::sync::Arc;
 
 const DNS_PORT: u16 = 53;
@@ -29,34 +30,21 @@ fn spawn_dns_worker_process(
     child_ipc_fd: RawFd,
     dns_socket_fd: RawFd,
     upstream_socket_fd: RawFd,
-) -> Result<std::process::Child, ServiceError> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    let binary_path = if std::path::Path::new("/bin/trimrouter").exists() {
-        "/bin/trimrouter"
-    } else {
-        "/proc/self/exe"
-    };
-
-    let mut cmd = Command::new(binary_path);
-    cmd.arg("worker");
-    cmd.arg("dns-forwarder");
-    cmd.arg(child_ipc_fd.to_string());
-    cmd.arg(dns_socket_fd.to_string());
-    cmd.arg(upstream_socket_fd.to_string());
-
-    unsafe {
-        cmd.pre_exec(move || {
-            libc::fcntl(child_ipc_fd, libc::F_SETFD, 0);
-            libc::fcntl(dns_socket_fd, libc::F_SETFD, 0);
-            libc::fcntl(upstream_socket_fd, libc::F_SETFD, 0);
-            Ok(())
-        });
-    }
-
-    cmd.spawn()
-        .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
+) -> Result<Child, ServiceError> {
+    let child_ipc_str = child_ipc_fd.to_string();
+    let dns_socket_str = dns_socket_fd.to_string();
+    let upstream_socket_str = upstream_socket_fd.to_string();
+    let args = &[
+        child_ipc_str.as_str(),
+        dns_socket_str.as_str(),
+        upstream_socket_str.as_str(),
+    ];
+    spawn_worker(
+        DNS_FORWARDER_SERVICE_NAME,
+        args,
+        &[child_ipc_fd, dns_socket_fd, upstream_socket_fd],
+    )
+    .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
 }
 
 async fn run_parent_dns_monitor(

@@ -1,7 +1,8 @@
 use super::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
-use super::utils::{SharedWanLease, terminate_worker};
-use super::{Service, ServiceError};
+use super::utils::{SharedWanLease, spawn_worker, terminate_worker};
+use super::{SNTP_CLIENT_SERVICE_NAME, Service, ServiceError};
 use std::os::unix::io::RawFd;
+use std::process::Child;
 use std::sync::Arc;
 
 pub struct SntpClient {
@@ -22,29 +23,10 @@ impl SntpClient {
     }
 }
 
-fn spawn_sntp_worker_process(child_ipc_fd: RawFd) -> Result<std::process::Child, ServiceError> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    let binary_path = if std::path::Path::new("/bin/trimrouter").exists() {
-        "/bin/trimrouter"
-    } else {
-        "/proc/self/exe"
-    };
-
-    let mut cmd = Command::new(binary_path);
-    cmd.arg("worker");
-    cmd.arg("sntp-client");
-    cmd.arg(child_ipc_fd.to_string());
-
-    unsafe {
-        cmd.pre_exec(move || {
-            libc::fcntl(child_ipc_fd, libc::F_SETFD, 0);
-            Ok(())
-        });
-    }
-
-    cmd.spawn()
+fn spawn_sntp_worker_process(child_ipc_fd: RawFd) -> Result<Child, ServiceError> {
+    let child_ipc_str = child_ipc_fd.to_string();
+    let args = &[child_ipc_str.as_str()];
+    spawn_worker(SNTP_CLIENT_SERVICE_NAME, args, &[child_ipc_fd])
         .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
 }
 

@@ -2,6 +2,14 @@ use nix::unistd::Pid;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use trimrouter::config::RouterConfig;
+pub mod cli;
+
+use clap::Parser;
+use cli::{Cli, Commands, WorkerService};
+use std::process::exit;
+use trimrouter::services::{
+    CHROOT_JAIL_PATH, dhcp_client, dhcp_server, dns_forwarder, sntp_client,
+};
 use trimrouter::system::{
     RealSystem, SystemOps, mount_boot_partition, mount_virtual_filesystems, register_panic_handler,
 };
@@ -18,82 +26,73 @@ async fn main() {
     if is_modprobe {
         if let Err(e) = kmod::run_as_modprobe(args) {
             eprintln!("[modprobe] ERROR: {}", e);
-            std::process::exit(1);
+            exit(1);
         }
-        std::process::exit(0);
+        exit(0);
     }
 
-    let is_worker = args.get(1).is_some_and(|arg| arg == "worker");
-    if is_worker {
-        let service_name = args.get(2).expect("Worker service name required");
-        let ipc_fd = args
-            .get(3)
-            .expect("IPC socket FD required")
-            .parse::<i32>()
-            .expect("Invalid FD");
-
-        if service_name == "sntp-client" {
-            if let Err(e) = trimrouter::services::sntp_client::run_sntp_client_worker(ipc_fd).await
-            {
-                eprintln!("[sntp-client-worker] ERROR: {}", e);
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-
-        let raw_socket_fd = args
-            .get(4)
-            .expect("Raw socket FD required")
-            .parse::<i32>()
-            .expect("Invalid FD");
-        let wan_interface = args.get(5).expect("WAN interface name required").clone();
-
-        if service_name == "dhcp-client" {
-            if let Err(e) = trimrouter::services::dhcp_client::run_dhcp_client_worker(
-                ipc_fd,
-                raw_socket_fd,
-                wan_interface,
-            )
-            .await
-            {
-                eprintln!("[dhcp-client-worker] ERROR: {}", e);
-                std::process::exit(1);
-            }
-        } else if service_name == "dhcp-server" {
-            let lan_ip = args.get(6).expect("LAN IP required").clone();
-            if let Err(e) = trimrouter::services::dhcp_server::run_dhcp_server_worker(
-                ipc_fd,
-                raw_socket_fd,
-                wan_interface,
-                lan_ip,
-            )
-            .await
-            {
-                eprintln!("[dhcp-server-worker] ERROR: {}", e);
-                std::process::exit(1);
-            }
-        } else if service_name == "dns-forwarder" {
-            let dns_socket_fd = raw_socket_fd;
-            let upstream_socket_fd = args
-                .get(5)
-                .expect("Upstream socket FD required")
-                .parse::<i32>()
-                .expect("Invalid FD");
-            if let Err(e) = trimrouter::services::dns_forwarder::run_dns_forwarder_worker(
-                ipc_fd,
-                dns_socket_fd,
-                upstream_socket_fd,
-            )
-            .await
-            {
-                eprintln!("[dns-forwarder-worker] ERROR: {}", e);
-            }
-        }
-        std::process::exit(0);
+    if let Ok(cli) = Cli::try_parse()
+        && let Some(Commands::Worker { service }) = cli.command
+    {
+        run_worker(service).await;
     }
 
     let sys = Arc::new(RealSystem);
     run_as_init(sys).await;
+}
+
+async fn run_worker(service: WorkerService) {
+    match service {
+        WorkerService::SntpClient { ipc_fd } => {
+            if let Err(e) = sntp_client::run_sntp_client_worker(ipc_fd).await {
+                eprintln!("[sntp-client-worker] ERROR: {}", e);
+                exit(1);
+            }
+            exit(0);
+        }
+        WorkerService::DhcpClient {
+            ipc_fd,
+            raw_socket_fd,
+            wan_interface,
+        } => {
+            if let Err(e) =
+                dhcp_client::run_dhcp_client_worker(ipc_fd, raw_socket_fd, wan_interface).await
+            {
+                eprintln!("[dhcp-client-worker] ERROR: {}", e);
+                exit(1);
+            }
+            exit(0);
+        }
+        WorkerService::DhcpServer {
+            ipc_fd,
+            raw_socket_fd,
+            wan_interface,
+            lan_ip,
+        } => {
+            if let Err(e) =
+                dhcp_server::run_dhcp_server_worker(ipc_fd, raw_socket_fd, wan_interface, lan_ip)
+                    .await
+            {
+                eprintln!("[dhcp-server-worker] ERROR: {}", e);
+                exit(1);
+            }
+            exit(0);
+        }
+        WorkerService::DnsForwarder {
+            ipc_fd,
+            dns_socket_fd,
+            upstream_socket_fd,
+        } => {
+            if let Err(e) =
+                dns_forwarder::run_dns_forwarder_worker(ipc_fd, dns_socket_fd, upstream_socket_fd)
+                    .await
+            {
+                eprintln!("[dns-forwarder-worker] ERROR: {}", e);
+                exit(1);
+            }
+            exit(0);
+        }
+    }
 }
 
 async fn run_as_init(sys: Arc<RealSystem>) {
@@ -151,20 +150,21 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
         }
 
         // Create chroot jail directory if it doesn't exist
-        let _ = std::fs::create_dir_all("/run/empty");
-        if let Ok(metadata) = std::fs::metadata("/run/empty") {
+        std::fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
+        if let Ok(metadata) = std::fs::metadata(CHROOT_JAIL_PATH) {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = metadata.permissions();
             perms.set_mode(0o555); // rx-rx-rx
-            let _ = std::fs::set_permissions("/run/empty", perms);
+            std::fs::set_permissions(CHROOT_JAIL_PATH, perms)
+                .expect("Failed to set chroot jail permissions");
         }
     } else {
         println!(
             "[init] Running in standard user environment (PID {}). Skipping VFS mounts.",
             sys.getpid()
         );
-        // Ensure /run/empty exists for local tests as well
-        let _ = std::fs::create_dir_all("/run/empty");
+        // Ensure jail directory exists for local tests as well
+        std::fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
     }
 
     // 3. Load Configuration

@@ -3,7 +3,16 @@ use pnet::util::MacAddr;
 use rtnetlink::packet_route::link::LinkAttribute;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
+
+pub const CHROOT_JAIL_PATH: &str = "/run/empty";
+pub const NOBODY_UID: u32 = 65534;
+pub const NOBODY_GID: u32 = 65534;
+pub const SELF_EXE_PATH: &str = "/proc/self/exe";
+pub const ROUTER_BINARY_PATH: &str = "/bin/trimrouter";
 
 // =========================================================================
 // Shared WAN Lease Info
@@ -432,21 +441,20 @@ pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>)
 pub fn drop_privileges() -> Result<(), std::io::Error> {
     use nix::unistd::{Gid, Uid, setgid, setuid};
 
-    let _ = std::fs::create_dir_all("/run/empty");
-    if let Ok(metadata) = std::fs::metadata("/run/empty") {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o555);
-        let _ = std::fs::set_permissions("/run/empty", perms);
-    }
+    std::fs::create_dir_all(CHROOT_JAIL_PATH)?;
+    let metadata = std::fs::metadata(CHROOT_JAIL_PATH)?;
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = metadata.permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(CHROOT_JAIL_PATH, perms)?;
 
-    let chroot_path = std::ffi::CString::new("/run/empty").unwrap();
+    let chroot_path = std::ffi::CString::new(CHROOT_JAIL_PATH).map_err(std::io::Error::other)?;
     let res = unsafe { libc::chroot(chroot_path.as_ptr()) };
     if res != 0 {
         return Err(std::io::Error::last_os_error());
     }
 
-    let chdir_path = std::ffi::CString::new("/").unwrap();
+    let chdir_path = std::ffi::CString::new("/").map_err(std::io::Error::other)?;
     let res = unsafe { libc::chdir(chdir_path.as_ptr()) };
     if res != 0 {
         return Err(std::io::Error::last_os_error());
@@ -454,13 +462,13 @@ pub fn drop_privileges() -> Result<(), std::io::Error> {
 
     caps::clear(None, caps::CapSet::Bounding).map_err(std::io::Error::other)?;
 
-    setgid(Gid::from_raw(65534)).map_err(std::io::Error::other)?;
+    setgid(Gid::from_raw(NOBODY_GID)).map_err(std::io::Error::other)?;
 
-    setuid(Uid::from_raw(65534)).map_err(std::io::Error::other)?;
+    setuid(Uid::from_raw(NOBODY_UID)).map_err(std::io::Error::other)?;
 
-    let _ = caps::clear(None, caps::CapSet::Inheritable);
-    let _ = caps::clear(None, caps::CapSet::Effective);
-    let _ = caps::clear(None, caps::CapSet::Permitted);
+    caps::clear(None, caps::CapSet::Inheritable).map_err(std::io::Error::other)?;
+    caps::clear(None, caps::CapSet::Effective).map_err(std::io::Error::other)?;
+    caps::clear(None, caps::CapSet::Permitted).map_err(std::io::Error::other)?;
 
     Ok(())
 }
@@ -479,21 +487,59 @@ pub fn setup_worker_sockets(interface: &str) -> std::io::Result<(RawFd, RawFd, R
     Ok((raw_socket_fd, fds[0], fds[1]))
 }
 
+pub fn spawn_worker(
+    service_name: &str,
+    args: &[&str],
+    fds_to_keep: &[RawFd],
+) -> std::io::Result<Child> {
+    let binary_path = if Path::new(ROUTER_BINARY_PATH).exists() {
+        ROUTER_BINARY_PATH
+    } else {
+        SELF_EXE_PATH
+    };
+
+    let mut cmd = Command::new(binary_path);
+    cmd.arg("worker");
+    cmd.arg(service_name);
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    let fds = fds_to_keep.to_vec();
+    unsafe {
+        cmd.pre_exec(move || {
+            for &fd in &fds {
+                libc::fcntl(fd, libc::F_SETFD, 0);
+            }
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
+}
+
 pub async fn terminate_worker(pid: u32) {
     let pid = nix::unistd::Pid::from_raw(pid as i32);
-    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+    if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
+        eprintln!(
+            "[utils] Warning: Failed to send SIGTERM to worker process {}: {}",
+            pid, e
+        );
+    }
 
     let start = std::time::Instant::now();
-    loop {
-        match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-            Ok(nix::sys::wait::WaitStatus::StillAlive) => {
-                if start.elapsed() > std::time::Duration::from_secs(1) {
-                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            _ => break,
+    while let Ok(nix::sys::wait::WaitStatus::StillAlive) =
+        nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
+    {
+        if start.elapsed() > std::time::Duration::from_secs(1)
+            && let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL)
+        {
+            eprintln!(
+                "[utils] Warning: Failed to send SIGKILL to worker process {}: {}",
+                pid, e
+            );
         }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 

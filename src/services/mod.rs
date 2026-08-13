@@ -10,6 +10,15 @@ pub mod sntp_client;
 pub mod sntp_client_parent;
 pub mod utils;
 
+pub use crate::network::{LAN_INTERFACE, WAN_INTERFACE};
+
+pub const DHCP_CLIENT_SERVICE_NAME: &str = "dhcp-client";
+pub const DHCP_SERVER_SERVICE_NAME: &str = "dhcp-server";
+pub const DNS_FORWARDER_SERVICE_NAME: &str = "dns-forwarder";
+pub const SNTP_CLIENT_SERVICE_NAME: &str = "sntp-client";
+
+pub use utils::{CHROOT_JAIL_PATH, NOBODY_GID, NOBODY_UID, ROUTER_BINARY_PATH, SELF_EXE_PATH};
+
 pub use dhcp_client_parent::DhcpClient;
 pub use dhcp_server_parent::DhcpServer;
 pub use dns_forwarder_parent::DnsForwarder;
