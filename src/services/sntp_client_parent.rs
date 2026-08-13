@@ -1,20 +1,17 @@
-use super::ipc::{DnsParentToWorkerMsg, send_msg};
+use super::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
 use super::utils::{SharedWanLease, terminate_worker};
 use super::{Service, ServiceError};
-use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-const DNS_PORT: u16 = 53;
-
-pub struct DnsForwarder {
+pub struct SntpClient {
     lease_state: SharedWanLease,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
     child_pid: Option<u32>,
 }
 
-impl DnsForwarder {
+impl SntpClient {
     pub fn new(lease_state: SharedWanLease) -> Self {
         Self {
             lease_state,
@@ -25,11 +22,7 @@ impl DnsForwarder {
     }
 }
 
-fn spawn_dns_worker_process(
-    child_ipc_fd: RawFd,
-    dns_socket_fd: RawFd,
-    upstream_socket_fd: RawFd,
-) -> Result<std::process::Child, ServiceError> {
+fn spawn_sntp_worker_process(child_ipc_fd: RawFd) -> Result<std::process::Child, ServiceError> {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
@@ -41,16 +34,12 @@ fn spawn_dns_worker_process(
 
     let mut cmd = Command::new(binary_path);
     cmd.arg("worker");
-    cmd.arg("dns-forwarder");
+    cmd.arg("sntp-client");
     cmd.arg(child_ipc_fd.to_string());
-    cmd.arg(dns_socket_fd.to_string());
-    cmd.arg(upstream_socket_fd.to_string());
 
     unsafe {
         cmd.pre_exec(move || {
             libc::fcntl(child_ipc_fd, libc::F_SETFD, 0);
-            libc::fcntl(dns_socket_fd, libc::F_SETFD, 0);
-            libc::fcntl(upstream_socket_fd, libc::F_SETFD, 0);
             Ok(())
         });
     }
@@ -59,34 +48,55 @@ fn spawn_dns_worker_process(
         .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
 }
 
-async fn run_parent_dns_monitor(
-    shared_ipc_writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    child_pid: u32,
+async fn run_wan_status_monitor(
     lease_state: SharedWanLease,
+    shared_ipc_writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    println!(
-        "[dns-forwarder-parent] Supervising DNS forwarder worker (PID {})",
-        child_pid
-    );
-
-    let mut last_dns_servers: Vec<Ipv4Addr> = Vec::new();
+    let mut last_wan_status = false;
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
     while !*shutdown_rx.borrow() {
         tokio::select! {
             _ = shutdown_rx.changed() => {}
             _ = interval.tick() => {
-                let current_servers = {
-                    let lease = lease_state.lock().unwrap();
-                    lease.dns_servers.clone()
-                };
-
-                if current_servers != last_dns_servers {
-                    if update_upstream_resolvers(&shared_ipc_writer, &current_servers).await.is_err() {
+                let has_wan = lease_state.lock().unwrap().ip.is_some();
+                if has_wan != last_wan_status {
+                    if update_wan_status(&shared_ipc_writer, has_wan).await.is_err() {
                         break;
                     }
-                    last_dns_servers = current_servers;
+                    last_wan_status = has_wan;
+                }
+            }
+        }
+    }
+}
+
+async fn update_wan_status(
+    shared_ipc_writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    has_wan: bool,
+) -> Result<(), std::io::Error> {
+    let msg = SntpParentToWorkerMsg::SetWanStatus { active: has_wan };
+    let mut writer = shared_ipc_writer.lock().await;
+    send_msg(&mut *writer, &msg).await
+}
+
+async fn run_parent_ipc_receiver(
+    mut ipc_reader: tokio::net::unix::OwnedReadHalf,
+    child_pid: u32,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    println!(
+        "[sntp-client-parent] Supervising SNTP client worker (PID {})",
+        child_pid
+    );
+
+    while !*shutdown_rx.borrow() {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {}
+            res = recv_msg::<SntpClientToParentMsg, _>(&mut ipc_reader) => {
+                if !handle_parent_ipc_message(res).await {
+                    break;
                 }
             }
         }
@@ -96,22 +106,41 @@ async fn run_parent_dns_monitor(
     let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
 }
 
-async fn update_upstream_resolvers(
-    shared_ipc_writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    servers: &[Ipv4Addr],
-) -> Result<(), std::io::Error> {
-    println!(
-        "[dns-forwarder-parent] Upstream DNS servers updated: {:?}",
-        servers
-    );
-    let msg = DnsParentToWorkerMsg::SetUpstreamResolvers {
-        servers: servers.to_vec(),
-    };
-    let mut writer = shared_ipc_writer.lock().await;
-    send_msg(&mut *writer, &msg).await
+async fn handle_parent_ipc_message(
+    res: Result<Option<SntpClientToParentMsg>, std::io::Error>,
+) -> bool {
+    match res {
+        Ok(Some(SntpClientToParentMsg::SetSystemTime {
+            seconds,
+            nanoseconds,
+        })) => {
+            set_system_clock(seconds, nanoseconds);
+            true
+        }
+        Ok(None) => {
+            println!("[sntp-client-parent] Worker IPC socket closed.");
+            false
+        }
+        Err(e) => {
+            eprintln!("[sntp-client-parent] IPC recv error: {}", e);
+            false
+        }
+    }
 }
 
-fn start_parent_dns_monitor(
+fn set_system_clock(seconds: i64, nanoseconds: i64) {
+    let timespec = nix::sys::time::TimeSpec::new(seconds, nanoseconds);
+    if let Err(e) = nix::time::clock_settime(nix::time::ClockId::CLOCK_REALTIME, timespec) {
+        eprintln!(
+            "[sntp-client-parent] ERROR: Failed to set system clock: {}",
+            e
+        );
+    } else {
+        println!("[sntp-client-parent] Successfully set system clock.");
+    }
+}
+
+fn start_parent_sntp_monitor(
     parent_ipc_fd: RawFd,
     child_pid: u32,
     lease_state: SharedWanLease,
@@ -123,26 +152,28 @@ fn start_parent_dns_monitor(
     let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
     std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
     let ipc_stream = tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
-    let (_, ipc_writer) = ipc_stream.into_split();
+    let (ipc_reader, ipc_writer) = ipc_stream.into_split();
     let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
 
-    let handle = tokio::spawn(run_parent_dns_monitor(
-        shared_ipc_writer,
-        child_pid,
+    // Spawn WAN status monitor task
+    let shutdown_rx_clone = shutdown_rx.clone();
+    tokio::spawn(run_wan_status_monitor(
         lease_state,
-        shutdown_rx,
+        shared_ipc_writer,
+        shutdown_rx_clone,
     ));
 
+    // Spawn parent IPC message receiver task
+    let handle = tokio::spawn(run_parent_ipc_receiver(ipc_reader, child_pid, shutdown_rx));
     Ok(handle)
 }
 
-impl Service for DnsForwarder {
+impl Service for SntpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
         if self.task_handle.is_some() {
             return Err(ServiceError::AlreadyRunning);
         }
 
-        // 1. Create socketpair for IPC
         let (parent_ipc_socket, child_ipc_socket) = match tokio::net::UnixStream::pair() {
             Ok(pair) => pair,
             Err(e) => {
@@ -153,7 +184,6 @@ impl Service for DnsForwarder {
             }
         };
 
-        // Convert child_ipc_socket to raw fd and disable CLOEXEC so it stays open in the child process
         use std::os::unix::io::IntoRawFd;
         let child_ipc_fd = child_ipc_socket
             .into_std()
@@ -164,51 +194,15 @@ impl Service for DnsForwarder {
             .map_err(ServiceError::Io)?
             .into_raw_fd();
 
-        // 2. Bind port 53 socket (requires root)
-        let dns_socket = match std::net::UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT)) {
-            Ok(s) => s,
-            Err(e) => {
-                unsafe {
-                    libc::close(child_ipc_fd);
-                    libc::close(parent_ipc_fd);
-                }
-                return Err(ServiceError::FailedToStart(format!(
-                    "Failed to bind DNS port 53: {}",
-                    e
-                )));
-            }
-        };
-        let dns_socket_fd = dns_socket.into_raw_fd();
-
-        // 3. Bind upstream socket
-        let upstream_socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                unsafe {
-                    libc::close(child_ipc_fd);
-                    libc::close(parent_ipc_fd);
-                    libc::close(dns_socket_fd);
-                }
-                return Err(ServiceError::FailedToStart(format!(
-                    "Failed to bind upstream DNS client socket: {}",
-                    e
-                )));
-            }
-        };
-        let upstream_socket_fd = upstream_socket.into_raw_fd();
-
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
-        let child = match spawn_dns_worker_process(child_ipc_fd, dns_socket_fd, upstream_socket_fd)
-        {
+        let child = match spawn_sntp_worker_process(child_ipc_fd) {
             Ok(c) => c,
             Err(e) => {
                 unsafe {
                     libc::close(child_ipc_fd);
                     libc::close(parent_ipc_fd);
-                    libc::close(dns_socket_fd);
-                    libc::close(upstream_socket_fd);
                 }
                 return Err(e);
             }
@@ -216,12 +210,10 @@ impl Service for DnsForwarder {
 
         unsafe {
             libc::close(child_ipc_fd);
-            libc::close(dns_socket_fd);
-            libc::close(upstream_socket_fd);
         }
 
         let child_pid = child.id();
-        let handle = start_parent_dns_monitor(
+        let handle = start_parent_sntp_monitor(
             parent_ipc_fd,
             child_pid,
             self.lease_state.clone(),
@@ -239,7 +231,7 @@ impl Service for DnsForwarder {
         let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
 
         println!(
-            "[dns-forwarder-parent] Stopping DNS worker process PID {}",
+            "[sntp-client-parent] Stopping SNTP worker process PID {}",
             child_pid
         );
         let _ = tx.send(true);

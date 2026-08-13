@@ -31,6 +31,16 @@ async fn main() {
             .expect("IPC socket FD required")
             .parse::<i32>()
             .expect("Invalid FD");
+
+        if service_name == "sntp-client" {
+            if let Err(e) = trimrouter::services::sntp_client::run_sntp_client_worker(ipc_fd).await
+            {
+                eprintln!("[sntp-client-worker] ERROR: {}", e);
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+
         let raw_socket_fd = args
             .get(4)
             .expect("Raw socket FD required")
@@ -77,7 +87,6 @@ async fn main() {
             .await
             {
                 eprintln!("[dns-forwarder-worker] ERROR: {}", e);
-                std::process::exit(1);
             }
         }
         std::process::exit(0);

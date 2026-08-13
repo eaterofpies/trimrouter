@@ -1,4 +1,4 @@
-use super::ipc::{ParentToWorkerMsg, recv_msg};
+use super::ipc::{DnsParentToWorkerMsg, recv_msg};
 use super::utils::{drop_privileges, wait_shutdown};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -80,33 +80,11 @@ pub async fn run_dns_forwarder_worker(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Spawn IPC monitor task to receive upstream DNS servers dynamically
-    let upstream_dns_clone = upstream_dns.clone();
-    let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let mut reader = ipc_reader;
-        loop {
-            match recv_msg::<ParentToWorkerMsg, _>(&mut reader).await {
-                Ok(Some(ParentToWorkerMsg::SetUpstreamResolvers { servers })) => {
-                    let mut lock = upstream_dns_clone.lock().unwrap();
-                    *lock = servers;
-                }
-                Ok(None) => {
-                    println!("[dns-forwarder-worker] Parent closed IPC. Shutting down.");
-                    let _ = shutdown_tx_clone.send(true);
-                    break;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[dns-forwarder-worker] IPC read error: {}. Shutting down.",
-                        e
-                    );
-                    let _ = shutdown_tx_clone.send(true);
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
+    tokio::spawn(run_dns_ipc_monitor(
+        ipc_reader,
+        upstream_dns.clone(),
+        shutdown_tx.clone(),
+    ));
 
     // Spawn the background receiver task for upstream replies.
     let upstream_task = tokio::spawn(run_upstream_receiver(
@@ -132,6 +110,34 @@ pub async fn run_dns_forwarder_worker(
     let _ = upstream_task.await;
     let _ = cleanup_task.await;
     Ok(())
+}
+
+async fn run_dns_ipc_monitor(
+    mut reader: tokio::net::unix::OwnedReadHalf,
+    upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    loop {
+        match recv_msg::<DnsParentToWorkerMsg, _>(&mut reader).await {
+            Ok(Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })) => {
+                let mut lock = upstream_dns.lock().unwrap();
+                *lock = servers;
+            }
+            Ok(None) => {
+                println!("[dns-forwarder-worker] Parent closed IPC. Shutting down.");
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[dns-forwarder-worker] IPC read error: {}. Shutting down.",
+                    e
+                );
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+        }
+    }
 }
 
 fn dispatch_pending_query(

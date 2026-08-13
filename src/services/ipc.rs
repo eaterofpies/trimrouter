@@ -3,14 +3,21 @@ use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub enum ParentToWorkerMsg {
-    SetUpstreamResolvers {
-        servers: Vec<Ipv4Addr>,
-    },
+pub enum DnsParentToWorkerMsg {
+    SetUpstreamResolvers { servers: Vec<Ipv4Addr> },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum DhcpServerParentToWorkerMsg {
     AddNeighbor {
         ip_address: Ipv4Addr,
         mac_address: [u8; 6],
     },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum SntpParentToWorkerMsg {
+    SetWanStatus { active: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -22,6 +29,11 @@ pub enum DhcpClientToParentMsg {
         dns_servers: Vec<Ipv4Addr>,
     },
     ClearWanLease,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum SntpClientToParentMsg {
+    SetSystemTime { seconds: i64, nanoseconds: i64 },
 }
 
 pub async fn send_msg<T: Serialize, W: AsyncWriteExt + Unpin>(

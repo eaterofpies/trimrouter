@@ -1,4 +1,4 @@
-use super::ipc::{ParentToWorkerMsg, recv_msg};
+use super::ipc::{DhcpServerParentToWorkerMsg, recv_msg};
 use super::utils::{
     drop_privileges, get_interface_mac, parse_dhcp_payload, read_raw_packet, send_raw_packet,
     wait_shutdown,
@@ -224,7 +224,7 @@ pub async fn run_dhcp_server_worker(
 
     let mac = get_interface_mac(&lan_interface)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     let async_sock = AsyncFd::new(raw_socket_fd)?;
 
     let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
@@ -234,15 +234,14 @@ pub async fn run_dhcp_server_worker(
     let mut reader = ipc_reader;
     tokio::spawn(async move {
         loop {
-            match recv_msg::<ParentToWorkerMsg, _>(&mut reader).await {
-                Ok(Some(ParentToWorkerMsg::AddNeighbor {
+            match recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut reader).await {
+                Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
                     ip_address,
                     mac_address,
                 })) => {
                     let mac = MacAddr::from(mac_address);
                     update_lease_from_neighbor(mac, ip_address, &leases_clone).await;
                 }
-                Ok(Some(ParentToWorkerMsg::SetUpstreamResolvers { .. })) => {}
                 Ok(None) | Err(_) => {
                     println!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
                     let _ = shutdown_tx.send(true);

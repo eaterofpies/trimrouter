@@ -7,14 +7,17 @@ pub mod dns_forwarder_parent;
 pub mod ipc;
 pub mod lan_manager;
 pub mod sntp_client;
+pub mod sntp_client_parent;
 pub mod utils;
 
 pub use dhcp_client_parent::DhcpClient;
 pub use dhcp_server_parent::DhcpServer;
 pub use dns_forwarder_parent::DnsForwarder;
-pub use ipc::{DhcpClientToParentMsg, ParentToWorkerMsg};
+pub use ipc::{
+    DhcpClientToParentMsg, DhcpServerParentToWorkerMsg, DnsParentToWorkerMsg, SntpParentToWorkerMsg,
+};
 pub use lan_manager::LanManager;
-pub use sntp_client::SntpClient;
+pub use sntp_client_parent::SntpClient;
 pub use utils::WanLease;
 
 #[derive(Debug)]

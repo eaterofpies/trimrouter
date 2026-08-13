@@ -1,4 +1,4 @@
-use super::ipc::{ParentToWorkerMsg, send_msg};
+use super::ipc::{DhcpServerParentToWorkerMsg, send_msg};
 use super::utils::{setup_worker_sockets, terminate_worker};
 use super::{Service, ServiceError};
 use futures_util::StreamExt;
@@ -119,7 +119,7 @@ fn start_parent_arp_listener(
                             }
                         }
                         if let (Some(ip), Some(mac)) = (ip_opt, mac_opt) {
-                            let ipc_msg = ParentToWorkerMsg::AddNeighbor {
+                            let ipc_msg = DhcpServerParentToWorkerMsg::AddNeighbor {
                                 ip_address: ip,
                                 mac_address: mac,
                             };

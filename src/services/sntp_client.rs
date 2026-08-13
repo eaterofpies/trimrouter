@@ -1,66 +1,90 @@
-use super::utils::{WanLease, wait_shutdown};
-use super::{Service, ServiceError};
+use super::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
+use super::utils::{drop_privileges, wait_shutdown};
+use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
 const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
-
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(900); // 15 minutes
 
 const NTP_PORT: u16 = 123;
 const WAN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-pub struct SntpClient {
-    lease_state: Arc<Mutex<WanLease>>,
-    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-}
+pub async fn run_sntp_client_worker(ipc_fd: RawFd) -> Result<(), std::io::Error> {
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::net::UnixStream as StdUnixStream;
 
-impl SntpClient {
-    pub fn new(lease_state: Arc<Mutex<WanLease>>) -> Self {
-        Self {
-            lease_state,
-            shutdown_tx: None,
-            task_handle: None,
+    println!("[sntp-client-worker] Starting unprivileged SNTP time synchronization worker...");
+
+    let std_ipc = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
+    std_ipc.set_nonblocking(true)?;
+    let ipc_stream = tokio::net::UnixStream::from_std(std_ipc)?;
+    let (mut ipc_reader, ipc_writer) = ipc_stream.into_split();
+    let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
+
+    // Drop privileges
+    drop_privileges().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    println!(
+        "[sntp-client-worker] Privileges dropped successfully (running as nobody inside chroot jail)."
+    );
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let wan_active = Arc::new(Mutex::new(false));
+
+    // Monitor parent messages
+    let wan_active_clone = wan_active.clone();
+    let shutdown_tx_clone = shutdown_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match recv_msg::<SntpParentToWorkerMsg, _>(&mut ipc_reader).await {
+                Ok(Some(SntpParentToWorkerMsg::SetWanStatus { active })) => {
+                    let mut lock = wan_active_clone.lock().unwrap();
+                    *lock = active;
+                }
+                Ok(None) => {
+                    println!("[sntp-client-worker] Parent closed IPC. Shutting down.");
+                    let _ = shutdown_tx_clone.send(true);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[sntp-client-worker] IPC read error: {}. Shutting down.", e);
+                    let _ = shutdown_tx_clone.send(true);
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut current_retry_delay = RETRY_INTERVAL;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        if !handle_sntp_iteration(
+            &wan_active,
+            &shared_ipc_writer,
+            &mut shutdown_rx,
+            &mut current_retry_delay,
+        )
+        .await
+        {
+            break;
         }
     }
-}
 
-impl Service for SntpClient {
-    async fn start(&mut self) -> Result<(), ServiceError> {
-        if self.task_handle.is_some() {
-            return Err(ServiceError::AlreadyRunning);
-        }
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        self.shutdown_tx = Some(shutdown_tx);
-
-        let lease_state = self.lease_state.clone();
-        let handle = tokio::spawn(async move {
-            run_sntp_loop(lease_state, shutdown_rx).await;
-        });
-        self.task_handle = Some(handle);
-
-        Ok(())
-    }
-
-    async fn stop(&mut self) -> Result<(), ServiceError> {
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
-        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
-
-        let _ = tx.send(true);
-        let _ = handle.await;
-        Ok(())
-    }
+    Ok(())
 }
 
 async fn handle_sntp_iteration(
-    lease_state: &Arc<Mutex<WanLease>>,
+    wan_active: &Arc<Mutex<bool>>,
+    ipc_writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     current_retry_delay: &mut Duration,
 ) -> bool {
-    if !wait_for_wan(lease_state, shutdown_rx).await {
+    if !wait_for_wan(wan_active, shutdown_rx).await {
         return false;
     }
 
@@ -72,11 +96,25 @@ async fn handle_sntp_iteration(
     };
 
     match sync_res {
-        Ok(time_now) => {
+        Ok(chrono_dt) => {
             println!(
-                "[sntp-client] Successfully synchronized system time: {}",
-                time_now
+                "[sntp-client-worker] Successfully fetched NTP time: {}",
+                chrono_dt
             );
+
+            // Send time spec back to parent over IPC
+            let duration = chrono_dt.signed_duration_since(chrono::DateTime::UNIX_EPOCH);
+            if let Ok(std_duration) = duration.to_std() {
+                let msg = SntpClientToParentMsg::SetSystemTime {
+                    seconds: std_duration.as_secs() as i64,
+                    nanoseconds: std_duration.subsec_nanos() as i64,
+                };
+                let mut writer = ipc_writer.lock().await;
+                if let Err(e) = send_msg(&mut *writer, &msg).await {
+                    eprintln!("[sntp-client] Failed to send SetSystemTime IPC msg: {}", e);
+                }
+            }
+
             *current_retry_delay = RETRY_INTERVAL;
             sleep_or_shutdown(SYNC_INTERVAL, shutdown_rx).await
         }
@@ -93,33 +131,14 @@ async fn handle_sntp_iteration(
     }
 }
 
-async fn run_sntp_loop(
-    lease_state: Arc<Mutex<WanLease>>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    println!("[sntp-client] Starting NTP time synchronization service...");
-
-    let mut current_retry_delay = RETRY_INTERVAL;
-
-    loop {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-
-        if !handle_sntp_iteration(&lease_state, &mut shutdown_rx, &mut current_retry_delay).await {
-            break;
-        }
-    }
-}
-
 async fn wait_for_wan(
-    lease_state: &Arc<Mutex<WanLease>>,
+    wan_active: &Arc<Mutex<bool>>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     loop {
         let has_wan = {
-            let lease = lease_state.lock().unwrap();
-            lease.ip.is_some()
+            let active = wan_active.lock().unwrap();
+            *active
         };
         if has_wan {
             return true;
@@ -160,14 +179,6 @@ async fn sync_time() -> Result<chrono::DateTime<chrono::Utc>, String> {
         .datetime()
         .into_chrono_datetime()
         .map_err(|e| format!("Failed to convert NTP datetime: {}", e))?;
-
-    let duration = chrono_dt.signed_duration_since(chrono::DateTime::UNIX_EPOCH);
-    let std_duration = duration
-        .to_std()
-        .map_err(|e| format!("Invalid duration: {}", e))?;
-    let timespec = nix::sys::time::TimeSpec::from(std_duration);
-    nix::time::clock_settime(nix::time::ClockId::CLOCK_REALTIME, timespec)
-        .map_err(|e| format!("Failed to set system clock: {}", e))?;
 
     Ok(chrono_dt)
 }

@@ -88,10 +88,8 @@ async fn apply_parent_lease(
         changed
     };
 
-    if changed {
-        if let Err(e) = configure_wan(wan_interface, ip_address, mask, Some(gateway)).await {
-            eprintln!("[dhcp-client-parent] ERROR: Failed to configure WAN: {}", e);
-        }
+    if changed && let Err(e) = configure_wan(wan_interface, ip_address, mask, Some(gateway)).await {
+        eprintln!("[dhcp-client-parent] ERROR: Failed to configure WAN: {}", e);
     }
 }
 
@@ -106,13 +104,12 @@ async fn clear_parent_lease(lease_state: &SharedWanLease, wan_interface: &str) {
 
     if let Some(ip) = ip
         && let Some(mask) = mask
+        && let Err(e) = deconfigure_wan(wan_interface, ip, mask).await
     {
-        if let Err(e) = deconfigure_wan(wan_interface, ip, mask).await {
-            eprintln!(
-                "[dhcp-client-parent] ERROR: Failed to deconfigure WAN: {}",
-                e
-            );
-        }
+        eprintln!(
+            "[dhcp-client-parent] ERROR: Failed to deconfigure WAN: {}",
+            e
+        );
     }
 }
 
@@ -183,7 +180,7 @@ impl Service for DhcpClient {
 
         let _ = get_interface_mac(&self.wan_interface)
             .await
-            .map_err(|e| ServiceError::FailedToStart(e))?;
+            .map_err(ServiceError::FailedToStart)?;
 
         let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) =
             setup_worker_sockets(&self.wan_interface)
