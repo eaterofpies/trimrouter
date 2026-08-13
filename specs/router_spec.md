@@ -121,7 +121,12 @@ All network services are implemented directly inside the `trimrouter` binary as 
 4. **[NTP Client (SNTP)](sntp_client_spec.md)**: Periodically synchronizes the router system clock from time.google.com using the Simple Network Time Protocol (SNTP) and standard system time settings.
 
 
-### 2.4 Logging & Timestamps
+### 2.4 System Security & Privilege Separation
+To protect the system from remote code execution vulnerabilities in network packet parsing libraries, the application architecture relies on strict privilege separation:
+*   **[Privilege Separation Spec](privilege_separation_spec.md)**: Details the sandboxing, dynamic user IDs, capabilities dropping, socket passing, and IPC protocol used to isolate untrusted network-facing services from root PID 1 privileges.
+
+
+### 2.5 Logging & Timestamps
 - All standard output and error logs printed by `trimrouter` must include a standardized timestamp prefix with millisecond resolution in UTC format.
 - Format: `[YYYY-MM-DDTHH:MM:SS.mmmZ] [module] message` (e.g. `[2026-07-18T15:18:30.123Z] [init] Mounted /proc successfully.`).
 ---
