@@ -3,6 +3,7 @@ pub mod dhcp_client_parent;
 pub mod dhcp_server;
 pub mod dhcp_server_parent;
 pub mod dns_forwarder;
+pub mod dns_forwarder_parent;
 pub mod ipc;
 pub mod lan_manager;
 pub mod sntp_client;
@@ -10,7 +11,7 @@ pub mod utils;
 
 pub use dhcp_client_parent::DhcpClient;
 pub use dhcp_server_parent::DhcpServer;
-pub use dns_forwarder::DnsForwarder;
+pub use dns_forwarder_parent::DnsForwarder;
 pub use ipc::{DhcpClientToParentMsg, ParentToWorkerMsg};
 pub use lan_manager::LanManager;
 pub use sntp_client::SntpClient;

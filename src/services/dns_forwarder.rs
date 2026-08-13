@@ -1,6 +1,8 @@
-use super::utils::{WanLease, wait_shutdown};
+use super::ipc::{ParentToWorkerMsg, recv_msg};
+use super::utils::{drop_privileges, wait_shutdown};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,71 +39,74 @@ struct PendingQuery {
 type SharedCache = Arc<Mutex<HashMap<Vec<u8>, CacheEntry>>>;
 type PendingQueries = Arc<Mutex<HashMap<u16, PendingQuery>>>;
 
-use super::{Service, ServiceError};
+pub async fn run_dns_forwarder_worker(
+    ipc_fd: RawFd,
+    dns_socket_fd: RawFd,
+    upstream_socket_fd: RawFd,
+) -> Result<(), std::io::Error> {
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::net::UnixStream as StdUnixStream;
 
-pub struct DnsForwarder {
-    lease_state: Arc<Mutex<WanLease>>,
-    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-}
+    println!("[dns-forwarder-worker] Starting unprivileged DNS forwarder worker...");
 
-impl DnsForwarder {
-    pub fn new(lease_state: Arc<Mutex<WanLease>>) -> Self {
-        Self {
-            lease_state,
-            shutdown_tx: None,
-            task_handle: None,
-        }
-    }
-}
+    // Convert raw FDs
+    let std_dns_socket = unsafe { std::net::UdpSocket::from_raw_fd(dns_socket_fd) };
+    let std_upstream_socket = unsafe { std::net::UdpSocket::from_raw_fd(upstream_socket_fd) };
 
-impl Service for DnsForwarder {
-    async fn start(&mut self) -> Result<(), ServiceError> {
-        if self.task_handle.is_some() {
-            return Err(ServiceError::AlreadyRunning);
-        }
+    std_dns_socket.set_nonblocking(true)?;
+    std_upstream_socket.set_nonblocking(true)?;
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        self.shutdown_tx = Some(shutdown_tx);
+    let dns_socket = tokio::net::UdpSocket::from_std(std_dns_socket)?;
+    let upstream_socket = tokio::net::UdpSocket::from_std(std_upstream_socket)?;
 
-        let lease_state = self.lease_state.clone();
+    let std_ipc = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
+    std_ipc.set_nonblocking(true)?;
+    let ipc_stream = tokio::net::UnixStream::from_std(std_ipc)?;
+    let (ipc_reader, _) = ipc_stream.into_split();
 
-        let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), DNS_PORT);
-        let socket = tokio::net::UdpSocket::bind(addr).await?;
-        let socket = Arc::new(socket);
+    // Drop privileges
+    drop_privileges().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    println!(
+        "[dns-forwarder-worker] Privileges dropped successfully (running as nobody inside chroot jail)."
+    );
 
-        // Bind a single, long-lived client socket for all outgoing upstream DNS queries.
-        let upstream_socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        let upstream_socket = Arc::new(upstream_socket);
-
-        let handle = tokio::spawn(async move {
-            run_dns_forwarder(socket, upstream_socket, lease_state, shutdown_rx).await;
-        });
-
-        self.task_handle = Some(handle);
-        Ok(())
-    }
-
-    async fn stop(&mut self) -> Result<(), ServiceError> {
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
-        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
-
-        let _ = tx.send(true);
-        let _ = handle.await;
-        Ok(())
-    }
-}
-
-async fn run_dns_forwarder(
-    socket: Arc<tokio::net::UdpSocket>,
-    upstream_socket: Arc<tokio::net::UdpSocket>,
-    lease_state: Arc<Mutex<WanLease>>,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    println!("[dns-forwarder] Listening on 0.0.0.0:{}...", DNS_PORT);
+    let dns_socket = Arc::new(dns_socket);
+    let upstream_socket = Arc::new(upstream_socket);
 
     let cache: SharedCache = Arc::new(Mutex::new(HashMap::new()));
     let pending_queries: PendingQueries = Arc::new(Mutex::new(HashMap::new()));
+    let upstream_dns = Arc::new(Mutex::new(Vec::<Ipv4Addr>::new()));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Spawn IPC monitor task to receive upstream DNS servers dynamically
+    let upstream_dns_clone = upstream_dns.clone();
+    let shutdown_tx_clone = shutdown_tx.clone();
+    tokio::spawn(async move {
+        let mut reader = ipc_reader;
+        loop {
+            match recv_msg::<ParentToWorkerMsg, _>(&mut reader).await {
+                Ok(Some(ParentToWorkerMsg::SetUpstreamResolvers { servers })) => {
+                    let mut lock = upstream_dns_clone.lock().unwrap();
+                    *lock = servers;
+                }
+                Ok(None) => {
+                    println!("[dns-forwarder-worker] Parent closed IPC. Shutting down.");
+                    let _ = shutdown_tx_clone.send(true);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[dns-forwarder-worker] IPC read error: {}. Shutting down.",
+                        e
+                    );
+                    let _ = shutdown_tx_clone.send(true);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
 
     // Spawn the background receiver task for upstream replies.
     let upstream_task = tokio::spawn(run_upstream_receiver(
@@ -115,18 +120,18 @@ async fn run_dns_forwarder(
 
     // Run the main query forwarder loop
     run_query_loop(
-        socket,
+        dns_socket,
         upstream_socket,
         cache,
         pending_queries,
-        lease_state,
+        upstream_dns,
         shutdown_rx,
     )
     .await;
 
-    // Await child tasks to exit
     let _ = upstream_task.await;
     let _ = cleanup_task.await;
+    Ok(())
 }
 
 fn dispatch_pending_query(
@@ -227,7 +232,7 @@ async fn process_next_query(
     upstream_socket: &Arc<tokio::net::UdpSocket>,
     cache: &SharedCache,
     pending_queries: &PendingQueries,
-    lease_state: &Arc<Mutex<WanLease>>,
+    upstream_dns: &Arc<Mutex<Vec<Ipv4Addr>>>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     buf: &mut [u8],
 ) -> bool {
@@ -250,7 +255,7 @@ async fn process_next_query(
     let query = buf[..len].to_vec();
     let socket_clone = socket.clone();
     let cache_clone = cache.clone();
-    let lease_clone = lease_state.clone();
+    let upstream_dns_clone = upstream_dns.clone();
     let upstream_sock_clone = upstream_socket.clone();
     let pending_queries_clone = pending_queries.clone();
 
@@ -260,7 +265,7 @@ async fn process_next_query(
             src,
             socket_clone,
             cache_clone,
-            lease_clone,
+            upstream_dns_clone,
             upstream_sock_clone,
             pending_queries_clone,
         )
@@ -274,7 +279,7 @@ async fn run_query_loop(
     upstream_socket: Arc<tokio::net::UdpSocket>,
     cache: SharedCache,
     pending_queries: PendingQueries,
-    lease_state: Arc<Mutex<WanLease>>,
+    upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut buf = [0u8; RECV_BUF_SIZE];
@@ -287,7 +292,7 @@ async fn run_query_loop(
             &upstream_socket,
             &cache,
             &pending_queries,
-            &lease_state,
+            &upstream_dns,
             &mut shutdown_rx,
             &mut buf,
         )
@@ -317,7 +322,7 @@ async fn handle_dns_query(
     src: std::net::SocketAddr,
     socket: Arc<tokio::net::UdpSocket>,
     cache: SharedCache,
-    lease_state: Arc<Mutex<WanLease>>,
+    upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
     upstream_socket: Arc<tokio::net::UdpSocket>,
     pending_queries: PendingQueries,
 ) {
@@ -337,10 +342,10 @@ async fn handle_dns_query(
         return;
     }
 
-    let upstream_dns = get_upstream_dns(&lease_state);
+    let upstream_ip = get_upstream_dns(&upstream_dns);
 
     if let Some(response) =
-        forward_query(&query, upstream_dns, &upstream_socket, &pending_queries).await
+        forward_query(&query, upstream_ip, &upstream_socket, &pending_queries).await
     {
         insert_cache(cache_key, response.clone(), &cache);
         let _ = socket.send_to(&response, src).await;
@@ -397,10 +402,10 @@ fn insert_cache(
     lock.insert(cache_key, CacheEntry { response, expiry });
 }
 
-fn get_upstream_dns(lease_state: &Mutex<WanLease>) -> Ipv4Addr {
-    let lease = lease_state.lock().unwrap();
-    if !lease.dns_servers.is_empty() {
-        lease.dns_servers[0]
+fn get_upstream_dns(upstream_dns: &Mutex<Vec<Ipv4Addr>>) -> Ipv4Addr {
+    let servers = upstream_dns.lock().unwrap();
+    if !servers.is_empty() {
+        servers[0]
     } else {
         FALLBACK_DNS_SERVER
     }

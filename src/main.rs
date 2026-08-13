@@ -62,6 +62,23 @@ async fn main() {
                 eprintln!("[dhcp-server-worker] ERROR: {}", e);
                 std::process::exit(1);
             }
+        } else if service_name == "dns-forwarder" {
+            let dns_socket_fd = raw_socket_fd;
+            let upstream_socket_fd = args
+                .get(5)
+                .expect("Upstream socket FD required")
+                .parse::<i32>()
+                .expect("Invalid FD");
+            if let Err(e) = trimrouter::services::dns_forwarder::run_dns_forwarder_worker(
+                ipc_fd,
+                dns_socket_fd,
+                upstream_socket_fd,
+            )
+            .await
+            {
+                eprintln!("[dns-forwarder-worker] ERROR: {}", e);
+                std::process::exit(1);
+            }
         }
         std::process::exit(0);
     }
