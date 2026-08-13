@@ -1,11 +1,15 @@
 use super::utils::{
     CleanOption, RawPacketSocket, SharedWanLease, WanLease, get_interface_mac,
-    mask_to_prefix_len as utils_mask_to_prefix_len, wait_shutdown,
+    mask_to_prefix_len as utils_mask_to_prefix_len, wait_shutdown, open_raw_socket,
 };
 use crate::packet::build_raw_packet;
 use futures_util::TryStreamExt;
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
+use std::os::unix::io::{FromRawFd, RawFd};
+use tokio::io::AsyncReadExt;
+use super::ipc::{recv_msg, DhcpClientToParentMsg};
 
 const DEFAULT_LEASE_SECS: u32 = 3600;
 const MAX_RETRY_DELAY_SECS: u32 = 64;
@@ -88,6 +92,10 @@ impl DhcpClientSocket {
         Ok(Self { raw_socket, mac })
     }
 
+    fn from_raw_socket(raw_socket: RawPacketSocket, mac: MacAddr) -> Self {
+        Self { raw_socket, mac }
+    }
+
     async fn send(
         &self,
         message: &dhcproto::v4::Message,
@@ -154,6 +162,7 @@ struct DhcpClientInternal {
     mac: MacAddr,
     lease_state: SharedWanLease,
     wan_interface: String,
+    ipc_writer: Option<Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>>,
 }
 
 impl DhcpClientInternal {
@@ -168,6 +177,7 @@ impl DhcpClientInternal {
             mac,
             lease_state,
             wan_interface,
+            ipc_writer: None,
         }
     }
 
@@ -439,46 +449,66 @@ impl DhcpClientInternal {
         gateway: Option<Ipv4Addr>,
         dns_servers: &[Ipv4Addr],
     ) -> Result<(), DhcpError> {
-        let changed = {
-            let mut lease = self.lease_state.lock().unwrap();
-            let changed = lease.ip != Some(ip)
-                || lease.mask != Some(mask)
-                || lease.gateway != gateway
-                || lease.dns_servers != dns_servers;
+        if let Some(ref writer_mutex) = self.ipc_writer {
+            let prefix_len = utils_mask_to_prefix_len(mask).unwrap_or(24);
+            let msg = super::ipc::DhcpClientToParentMsg::ApplyWanLease {
+                ip_address: ip,
+                prefix_len,
+                gateway: gateway.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                dns_servers: dns_servers.to_vec(),
+            };
+            let mut writer = writer_mutex.lock().await;
+            super::ipc::send_msg(&mut *writer, &msg).await
+                .map_err(|e| DhcpError::Io(e))?;
+            Ok(())
+        } else {
+            let changed = {
+                let mut lease = self.lease_state.lock().unwrap();
+                let changed = lease.ip != Some(ip)
+                    || lease.mask != Some(mask)
+                    || lease.gateway != gateway
+                    || lease.dns_servers != dns_servers;
+
+                if changed {
+                    lease.ip = Some(ip);
+                    lease.mask = Some(mask);
+                    lease.gateway = gateway;
+                    lease.dns_servers = dns_servers.to_vec();
+                    println!("[dhcp-client] Lease parameters updated: {:?}", *lease);
+                }
+                changed
+            };
 
             if changed {
-                lease.ip = Some(ip);
-                lease.mask = Some(mask);
-                lease.gateway = gateway;
-                lease.dns_servers = dns_servers.to_vec();
-                println!("[dhcp-client] Lease parameters updated: {:?}", *lease);
+                configure_wan(&self.wan_interface, ip, mask, gateway).await?;
             }
-            changed
-        };
-
-        if changed {
-            configure_wan(&self.wan_interface, ip, mask, gateway).await?;
+            Ok(())
         }
-        Ok(())
     }
 
     async fn deconfigure(&self) {
-        let (ip, mask) = {
-            let mut lease = self.lease_state.lock().unwrap();
-            let ip = lease.ip;
-            let mask = lease.mask;
-            *lease = WanLease::default();
-            (ip, mask)
-        };
+        if let Some(ref writer_mutex) = self.ipc_writer {
+            let msg = super::ipc::DhcpClientToParentMsg::ClearWanLease;
+            let mut writer = writer_mutex.lock().await;
+            let _ = super::ipc::send_msg(&mut *writer, &msg).await;
+        } else {
+            let (ip, mask) = {
+                let mut lease = self.lease_state.lock().unwrap();
+                let ip = lease.ip;
+                let mask = lease.mask;
+                *lease = WanLease::default();
+                (ip, mask)
+            };
 
-        if let Some(ip) = ip
-            && let Some(mask) = mask
-            && let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await
-        {
-            println!(
-                "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
-                e
-            );
+            if let Some(ip) = ip
+                && let Some(mask) = mask
+                && let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await
+            {
+                println!(
+                    "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
+                    e
+                );
+            }
         }
     }
 
@@ -550,16 +580,16 @@ impl DhcpClientInternal {
     }
 }
 
-// =========================================================================
-// DHCP Client (WAN) - helper functions
-// =========================================================================
 use super::{Service, ServiceError};
+
+const NOBODY_UID: u32 = 65534;
+const NOBODY_GID: u32 = 65534;
 
 pub struct DhcpClient {
     wan_interface: String,
     lease_state: SharedWanLease,
-    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    child_pid: Option<u32>,
 }
 
 impl DhcpClient {
@@ -567,39 +597,345 @@ impl DhcpClient {
         Self {
             wan_interface,
             lease_state,
-            shutdown_tx: None,
             task_handle: None,
+            child_pid: None,
         }
     }
 }
+
+fn prefix_len_to_mask(prefix_len: u8) -> Ipv4Addr {
+    let mask_u32 = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    Ipv4Addr::from(mask_u32)
+}
+
+fn setup_worker_sockets(wan_interface: &str) -> Result<(RawFd, RawFd, RawFd), ServiceError> {
+    let raw_socket_fd = open_raw_socket(wan_interface)
+        .map_err(|e| ServiceError::FailedToStart(e))?;
+
+    let mut fds = [0; 2];
+    let res = unsafe {
+        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
+    };
+    if res < 0 {
+        unsafe { libc::close(raw_socket_fd); }
+        return Err(ServiceError::FailedToStart(format!(
+            "socketpair failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok((raw_socket_fd, fds[0], fds[1]))
+}
+
+fn spawn_worker_process(
+    child_ipc_fd: RawFd,
+    raw_socket_fd: RawFd,
+    wan_interface: &str,
+) -> Result<std::process::Child, ServiceError> {
+    use std::process::Command;
+    use std::os::unix::process::CommandExt;
+
+    let binary_path = if std::path::Path::new("/bin/trimrouter").exists() {
+        "/bin/trimrouter"
+    } else {
+        "/proc/self/exe"
+    };
+
+    let mut cmd = Command::new(binary_path);
+    cmd.arg("worker");
+    cmd.arg("dhcp-client");
+    cmd.arg(child_ipc_fd.to_string());
+    cmd.arg(raw_socket_fd.to_string());
+    cmd.arg(wan_interface);
+
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::fcntl(child_ipc_fd, libc::F_SETFD, 0);
+            libc::fcntl(raw_socket_fd, libc::F_SETFD, 0);
+            Ok(())
+        });
+    }
+
+    cmd.spawn().map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
+}
+
+async fn apply_parent_lease(
+    lease_state: &SharedWanLease,
+    wan_interface: &str,
+    ip_address: Ipv4Addr,
+    mask: Ipv4Addr,
+    gateway: Ipv4Addr,
+    dns_servers: Vec<Ipv4Addr>,
+) {
+    let changed = {
+        let mut lease = lease_state.lock().unwrap();
+        let changed = lease.ip != Some(ip_address)
+            || lease.mask != Some(mask)
+            || lease.gateway != Some(gateway)
+            || lease.dns_servers != dns_servers;
+
+        if changed {
+            lease.ip = Some(ip_address);
+            lease.mask = Some(mask);
+            lease.gateway = Some(gateway);
+            lease.dns_servers = dns_servers;
+            println!(
+                "[dhcp-client-parent] Applied WAN lease configuration: {:?}",
+                *lease
+            );
+        }
+        changed
+    };
+
+    if changed {
+        if let Err(e) = configure_wan(wan_interface, ip_address, mask, Some(gateway)).await {
+            eprintln!("[dhcp-client-parent] ERROR: Failed to configure WAN: {}", e);
+        }
+    }
+}
+
+async fn clear_parent_lease(lease_state: &SharedWanLease, wan_interface: &str) {
+    let (ip, mask) = {
+        let mut lease = lease_state.lock().unwrap();
+        let ip = lease.ip;
+        let mask = lease.mask;
+        *lease = WanLease::default();
+        (ip, mask)
+    };
+
+    if let Some(ip) = ip
+        && let Some(mask) = mask
+    {
+        if let Err(e) = deconfigure_wan(wan_interface, ip, mask).await {
+            eprintln!("[dhcp-client-parent] ERROR: Failed to deconfigure WAN: {}", e);
+        }
+    }
+}
+
+fn start_parent_supervisor_task(
+    parent_ipc_fd: RawFd,
+    child_pid: u32,
+    wan_interface: String,
+    lease_state: SharedWanLease,
+) -> Result<tokio::task::JoinHandle<()>, ServiceError> {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
+    std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
+    let mut parent_ipc_stream = tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+
+    let handle = tokio::spawn(async move {
+        println!(
+            "[dhcp-client-parent] Supervising DHCP client worker (PID {})",
+            child_pid
+        );
+        loop {
+            match recv_msg::<DhcpClientToParentMsg, _>(&mut parent_ipc_stream).await {
+                Ok(Some(DhcpClientToParentMsg::ApplyWanLease {
+                    ip_address,
+                    prefix_len,
+                    gateway,
+                    dns_servers,
+                })) => {
+                    let mask = prefix_len_to_mask(prefix_len);
+                    apply_parent_lease(
+                        &lease_state,
+                        &wan_interface,
+                        ip_address,
+                        mask,
+                        gateway,
+                        dns_servers,
+                    )
+                    .await;
+                }
+                Ok(Some(DhcpClientToParentMsg::ClearWanLease)) => {
+                    clear_parent_lease(&lease_state, &wan_interface).await;
+                }
+                Ok(None) => {
+                    println!("[dhcp-client-parent] Worker IPC socket closed.");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[dhcp-client-parent] IPC recv error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    });
+
+    Ok(handle)
+}
+
 impl Service for DhcpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
         if self.task_handle.is_some() {
             return Err(ServiceError::AlreadyRunning);
         }
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        self.shutdown_tx = Some(shutdown_tx);
+        let _ = get_interface_mac(&self.wan_interface).await
+            .map_err(|e| ServiceError::FailedToStart(e))?;
 
-        let wan_interface = self.wan_interface.clone();
-        let lease_state = self.lease_state.clone();
+        let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) = setup_worker_sockets(&self.wan_interface)?;
 
-        let handle = tokio::spawn(async move {
-            run_client_loop(wan_interface, lease_state, shutdown_rx).await;
-        });
+        let child = match spawn_worker_process(child_ipc_fd, raw_socket_fd, &self.wan_interface) {
+            Ok(c) => c,
+            Err(e) => {
+                unsafe {
+                    libc::close(raw_socket_fd);
+                    libc::close(parent_ipc_fd);
+                    libc::close(child_ipc_fd);
+                }
+                return Err(e);
+            }
+        };
 
+        unsafe {
+            libc::close(child_ipc_fd);
+            libc::close(raw_socket_fd);
+        }
+
+        let child_pid = child.id();
+        let handle = start_parent_supervisor_task(
+            parent_ipc_fd,
+            child_pid,
+            self.wan_interface.clone(),
+            self.lease_state.clone(),
+        )?;
+
+        self.child_pid = Some(child_pid);
         self.task_handle = Some(handle);
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
+        let child_pid = self.child_pid.take().ok_or(ServiceError::NotRunning)?;
         let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
 
-        let _ = tx.send(true);
+        println!("[dhcp-client-parent] Stopping worker process PID {}", child_pid);
+        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+
+        let start = std::time::Instant::now();
+        loop {
+            match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                    if start.elapsed() > std::time::Duration::from_secs(1) {
+                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                _ => break,
+            }
+        }
+
         let _ = handle.await;
         Ok(())
     }
+}
+
+async fn monitor_parent_ipc(
+    mut reader: tokio::net::unix::OwnedReadHalf,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let mut buf = [0u8; 1024];
+    while let Ok(n) = reader.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+    }
+    println!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
+    let _ = shutdown_tx.send(true);
+}
+
+pub async fn run_dhcp_client_worker(
+    ipc_fd: RawFd,
+    raw_socket_fd: RawFd,
+    wan_interface: String,
+) -> Result<(), std::io::Error> {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    println!(
+        "[dhcp-client-worker] Starting unprivileged WAN DHCP client worker on {}...",
+        wan_interface
+    );
+
+    let socket = RawPacketSocket::from_raw_fd(raw_socket_fd)?;
+    let mac = match get_interface_mac(&wan_interface).await {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+        }
+    };
+    let client_socket = DhcpClientSocket::from_raw_socket(socket, mac);
+
+    let std_stream = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
+    std_stream.set_nonblocking(true)?;
+    let ipc_stream = tokio::net::UnixStream::from_std(std_stream)?;
+    let (ipc_reader, ipc_writer) = ipc_stream.into_split();
+    let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
+
+    if let Err(e) = drop_privileges() {
+        eprintln!("[dhcp-client-worker] FATAL: Failed to drop privileges: {}", e);
+        std::process::exit(1);
+    }
+    println!("[dhcp-client-worker] Privileges dropped successfully (running as nobody inside chroot jail).");
+
+    let dummy_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
+    let client = DhcpClientInternal {
+        socket: client_socket,
+        mac,
+        lease_state: dummy_lease_state,
+        wan_interface: wan_interface.clone(),
+        ipc_writer: Some(shared_ipc_writer),
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(monitor_parent_ipc(ipc_reader, shutdown_tx));
+
+    client.run(shutdown_rx).await;
+    Ok(())
+}
+
+fn drop_privileges() -> Result<(), std::io::Error> {
+    use nix::unistd::{setuid, setgid, Uid, Gid};
+
+    let _ = std::fs::create_dir_all("/run/empty");
+    if let Ok(metadata) = std::fs::metadata("/run/empty") {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o555);
+        let _ = std::fs::set_permissions("/run/empty", perms);
+    }
+
+    let chroot_path = std::ffi::CString::new("/run/empty").unwrap();
+    let res = unsafe { libc::chroot(chroot_path.as_ptr()) };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let chdir_path = std::ffi::CString::new("/").unwrap();
+    let res = unsafe { libc::chdir(chdir_path.as_ptr()) };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    caps::clear(None, caps::CapSet::Bounding).map_err(std::io::Error::other)?;
+
+    setgid(Gid::from_raw(NOBODY_GID)).map_err(std::io::Error::other)?;
+
+    setuid(Uid::from_raw(NOBODY_UID)).map_err(std::io::Error::other)?;
+
+    let _ = caps::clear(None, caps::CapSet::Inheritable);
+    let _ = caps::clear(None, caps::CapSet::Effective);
+    let _ = caps::clear(None, caps::CapSet::Permitted);
+
+    Ok(())
 }
 
 async fn handle_mac_address_error(

@@ -140,6 +140,7 @@ pub enum DhcpClientToParentMsg {
         ip_address: Ipv4Addr,
         prefix_len: u8,
         gateway: Ipv4Addr,
+        dns_servers: Vec<Ipv4Addr>,
     },
     /// Sent when the WAN lease is lost or expired
     ClearWanLease,

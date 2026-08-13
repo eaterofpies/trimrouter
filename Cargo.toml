@@ -28,6 +28,9 @@ kobject-uevent = "0.2.0"
 netlink-sys = "0.8.8"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
+postcard = { version = "1.1.1", features = ["use-std"] }
+caps = "0.5.1"
+privdrop = "0.5.4"
 
 
 

@@ -23,6 +23,22 @@ async fn main() {
         std::process::exit(0);
     }
 
+    let is_worker = args.get(1).is_some_and(|arg| arg == "worker");
+    if is_worker {
+        let service_name = args.get(2).expect("Worker service name required");
+        let ipc_fd = args.get(3).expect("IPC socket FD required").parse::<i32>().expect("Invalid FD");
+        let raw_socket_fd = args.get(4).expect("Raw socket FD required").parse::<i32>().expect("Invalid FD");
+        let wan_interface = args.get(5).expect("WAN interface name required").clone();
+
+        if service_name == "dhcp-client" {
+            if let Err(e) = trimrouter::services::dhcp_client::run_dhcp_client_worker(ipc_fd, raw_socket_fd, wan_interface).await {
+                eprintln!("[dhcp-client-worker] ERROR: {}", e);
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+
     let sys = Arc::new(RealSystem);
     run_as_init(sys).await;
 }
@@ -80,11 +96,22 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
         if let Err(e) = mount_boot_partition(sys.as_ref()) {
             panic!("FATAL: Failed to mount boot partition: {}", e);
         }
+
+        // Create chroot jail directory if it doesn't exist
+        let _ = std::fs::create_dir_all("/run/empty");
+        if let Ok(metadata) = std::fs::metadata("/run/empty") {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o555); // rx-rx-rx
+            let _ = std::fs::set_permissions("/run/empty", perms);
+        }
     } else {
         println!(
             "[init] Running in standard user environment (PID {}). Skipping VFS mounts.",
             sys.getpid()
         );
+        // Ensure /run/empty exists for local tests as well
+        let _ = std::fs::create_dir_all("/run/empty");
     }
 
     // 3. Load Configuration

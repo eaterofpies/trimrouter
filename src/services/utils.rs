@@ -278,6 +278,13 @@ impl RawPacketSocket {
         })
     }
 
+    pub fn from_raw_fd(raw_fd: std::os::unix::io::RawFd) -> Result<Self, std::io::Error> {
+        let socket = tokio::io::unix::AsyncFd::new(raw_fd)?;
+        Ok(Self {
+            socket: Some(socket),
+        })
+    }
+
     pub async fn send(&self, frame: &[u8]) -> Result<(), std::io::Error> {
         let socket = self.socket.as_ref().expect("socket is active");
         send_raw_packet(socket, frame).await;
