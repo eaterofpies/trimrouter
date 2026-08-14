@@ -12,6 +12,7 @@ mod dns_forwarder;
 mod firewall;
 mod lan_manager;
 mod sntp;
+mod supervisor;
 
 #[tokio::main]
 async fn main() {
@@ -183,7 +184,19 @@ async fn main() {
             Ok(forwarder) => {
                 std::println!("[test-control] TEST_PASSED dns_forwarding");
                 passed += 1;
-                dns_forwarder = Some(forwarder);
+
+                // Run Test 2b: Supervisor Recovery Test
+                match supervisor::test_dns_supervisor_recovery(forwarder).await {
+                    Ok(recovered_forwarder) => {
+                        std::println!("[test-control] TEST_PASSED dns_supervisor_recovery");
+                        passed += 1;
+                        dns_forwarder = Some(recovered_forwarder);
+                    }
+                    Err(e) => {
+                        std::println!("[test-control] TEST_FAILED dns_supervisor_recovery {}", e);
+                        failed += 1;
+                    }
+                }
             }
             Err(e) => {
                 std::println!("[test-control] TEST_FAILED dns_forwarding {}", e);
@@ -192,6 +205,7 @@ async fn main() {
         }
     } else {
         std::println!("[test] Skipping DNS Forwarding test (DHCP Client binding failed).");
+        std::println!("[test] Skipping DNS Supervisor Recovery test (DHCP Client binding failed).");
     }
 
     // Test 3: SNTP Client Time Sync (Only run if DNS forwarding is available)

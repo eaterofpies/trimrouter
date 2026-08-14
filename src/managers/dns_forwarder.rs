@@ -1,8 +1,10 @@
 use super::ipc::{DnsParentToWorkerMsg, send_msg};
-use super::utils::{SharedWanLease, spawn_worker, terminate_worker};
+use super::utils::{
+    SharedWanLease, create_ipc_fds, handle_supervisor_restart_delay, spawn_worker, terminate_worker,
+};
 use super::{DNS_FORWARDER_SERVICE_NAME, Service, ServiceError};
 use std::net::Ipv4Addr;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{IntoRawFd, RawFd};
 use std::process::Child;
 use std::sync::Arc;
 
@@ -12,7 +14,7 @@ pub struct DnsForwarder {
     lease_state: SharedWanLease,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
-    child_pid: Option<u32>,
+    child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DnsForwarder {
@@ -21,8 +23,12 @@ impl DnsForwarder {
             lease_state,
             shutdown_tx: None,
             task_handle: None,
-            child_pid: None,
+            child_pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    pub fn get_worker_pid(&self) -> u32 {
+        self.child_pid.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -48,6 +54,7 @@ fn spawn_dns_worker_process(
 }
 
 async fn run_parent_dns_monitor(
+    ipc_reader: tokio::net::unix::OwnedReadHalf,
     shared_ipc_writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     child_pid: u32,
     lease_state: SharedWanLease,
@@ -60,10 +67,28 @@ async fn run_parent_dns_monitor(
 
     let mut last_dns_servers: Vec<Ipv4Addr> = Vec::new();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut eof_buf = [0u8; 1];
 
     while !*shutdown_rx.borrow() {
         tokio::select! {
             _ = shutdown_rx.changed() => {}
+            read_res = ipc_reader.readable() => {
+                if read_res.is_err() {
+                    break;
+                }
+                match ipc_reader.try_read(&mut eof_buf) {
+                    Ok(0) => {
+                        println!("[dns-forwarder-parent] Worker closed IPC. Shutting down monitor.");
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Not EOF, just woke up
+                    }
+                    _ => {
+                        break;
+                    }
+                }
+            }
             _ = interval.tick() => {
                 let current_servers = {
                     let lease = lease_state.lock().unwrap();
@@ -111,10 +136,11 @@ fn start_parent_dns_monitor(
     let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
     std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
     let ipc_stream = tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
-    let (_, ipc_writer) = ipc_stream.into_split();
+    let (ipc_reader, ipc_writer) = ipc_stream.into_split();
     let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
 
     let handle = tokio::spawn(run_parent_dns_monitor(
+        ipc_reader,
         shared_ipc_writer,
         child_pid,
         lease_state,
@@ -130,108 +156,129 @@ impl Service for DnsForwarder {
             return Err(ServiceError::AlreadyRunning);
         }
 
-        // 1. Create socketpair for IPC
-        let (parent_ipc_socket, child_ipc_socket) = match tokio::net::UnixStream::pair() {
-            Ok(pair) => pair,
-            Err(e) => {
-                return Err(ServiceError::FailedToStart(format!(
-                    "Failed to create IPC socketpair: {}",
-                    e
-                )));
-            }
-        };
-
-        // Convert child_ipc_socket to raw fd and disable CLOEXEC so it stays open in the child process
-        use std::os::unix::io::IntoRawFd;
-        let child_ipc_fd = child_ipc_socket
-            .into_std()
-            .map_err(ServiceError::Io)?
-            .into_raw_fd();
-        let parent_ipc_fd = parent_ipc_socket
-            .into_std()
-            .map_err(ServiceError::Io)?
-            .into_raw_fd();
-
-        // 2. Bind port 53 socket (requires root)
-        let dns_socket = match std::net::UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT)) {
-            Ok(s) => s,
-            Err(e) => {
-                unsafe {
-                    libc::close(child_ipc_fd);
-                    libc::close(parent_ipc_fd);
-                }
-                return Err(ServiceError::FailedToStart(format!(
-                    "Failed to bind DNS port 53: {}",
-                    e
-                )));
-            }
-        };
-        let dns_socket_fd = dns_socket.into_raw_fd();
-
-        // 3. Bind upstream socket
-        let upstream_socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                unsafe {
-                    libc::close(child_ipc_fd);
-                    libc::close(parent_ipc_fd);
-                    libc::close(dns_socket_fd);
-                }
-                return Err(ServiceError::FailedToStart(format!(
-                    "Failed to bind upstream DNS client socket: {}",
-                    e
-                )));
-            }
-        };
-        let upstream_socket_fd = upstream_socket.into_raw_fd();
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
-        let child = match spawn_dns_worker_process(child_ipc_fd, dns_socket_fd, upstream_socket_fd)
-        {
-            Ok(c) => c,
-            Err(e) => {
+        let lease_state = self.lease_state.clone();
+        let child_pid_atomic = self.child_pid.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut attempt = 0;
+            while !*shutdown_rx.borrow() {
+                if !handle_supervisor_restart_delay("dns-forwarder", &mut attempt, &mut shutdown_rx)
+                    .await
+                {
+                    break;
+                }
+
+                let (parent_ipc_fd, child_ipc_fd) = match create_ipc_fds() {
+                    Ok(fds) => fds,
+                    Err(e) => {
+                        eprintln!(
+                            "[dns-forwarder-parent] Failed to create IPC socketpair: {}",
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                // 2. Bind port 53 socket (requires root)
+                let dns_socket = match std::net::UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[dns-forwarder-parent] Failed to bind DNS port 53: {}", e);
+                        unsafe {
+                            libc::close(child_ipc_fd);
+                            libc::close(parent_ipc_fd);
+                        }
+                        continue;
+                    }
+                };
+                let dns_socket_fd = dns_socket.into_raw_fd();
+
+                // 3. Bind upstream socket
+                let upstream_socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "[dns-forwarder-parent] Failed to bind upstream DNS client socket: {}",
+                            e
+                        );
+                        unsafe {
+                            libc::close(child_ipc_fd);
+                            libc::close(parent_ipc_fd);
+                            libc::close(dns_socket_fd);
+                        }
+                        continue;
+                    }
+                };
+                let upstream_socket_fd = upstream_socket.into_raw_fd();
+
+                let child =
+                    match spawn_dns_worker_process(child_ipc_fd, dns_socket_fd, upstream_socket_fd)
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[dns-forwarder-parent] Failed to spawn worker: {}", e);
+                            unsafe {
+                                libc::close(child_ipc_fd);
+                                libc::close(parent_ipc_fd);
+                                libc::close(dns_socket_fd);
+                                libc::close(upstream_socket_fd);
+                            }
+                            continue;
+                        }
+                    };
+
                 unsafe {
                     libc::close(child_ipc_fd);
-                    libc::close(parent_ipc_fd);
                     libc::close(dns_socket_fd);
                     libc::close(upstream_socket_fd);
                 }
-                return Err(e);
+
+                let child_pid = child.id();
+                child_pid_atomic.store(child_pid, std::sync::atomic::Ordering::SeqCst);
+
+                let monitor_handle = start_parent_dns_monitor(
+                    parent_ipc_fd,
+                    child_pid,
+                    lease_state.clone(),
+                    shutdown_rx.clone(),
+                );
+
+                match monitor_handle {
+                    Ok(h) => {
+                        let _ = h.await;
+                    }
+                    Err(e) => {
+                        eprintln!("[dns-forwarder-parent] Failed to start monitor task: {}", e);
+                        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
+                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                        unsafe {
+                            libc::close(parent_ipc_fd);
+                        }
+                    }
+                }
             }
-        };
+        });
 
-        unsafe {
-            libc::close(child_ipc_fd);
-            libc::close(dns_socket_fd);
-            libc::close(upstream_socket_fd);
-        }
-
-        let child_pid = child.id();
-        let handle = start_parent_dns_monitor(
-            parent_ipc_fd,
-            child_pid,
-            self.lease_state.clone(),
-            shutdown_rx,
-        )?;
-
-        self.child_pid = Some(child_pid);
         self.task_handle = Some(handle);
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        let child_pid = self.child_pid.take().ok_or(ServiceError::NotRunning)?;
         let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
         let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
+        let child_pid = self.child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
 
-        println!(
-            "[dns-forwarder-parent] Stopping DNS worker process PID {}",
-            child_pid
-        );
         let _ = tx.send(true);
-        terminate_worker(child_pid).await;
+        if child_pid != 0 {
+            println!(
+                "[dns-forwarder-parent] Stopping DNS worker process PID {}",
+                child_pid
+            );
+            terminate_worker(child_pid).await;
+        }
 
         let _ = handle.await;
         Ok(())

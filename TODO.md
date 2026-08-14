@@ -10,5 +10,5 @@
 - Deduplicate dependencies
 - Add service stopping notifications
 - Panic doesn't stop routing / other services. Should it?
-- Service privilege separation
 - Remove compressed module loading support if the kernel can do it
+- Revisit Seccomp-BPF filters to establish per-service fine-grained allowed syscall lists, and pass pre-bound SNTP sockets from the parent to completely remove socket/bind/connect calls from workers

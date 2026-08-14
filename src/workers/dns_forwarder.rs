@@ -62,7 +62,7 @@ pub async fn run_dns_forwarder_worker(
     let std_ipc = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
     std_ipc.set_nonblocking(true)?;
     let ipc_stream = tokio::net::UnixStream::from_std(std_ipc)?;
-    let (ipc_reader, _) = ipc_stream.into_split();
+    let (ipc_reader, _ipc_writer) = ipc_stream.into_split();
 
     // Drop privileges
     drop_privileges().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;

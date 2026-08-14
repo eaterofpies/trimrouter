@@ -182,3 +182,74 @@ async fn sync_time() -> Result<chrono::DateTime<chrono::Utc>, String> {
 
     Ok(chrono_dt)
 }
+
+// =========================================================================
+// Tests
+// =========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_sleep_or_shutdown_normal() {
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        // Sleep for a short duration
+        let result = sleep_or_shutdown(Duration::from_millis(10), &mut shutdown_rx).await;
+        assert!(result); // should return true (sleep completed)
+    }
+
+    #[tokio::test]
+    async fn test_sleep_or_shutdown_triggered() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            sleep_or_shutdown(Duration::from_secs(10), &mut shutdown_rx).await
+        });
+
+        // Trigger shutdown
+        shutdown_tx.send(true).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(!result); // should return false (shutdown triggered)
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_wan_ready() {
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let wan_active = Arc::new(Mutex::new(true));
+
+        let result = wait_for_wan(&wan_active, &mut shutdown_rx).await;
+        assert!(result); // should return true instantly
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_wan_delayed() {
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let wan_active = Arc::new(Mutex::new(false));
+        let wan_active_clone = wan_active.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut lock = wan_active_clone.lock().unwrap();
+            *lock = true;
+        });
+
+        let result = wait_for_wan(&wan_active, &mut shutdown_rx).await;
+        assert!(result); // should block and then return true
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_wan_shutdown() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let wan_active = Arc::new(Mutex::new(false));
+
+        let handle = tokio::spawn(async move { wait_for_wan(&wan_active, &mut shutdown_rx).await });
+
+        // Trigger shutdown while waiting
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        shutdown_tx.send(true).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(!result); // should return false on shutdown
+    }
+}

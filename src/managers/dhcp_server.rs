@@ -1,5 +1,7 @@
 use super::ipc::{DhcpServerParentToWorkerMsg, send_msg};
-use super::utils::{setup_worker_sockets, spawn_worker, terminate_worker};
+use super::utils::{
+    handle_supervisor_restart_delay, setup_worker_sockets, spawn_worker, terminate_worker,
+};
 use super::{DHCP_SERVER_SERVICE_NAME, Service, ServiceError};
 use futures_util::StreamExt;
 use rtnetlink::MulticastGroup;
@@ -15,7 +17,7 @@ pub struct DhcpServer {
     lan_ip: String,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
-    child_pid: Option<u32>,
+    child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DhcpServer {
@@ -25,8 +27,12 @@ impl DhcpServer {
             lan_ip,
             shutdown_tx: None,
             task_handle: None,
-            child_pid: None,
+            child_pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    pub fn get_worker_pid(&self) -> u32 {
+        self.child_pid.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -132,54 +138,96 @@ impl Service for DhcpServer {
             return Err(ServiceError::AlreadyRunning);
         }
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
-        let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) =
-            setup_worker_sockets(&self.lan_interface)
-                .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
+        let lan_interface = self.lan_interface.clone();
+        let lan_ip = self.lan_ip.clone();
+        let child_pid_atomic = self.child_pid.clone();
 
-        let child = match spawn_server_worker_process(
-            child_ipc_fd,
-            raw_socket_fd,
-            &self.lan_interface,
-            &self.lan_ip,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                unsafe {
-                    libc::close(raw_socket_fd);
-                    libc::close(parent_ipc_fd);
-                    libc::close(child_ipc_fd);
+        let handle = tokio::spawn(async move {
+            let mut attempt = 0;
+            while !*shutdown_rx.borrow() {
+                if !handle_supervisor_restart_delay("dhcp-server", &mut attempt, &mut shutdown_rx)
+                    .await
+                {
+                    break;
                 }
-                return Err(e);
+
+                let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) =
+                    match setup_worker_sockets(&lan_interface) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            eprintln!("[dhcp-server-parent] Socket setup failed: {}", e);
+                            continue;
+                        }
+                    };
+
+                let child = match spawn_server_worker_process(
+                    child_ipc_fd,
+                    raw_socket_fd,
+                    &lan_interface,
+                    &lan_ip,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[dhcp-server-parent] Spawn failed: {}", e);
+                        unsafe {
+                            libc::close(raw_socket_fd);
+                            libc::close(parent_ipc_fd);
+                            libc::close(child_ipc_fd);
+                        }
+                        continue;
+                    }
+                };
+
+                unsafe {
+                    libc::close(child_ipc_fd);
+                    libc::close(raw_socket_fd);
+                }
+
+                let child_pid = child.id();
+                child_pid_atomic.store(child_pid, std::sync::atomic::Ordering::SeqCst);
+
+                let listener_handle =
+                    start_parent_arp_listener(parent_ipc_fd, child_pid, shutdown_rx.clone());
+
+                match listener_handle {
+                    Ok(h) => {
+                        let _ = h.await;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[dhcp-server-parent] Failed to start ARP listener task: {}",
+                            e
+                        );
+                        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
+                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                        unsafe {
+                            libc::close(parent_ipc_fd);
+                        }
+                    }
+                }
             }
-        };
+        });
 
-        unsafe {
-            libc::close(child_ipc_fd);
-            libc::close(raw_socket_fd);
-        }
-
-        let child_pid = child.id();
-        let handle = start_parent_arp_listener(parent_ipc_fd, child_pid, shutdown_rx)?;
-
-        self.child_pid = Some(child_pid);
         self.task_handle = Some(handle);
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        let child_pid = self.child_pid.take().ok_or(ServiceError::NotRunning)?;
         let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
         let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
+        let child_pid = self.child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
 
-        println!(
-            "[dhcp-server-parent] Stopping worker process PID {}",
-            child_pid
-        );
         let _ = tx.send(true);
-        terminate_worker(child_pid).await;
+        if child_pid != 0 {
+            println!(
+                "[dhcp-server-parent] Stopping worker process PID {}",
+                child_pid
+            );
+            terminate_worker(child_pid).await;
+        }
 
         let _ = handle.await;
         Ok(())

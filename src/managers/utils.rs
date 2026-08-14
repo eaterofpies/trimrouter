@@ -438,6 +438,103 @@ pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>)
     }
 }
 
+pub fn apply_seccomp() -> Result<(), std::io::Error> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
+    use std::collections::BTreeMap;
+    use std::convert::TryInto;
+
+    let allowed_syscalls = [
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_close,
+        libc::SYS_fstat,
+        libc::SYS_lseek,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_shutdown,
+        libc::SYS_fcntl,
+        libc::SYS_getsockopt,
+        libc::SYS_setsockopt,
+        libc::SYS_socket,
+        libc::SYS_bind,
+        libc::SYS_connect,
+        libc::SYS_accept,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        libc::SYS_epoll_create,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_wait,
+        libc::SYS_epoll_create1,
+        libc::SYS_eventfd2,
+        libc::SYS_futex,
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_clone,
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_clone3,
+        libc::SYS_mmap,
+        libc::SYS_mprotect,
+        libc::SYS_munmap,
+        libc::SYS_brk,
+        libc::SYS_sched_yield,
+        libc::SYS_madvise,
+        libc::SYS_gettid,
+        libc::SYS_set_robust_list,
+        libc::SYS_prctl,
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_arch_prctl,
+        libc::SYS_clock_gettime,
+        libc::SYS_nanosleep,
+        libc::SYS_gettimeofday,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+        libc::SYS_rt_sigqueueinfo,
+        libc::SYS_getpid,
+        libc::SYS_getuid,
+        libc::SYS_geteuid,
+        libc::SYS_getgid,
+        libc::SYS_getegid,
+        libc::SYS_getrandom,
+        libc::SYS_ioctl,
+        libc::SYS_uname,
+        libc::SYS_pipe,
+        libc::SYS_pipe2,
+    ];
+
+    let mut rules = BTreeMap::new();
+    for &syscall in &allowed_syscalls {
+        rules.insert(syscall, vec![]);
+    }
+
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Trap,  // mismatch triggers SIGSYS
+        SeccompAction::Allow, // match allows syscall
+        std::env::consts::ARCH
+            .try_into()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    let prog: BpfProgram = filter
+        .try_into()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    seccompiler::apply_filter(&prog)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    Ok(())
+}
+
 pub fn drop_privileges() -> Result<(), std::io::Error> {
     use nix::unistd::{Gid, Uid, setgid, setuid};
 
@@ -469,6 +566,8 @@ pub fn drop_privileges() -> Result<(), std::io::Error> {
     caps::clear(None, caps::CapSet::Inheritable).map_err(std::io::Error::other)?;
     caps::clear(None, caps::CapSet::Effective).map_err(std::io::Error::other)?;
     caps::clear(None, caps::CapSet::Permitted).map_err(std::io::Error::other)?;
+
+    apply_seccomp()?;
 
     Ok(())
 }
@@ -516,6 +615,49 @@ pub fn spawn_worker(
     }
 
     cmd.spawn()
+}
+
+pub fn create_ipc_fds() -> Result<(RawFd, RawFd), std::io::Error> {
+    use std::os::unix::io::IntoRawFd;
+    let (parent_stream, child_stream) = tokio::net::UnixStream::pair()?;
+    let parent_std = parent_stream.into_std()?;
+    let parent_fd = parent_std.into_raw_fd();
+
+    let child_std = match child_stream.into_std() {
+        Ok(std_stream) => std_stream,
+        Err(e) => {
+            unsafe {
+                libc::close(parent_fd);
+            }
+            return Err(e);
+        }
+    };
+    let child_fd = child_std.into_raw_fd();
+    Ok((parent_fd, child_fd))
+}
+
+pub async fn handle_supervisor_restart_delay(
+    service_name: &str,
+    attempt: &mut u32,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    if *attempt > 0 {
+        let delay = std::time::Duration::from_secs(std::cmp::min(1 << *attempt, 60));
+        println!(
+            "[{}-parent] Worker crashed/exited. Restarting in {:?}",
+            service_name, delay
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
+                    return false;
+                }
+            }
+        }
+    }
+    *attempt += 1;
+    true
 }
 
 pub async fn terminate_worker(pid: u32) {

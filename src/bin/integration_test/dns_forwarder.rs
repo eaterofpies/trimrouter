@@ -12,6 +12,9 @@ pub async fn test_dns_forwarding(lease_state: SharedWanLease) -> Result<DnsForwa
         return Err(format!("Failed to start DNS Forwarder: {}", e));
     }
 
+    // Wait for the worker to drop privileges, set up Seccomp, and bind UDP port 53
+    std::thread::sleep(Duration::from_millis(1000));
+
     // 2. Bind to UDP port 23457 to receive verification from the host
     let socket = UdpSocket::bind("192.168.1.1:23457").map_err(|e| e.to_string())?;
     socket

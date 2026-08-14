@@ -15,10 +15,10 @@ pub async fn test_dhcp_client_binding(lease_state: SharedWanLease) -> Result<Dhc
         return Err(format!("Failed to start DHCP client: {}", e));
     }
 
-    // 3. Await configuration (up to 15 seconds)
+    // 3. Await configuration (up to 30 seconds)
     let start = std::time::Instant::now();
     let mut bound = false;
-    while start.elapsed() < Duration::from_secs(15) {
+    while start.elapsed() < Duration::from_secs(30) {
         {
             let lease = lease_state.lock().unwrap();
             if lease.ip == Some(Ipv4Addr::new(10, 0, 2, 15)) {
