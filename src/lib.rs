@@ -24,6 +24,7 @@ pub mod modes;
 pub mod netfilter;
 pub mod network;
 pub mod packet;
+pub mod partition;
 pub mod reaper;
 pub mod signal;
 pub mod system;

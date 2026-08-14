@@ -5,10 +5,8 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::fs;
 use std::panic;
-use std::path::Path;
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub trait SystemOps: Send + Sync + 'static {
     fn mount(
@@ -103,70 +101,6 @@ pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), RouterErro
     } else {
         println!("[init] Configured kernel modprobe path to /sbin/modprobe.");
     }
-
-    Ok(())
-}
-
-const BOOT_MOUNT_POINT: &str = "/boot";
-const BOOT_DEVICE_CANDIDATES: &[&str] = &["/dev/vda1", "/dev/mmcblk0p1", "/dev/sda1"];
-const BOOT_MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
-const BOOT_MOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-fn try_mount_candidates<S: SystemOps>(sys: &S) -> Option<String> {
-    for dev in BOOT_DEVICE_CANDIDATES {
-        if Path::new(dev).exists()
-            && sys
-                .mount(
-                    Some(*dev),
-                    BOOT_MOUNT_POINT,
-                    "vfat",
-                    MsFlags::MS_RDONLY,
-                    None,
-                )
-                .is_ok()
-        {
-            return Some((*dev).to_string());
-        }
-    }
-    None
-}
-
-pub fn mount_boot_partition<S: SystemOps>(sys: &S) -> Result<(), RouterError> {
-    if sys.getpid() != Pid::from_raw(1) {
-        return Ok(());
-    }
-
-    if let Err(e) = fs::create_dir_all(BOOT_MOUNT_POINT) {
-        println!(
-            "[init] Warning: failed to create {} directory: {}",
-            BOOT_MOUNT_POINT, e
-        );
-        return Ok(());
-    }
-
-    let start = Instant::now();
-    let mut mounted_device = None;
-
-    println!("[init] Waiting for boot partition to become available...");
-
-    while start.elapsed() < BOOT_MOUNT_TIMEOUT {
-        if let Some(dev) = try_mount_candidates(sys) {
-            mounted_device = Some(dev);
-            break;
-        }
-        thread::sleep(BOOT_MOUNT_POLL_INTERVAL);
-    }
-
-    let Some(dev) = mounted_device else {
-        return Err(RouterError::from(
-            "Timeout reached. Could not find or mount boot partition from any candidate device.",
-        ));
-    };
-
-    println!(
-        "[init] Successfully mounted {} on {} as read-only.",
-        dev, BOOT_MOUNT_POINT
-    );
 
     Ok(())
 }
@@ -308,7 +242,6 @@ pub mod mock {
 mod tests {
     use super::mock::MockSystem;
     use super::*;
-
     #[test]
     fn test_vfs_mounting() {
         let sys = MockSystem::new();
@@ -325,15 +258,6 @@ mod tests {
         assert_eq!(calls[2].2, "devtmpfs");
         assert_eq!(calls[3].1, "/run");
         assert_eq!(calls[3].2, "tmpfs");
-    }
-
-    #[test]
-    fn test_mount_boot_partition_failure() {
-        let sys = MockSystem::new();
-        let result = mount_boot_partition(&sys);
-        assert!(result.is_err());
-        let calls = sys.mount_calls.lock().unwrap();
-        assert!(calls.is_empty());
     }
 
     #[test]

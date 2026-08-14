@@ -5,7 +5,7 @@
 Crucially, **no other files** will be present on the target filesystem other than the Linux kernel and this binary (statically linked). It requires zero external helper utilities (no `iptables`, `nft`, `ip`, `dnsmasq`, `udev`, etc.) and configures itself via kernel command line parameters or automatic interface detection.
 
 > [!NOTE]
-> **Status: Partial.** Core routing, DHCP, DNS, SNTP, NAT, privilege separation, and interface lifecycle are all implemented. Two gaps remain: §2.5 (structured logging — currently raw stdout) is not yet implemented per [`logging_spec.md`](logging_spec.md); and the boot partition mount uses fixed device paths rather than the volume label scan specified in [`partition_layout_spec.md §4.4`](partition_layout_spec.md).
+> **Status: Partial.** Core routing, DHCP, DNS, SNTP, NAT, privilege separation, interface lifecycle, and boot partition label scanning are all implemented. The only remaining gap is structured logging (§2.5 / [`logging_spec.md`](logging_spec.md) — currently raw stdout/stderr).
 
 ---
 

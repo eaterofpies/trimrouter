@@ -5,7 +5,10 @@ use trimrouter::kmod;
 use trimrouter::managers::{Service, WanLease};
 use trimrouter::netfilter;
 use trimrouter::network;
-use trimrouter::system::{RealSystem, SystemOps, mount_boot_partition, mount_virtual_filesystems};
+use trimrouter::partition::{
+    ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
+};
+use trimrouter::system::{RealSystem, SystemOps, mount_virtual_filesystems};
 
 mod dhcp_client;
 mod dns_forwarder;
@@ -57,8 +60,26 @@ async fn main() {
         }
         kmod::start_uevent_listener();
         kmod::load_required_modules();
-        if let Err(e) = mount_boot_partition(sys.as_ref()) {
-            std::eprintln!("[test] FATAL: Failed to mount boot: {}", e);
+        let (boot_dev, parent_disk) = match wait_for_boot_partition() {
+            Ok(res) => res,
+            Err(e) => {
+                std::eprintln!("[test] FATAL: Failed to find boot partition: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        if let Err(e) = ensure_log_partition_in_mbr(&boot_dev, &parent_disk) {
+            std::eprintln!("[test] FATAL: Failed to ensure partition 2: {}", e);
+            std::process::exit(1);
+        }
+
+        if let Err(e) = mount_boot_partition(sys.as_ref(), &boot_dev) {
+            std::eprintln!("[test] FATAL: Failed to mount boot partition: {}", e);
+            std::process::exit(1);
+        }
+
+        if let Err(e) = setup_log_partition(sys.as_ref(), &boot_dev, &parent_disk) {
+            std::eprintln!("[test] FATAL: Failed to setup log partition: {}", e);
             std::process::exit(1);
         }
         let config = match trimrouter::config::RouterConfig::parse(sys.as_ref()) {

@@ -3,7 +3,7 @@
 This specification describes the on-disk partition structure of the `trimrouter` bootable raw image (`target/<arch>/trimrouter.img`), the contents placed in each partition, and how the init process locates and mounts both partitions at runtime.
 
 > [!NOTE]
-> **Status: Partial.** §3 (boot partition contents) and §6 (test image isolation) are fully implemented. §2 is missing the `mlabel` volume label step. §4.4 (volume label boot device scan) and §5 (first-boot log partition creation) are not yet implemented — the current code uses a fixed device probe list and does not create the log partition.
+> **Status: Implemented.** MBR partitioning, label scanning, partition table reread, and fatfs-based formatting are all fully in place and verified in integration tests.
 
 ---
 
@@ -188,11 +188,10 @@ Both partitions are mounted as part of the ordered PID 1 startup sequence, after
 
 ```
 1. mount_virtual_filesystems()          → /proc, /sys, /dev (devtmpfs), /run (tmpfs)
-2. mount_boot_partition()               → /boot (vfat, read-only)
-3. create_log_partition_if_needed()     → create + format + mount /var/log on first boot
-                                          mount /var/log on subsequent boots
-4. load_required_modules()              → kernel module preloading
-5. read_config_file()                   → /boot/config/trimrouter.toml
+2. wait_for_boot_partition()            → scans labels and returns when TRIMROUTER is found
+3. ensure_log_partition_in_mbr()        → updates MBR and re-reads partition table if needed
+4. mount_boot_partition()               → mounts /boot (vfat, read-only)
+5. setup_log_partition()                 → mounts /var/log (formats FAT32 first if mount fails)
 6. configure_network()                  → interfaces, NAT, services
    └─ for each worker spawn:
       open log file                     → /var/log/system.log (append mode)

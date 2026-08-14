@@ -1,8 +1,9 @@
 use crate::config::RouterConfig;
 use crate::managers::CHROOT_JAIL_PATH;
-use crate::system::{
-    RealSystem, SystemOps, mount_boot_partition, mount_virtual_filesystems, register_panic_handler,
+use crate::partition::{
+    ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
 };
+use crate::system::{RealSystem, SystemOps, mount_virtual_filesystems, register_panic_handler};
 use crate::{interface, kmod, managers, netfilter, network, reaper, signal, system};
 use nix::unistd::Pid;
 use std::sync::Arc;
@@ -58,8 +59,21 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
             panic!("FATAL: Failed to mount virtual filesystems: {}", e);
         }
         kmod::load_required_modules();
-        if let Err(e) = mount_boot_partition(sys.as_ref()) {
+        let (boot_dev, parent_disk) = match wait_for_boot_partition() {
+            Ok(res) => res,
+            Err(e) => panic!("FATAL: Failed to find boot partition: {}", e),
+        };
+
+        if let Err(e) = ensure_log_partition_in_mbr(&boot_dev, &parent_disk) {
+            println!("[init] Warning: failed to ensure partition 2: {}", e);
+        }
+
+        if let Err(e) = mount_boot_partition(sys.as_ref(), &boot_dev) {
             panic!("FATAL: Failed to mount boot partition: {}", e);
+        }
+
+        if let Err(e) = setup_log_partition(sys.as_ref(), &boot_dev, &parent_disk) {
+            println!("[init] WARNING: Failed to setup log partition: {}", e);
         }
 
         // Create chroot jail directory if it doesn't exist

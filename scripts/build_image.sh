@@ -31,10 +31,10 @@ case "$ARCH" in
         
         # 1. Allocate blank raw disk image
         dd if=/dev/zero of="$IMAGE" bs=1M count=128 2>/dev/null
-        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 100%
+        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 121MiB
         
-        # 2. Format partition as FAT32
-        mformat -i "${IMAGE}@@1M" -F
+        # 2. Format partition as FAT32 with label TRIMROUTER
+        mformat -v TRIMROUTER -i "${IMAGE}@@1M" -F
         
         # 3. Write boot payloads to the image
         mcopy -i "${IMAGE}@@1M" "$KERNEL" ::/vmlinuz
@@ -209,10 +209,10 @@ case "$ARCH" in
 
         echo "[build-rpi] Allocating blank raw disk block file for ${ARCH}..."
         dd if=/dev/zero of="$IMAGE" bs=1M count=128 2>/dev/null
-        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 100%
+        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 121MiB
 
         echo "[build-rpi] Formatting FAT32 partition in raw disk image..."
-        mformat -i "${IMAGE}@@1M" -F
+        mformat -v TRIMROUTER -i "${IMAGE}@@1M" -F
 
         echo "[build-rpi] Writing boot sector payload files..."
         mcopy -i "${IMAGE}@@1M" "$RPI_BOOT_DIR/bootcode.bin" ::/
