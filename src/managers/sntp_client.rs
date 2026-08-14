@@ -1,39 +1,25 @@
 use super::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
-use super::utils::{
-    SharedWanLease, create_ipc_fds, handle_supervisor_restart_delay, spawn_worker, terminate_worker,
-};
-use super::{SNTP_CLIENT_SERVICE_NAME, Service, ServiceError};
+use super::utils::{SharedWanLease, create_ipc_fds};
+use super::{ExternalWorker, Service, ServiceError};
 use std::os::unix::io::RawFd;
-use std::process::Child;
 use std::sync::Arc;
 
 pub struct SntpClient {
     lease_state: SharedWanLease,
-    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-    child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    state: ExternalWorker,
 }
 
 impl SntpClient {
     pub fn new(lease_state: SharedWanLease) -> Self {
         Self {
             lease_state,
-            shutdown_tx: None,
-            task_handle: None,
-            child_pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            state: ExternalWorker::new("sntp-client"),
         }
     }
 
     pub fn get_worker_pid(&self) -> u32 {
-        self.child_pid.load(std::sync::atomic::Ordering::SeqCst)
+        self.state.get_worker_pid()
     }
-}
-
-fn spawn_sntp_worker_process(child_ipc_fd: RawFd) -> Result<Child, ServiceError> {
-    let child_ipc_str = child_ipc_fd.to_string();
-    let args = &[child_ipc_str.as_str()];
-    spawn_worker(SNTP_CLIENT_SERVICE_NAME, args, &[child_ipc_fd])
-        .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
 }
 
 async fn run_wan_status_monitor(
@@ -156,99 +142,34 @@ fn start_parent_sntp_monitor(
     Ok(handle)
 }
 
+fn setup_sntp_attempt() -> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
+    let (parent_ipc_fd, child_ipc_fd) = create_ipc_fds()?;
+    Ok((
+        crate::cli::WorkerService::SntpClient {
+            ipc_fd: child_ipc_fd,
+        },
+        parent_ipc_fd,
+    ))
+}
+
 impl Service for SntpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        if self.task_handle.is_some() {
-            return Err(ServiceError::AlreadyRunning);
-        }
-
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        self.shutdown_tx = Some(shutdown_tx);
-
         let lease_state = self.lease_state.clone();
-        let child_pid_atomic = self.child_pid.clone();
 
-        let handle = tokio::spawn(async move {
-            let mut attempt = 0;
-            while !*shutdown_rx.borrow() {
-                if !handle_supervisor_restart_delay("sntp-client", &mut attempt, &mut shutdown_rx)
-                    .await
-                {
-                    break;
-                }
-
-                let (parent_ipc_fd, child_ipc_fd) = match create_ipc_fds() {
-                    Ok(fds) => fds,
-                    Err(e) => {
-                        eprintln!(
-                            "[sntp-client-parent] Failed to create IPC socketpair: {}",
-                            e
-                        );
-                        continue;
-                    }
-                };
-
-                let child = match spawn_sntp_worker_process(child_ipc_fd) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("[sntp-client-parent] Spawn failed: {}", e);
-                        unsafe {
-                            libc::close(child_ipc_fd);
-                            libc::close(parent_ipc_fd);
-                        }
-                        continue;
-                    }
-                };
-
-                unsafe {
-                    libc::close(child_ipc_fd);
-                }
-
-                let child_pid = child.id();
-                child_pid_atomic.store(child_pid, std::sync::atomic::Ordering::SeqCst);
-
-                let monitor_handle = start_parent_sntp_monitor(
+        self.state.start_supervised(
+            setup_sntp_attempt,
+            move |parent_ipc_fd, child_pid, shutdown_rx| {
+                start_parent_sntp_monitor(
                     parent_ipc_fd,
                     child_pid,
                     lease_state.clone(),
-                    shutdown_rx.clone(),
-                );
-
-                match monitor_handle {
-                    Ok(h) => {
-                        let _ = h.await;
-                    }
-                    Err(e) => {
-                        eprintln!("[sntp-client-parent] Failed to start monitor task: {}", e);
-                        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
-                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                        unsafe {
-                            libc::close(parent_ipc_fd);
-                        }
-                    }
-                }
-            }
-        });
-
-        self.task_handle = Some(handle);
-        Ok(())
+                    shutdown_rx,
+                )
+            },
+        )
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
-        let child_pid = self.child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
-
-        let _ = tx.send(true);
-        if child_pid != 0 {
-            println!(
-                "[sntp-client-parent] Stopping SNTP worker process PID {}",
-                child_pid
-            );
-            terminate_worker(child_pid).await;
-        }
-
-        let _ = handle.await;
-        Ok(())
+        self.state.stop().await
     }
 }

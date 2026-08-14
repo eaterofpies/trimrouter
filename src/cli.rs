@@ -95,6 +95,52 @@ pub enum WorkerService {
     },
 }
 
+impl WorkerService {
+    pub fn to_args_and_child_fds(&self) -> (Vec<String>, Vec<std::os::unix::io::RawFd>) {
+        match self {
+            Self::SntpClient { ipc_fd } => (vec![ipc_fd.to_string()], vec![*ipc_fd]),
+            Self::DhcpClient {
+                ipc_fd,
+                raw_socket_fd,
+                wan_interface,
+            } => (
+                vec![
+                    ipc_fd.to_string(),
+                    raw_socket_fd.to_string(),
+                    wan_interface.clone(),
+                ],
+                vec![*ipc_fd, *raw_socket_fd],
+            ),
+            Self::DhcpServer {
+                ipc_fd,
+                raw_socket_fd,
+                wan_interface,
+                lan_ip,
+            } => (
+                vec![
+                    ipc_fd.to_string(),
+                    raw_socket_fd.to_string(),
+                    wan_interface.clone(),
+                    lan_ip.clone(),
+                ],
+                vec![*ipc_fd, *raw_socket_fd],
+            ),
+            Self::DnsForwarder {
+                ipc_fd,
+                dns_socket_fd,
+                upstream_socket_fd,
+            } => (
+                vec![
+                    ipc_fd.to_string(),
+                    dns_socket_fd.to_string(),
+                    upstream_socket_fd.to_string(),
+                ],
+                vec![*ipc_fd, *dns_socket_fd, *upstream_socket_fd],
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

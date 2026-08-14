@@ -3,9 +3,6 @@ use pnet::util::MacAddr;
 use rtnetlink::packet_route::link::LinkAttribute;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
-use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 
 pub const CHROOT_JAIL_PATH: &str = "/run/empty";
@@ -586,37 +583,6 @@ pub fn setup_worker_sockets(interface: &str) -> std::io::Result<(RawFd, RawFd, R
     Ok((raw_socket_fd, fds[0], fds[1]))
 }
 
-pub fn spawn_worker(
-    service_name: &str,
-    args: &[&str],
-    fds_to_keep: &[RawFd],
-) -> std::io::Result<Child> {
-    let binary_path = if Path::new(ROUTER_BINARY_PATH).exists() {
-        ROUTER_BINARY_PATH
-    } else {
-        SELF_EXE_PATH
-    };
-
-    let mut cmd = Command::new(binary_path);
-    cmd.arg("worker");
-    cmd.arg(service_name);
-    for arg in args {
-        cmd.arg(arg);
-    }
-
-    let fds = fds_to_keep.to_vec();
-    unsafe {
-        cmd.pre_exec(move || {
-            for &fd in &fds {
-                libc::fcntl(fd, libc::F_SETFD, 0);
-            }
-            Ok(())
-        });
-    }
-
-    cmd.spawn()
-}
-
 pub fn create_ipc_fds() -> Result<(RawFd, RawFd), std::io::Error> {
     use std::os::unix::io::IntoRawFd;
     let (parent_stream, child_stream) = tokio::net::UnixStream::pair()?;
@@ -681,7 +647,6 @@ pub async fn terminate_worker(pid: u32) {
                 pid, e
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 

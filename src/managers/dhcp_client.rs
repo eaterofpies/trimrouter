@@ -1,21 +1,18 @@
 use super::ipc::{DhcpClientToParentMsg, recv_msg};
 use super::utils::{
-    CleanOption, SharedWanLease, WanLease, get_interface_mac, handle_supervisor_restart_delay,
-    mask_to_prefix_len, prefix_len_to_mask, setup_worker_sockets, spawn_worker, terminate_worker,
+    CleanOption, SharedWanLease, WanLease, get_interface_mac, mask_to_prefix_len,
+    prefix_len_to_mask, setup_worker_sockets,
 };
-use super::{DHCP_CLIENT_SERVICE_NAME, Service, ServiceError};
+use super::{ExternalWorker, Service, ServiceError};
 use crate::workers::dhcp_client::DhcpError;
 use futures_util::TryStreamExt;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
-use std::process::Child;
 
 pub struct DhcpClient {
     pub(super) wan_interface: String,
     pub(super) lease_state: SharedWanLease,
-    pub(super) task_handle: Option<tokio::task::JoinHandle<()>>,
-    pub(super) child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    pub(super) shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    state: ExternalWorker,
 }
 
 impl DhcpClient {
@@ -23,35 +20,13 @@ impl DhcpClient {
         Self {
             wan_interface,
             lease_state,
-            task_handle: None,
-            child_pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            shutdown_tx: None,
+            state: ExternalWorker::new("dhcp-client"),
         }
     }
 
     pub fn get_worker_pid(&self) -> u32 {
-        self.child_pid.load(std::sync::atomic::Ordering::SeqCst)
+        self.state.get_worker_pid()
     }
-}
-
-fn spawn_worker_process(
-    child_ipc_fd: RawFd,
-    raw_socket_fd: RawFd,
-    wan_interface: &str,
-) -> Result<Child, ServiceError> {
-    let child_ipc_str = child_ipc_fd.to_string();
-    let raw_socket_str = raw_socket_fd.to_string();
-    let args = &[
-        child_ipc_str.as_str(),
-        raw_socket_str.as_str(),
-        wan_interface,
-    ];
-    spawn_worker(
-        DHCP_CLIENT_SERVICE_NAME,
-        args,
-        &[child_ipc_fd, raw_socket_fd],
-    )
-    .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
 }
 
 async fn apply_parent_lease(
@@ -166,109 +141,46 @@ fn start_parent_supervisor_task(
     Ok(handle)
 }
 
+fn setup_dhcp_client_attempt(
+    wan_interface: &str,
+) -> Result<(crate::cli::WorkerService, std::os::unix::io::RawFd), ServiceError> {
+    let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) = setup_worker_sockets(wan_interface)
+        .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
+    Ok((
+        crate::cli::WorkerService::DhcpClient {
+            ipc_fd: child_ipc_fd,
+            raw_socket_fd,
+            wan_interface: wan_interface.to_string(),
+        },
+        parent_ipc_fd,
+    ))
+}
+
 impl Service for DhcpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        if self.task_handle.is_some() {
-            return Err(ServiceError::AlreadyRunning);
-        }
-
         let _ = get_interface_mac(&self.wan_interface)
             .await
             .map_err(ServiceError::FailedToStart)?;
 
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        self.shutdown_tx = Some(shutdown_tx);
-
-        let wan_interface = self.wan_interface.clone();
+        let wan_interface_setup = self.wan_interface.clone();
+        let wan_interface_monitor = self.wan_interface.clone();
         let lease_state = self.lease_state.clone();
-        let child_pid_atomic = self.child_pid.clone();
 
-        let handle = tokio::spawn(async move {
-            let mut attempt = 0;
-            while !*shutdown_rx.borrow() {
-                if !handle_supervisor_restart_delay("dhcp-client", &mut attempt, &mut shutdown_rx)
-                    .await
-                {
-                    break;
-                }
-
-                let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) =
-                    match setup_worker_sockets(&wan_interface) {
-                        Ok(res) => res,
-                        Err(e) => {
-                            eprintln!("[dhcp-client-parent] Socket setup failed: {}", e);
-                            continue;
-                        }
-                    };
-
-                let child = match spawn_worker_process(child_ipc_fd, raw_socket_fd, &wan_interface)
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("[dhcp-client-parent] Spawn failed: {}", e);
-                        unsafe {
-                            libc::close(raw_socket_fd);
-                            libc::close(parent_ipc_fd);
-                            libc::close(child_ipc_fd);
-                        }
-                        continue;
-                    }
-                };
-
-                unsafe {
-                    libc::close(child_ipc_fd);
-                    libc::close(raw_socket_fd);
-                }
-
-                let child_pid = child.id();
-                child_pid_atomic.store(child_pid, std::sync::atomic::Ordering::SeqCst);
-
-                let supervisor_handle = start_parent_supervisor_task(
+        self.state.start_supervised(
+            move || setup_dhcp_client_attempt(&wan_interface_setup),
+            move |parent_ipc_fd, child_pid, _shutdown_rx| {
+                start_parent_supervisor_task(
                     parent_ipc_fd,
                     child_pid,
-                    wan_interface.clone(),
+                    wan_interface_monitor.clone(),
                     lease_state.clone(),
-                );
-
-                match supervisor_handle {
-                    Ok(h) => {
-                        let _ = h.await;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[dhcp-client-parent] Failed to start supervisor task: {}",
-                            e
-                        );
-                        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
-                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                        unsafe {
-                            libc::close(parent_ipc_fd);
-                        }
-                    }
-                }
-            }
-        });
-
-        self.task_handle = Some(handle);
-        Ok(())
+                )
+            },
+        )
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
-        let child_pid = self.child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
-
-        let _ = tx.send(true);
-        if child_pid != 0 {
-            println!(
-                "[dhcp-client-parent] Stopping worker process PID {}",
-                child_pid
-            );
-            terminate_worker(child_pid).await;
-        }
-
-        let _ = handle.await;
-        Ok(())
+        self.state.stop().await
     }
 }
 

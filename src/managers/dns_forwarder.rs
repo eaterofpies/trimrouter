@@ -1,56 +1,28 @@
 use super::ipc::{DnsParentToWorkerMsg, send_msg};
-use super::utils::{
-    SharedWanLease, create_ipc_fds, handle_supervisor_restart_delay, spawn_worker, terminate_worker,
-};
-use super::{DNS_FORWARDER_SERVICE_NAME, Service, ServiceError};
+use super::utils::{SharedWanLease, create_ipc_fds};
+use super::{ExternalWorker, Service, ServiceError};
 use std::net::Ipv4Addr;
 use std::os::unix::io::{IntoRawFd, RawFd};
-use std::process::Child;
 use std::sync::Arc;
 
 const DNS_PORT: u16 = 53;
 
 pub struct DnsForwarder {
     lease_state: SharedWanLease,
-    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-    child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    state: ExternalWorker,
 }
 
 impl DnsForwarder {
     pub fn new(lease_state: SharedWanLease) -> Self {
         Self {
             lease_state,
-            shutdown_tx: None,
-            task_handle: None,
-            child_pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            state: ExternalWorker::new("dns-forwarder"),
         }
     }
 
     pub fn get_worker_pid(&self) -> u32 {
-        self.child_pid.load(std::sync::atomic::Ordering::SeqCst)
+        self.state.get_worker_pid()
     }
-}
-
-fn spawn_dns_worker_process(
-    child_ipc_fd: RawFd,
-    dns_socket_fd: RawFd,
-    upstream_socket_fd: RawFd,
-) -> Result<Child, ServiceError> {
-    let child_ipc_str = child_ipc_fd.to_string();
-    let dns_socket_str = dns_socket_fd.to_string();
-    let upstream_socket_str = upstream_socket_fd.to_string();
-    let args = &[
-        child_ipc_str.as_str(),
-        dns_socket_str.as_str(),
-        upstream_socket_str.as_str(),
-    ];
-    spawn_worker(
-        DNS_FORWARDER_SERVICE_NAME,
-        args,
-        &[child_ipc_fd, dns_socket_fd, upstream_socket_fd],
-    )
-    .map_err(|e| ServiceError::FailedToStart(format!("spawn failed: {}", e)))
 }
 
 async fn run_parent_dns_monitor(
@@ -150,137 +122,37 @@ fn start_parent_dns_monitor(
     Ok(handle)
 }
 
+fn setup_dns_forwarder_attempt()
+-> Result<(crate::cli::WorkerService, std::os::unix::io::RawFd), ServiceError> {
+    let (parent_ipc_fd, child_ipc_fd) = create_ipc_fds()?;
+    let dns_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT))?;
+    let dns_socket_fd = dns_socket.into_raw_fd();
+    let upstream_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let upstream_socket_fd = upstream_socket.into_raw_fd();
+
+    Ok((
+        crate::cli::WorkerService::DnsForwarder {
+            ipc_fd: child_ipc_fd,
+            dns_socket_fd,
+            upstream_socket_fd,
+        },
+        parent_ipc_fd,
+    ))
+}
+
 impl Service for DnsForwarder {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        if self.task_handle.is_some() {
-            return Err(ServiceError::AlreadyRunning);
-        }
-
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        self.shutdown_tx = Some(shutdown_tx);
-
         let lease_state = self.lease_state.clone();
-        let child_pid_atomic = self.child_pid.clone();
 
-        let handle = tokio::spawn(async move {
-            let mut attempt = 0;
-            while !*shutdown_rx.borrow() {
-                if !handle_supervisor_restart_delay("dns-forwarder", &mut attempt, &mut shutdown_rx)
-                    .await
-                {
-                    break;
-                }
-
-                let (parent_ipc_fd, child_ipc_fd) = match create_ipc_fds() {
-                    Ok(fds) => fds,
-                    Err(e) => {
-                        eprintln!(
-                            "[dns-forwarder-parent] Failed to create IPC socketpair: {}",
-                            e
-                        );
-                        continue;
-                    }
-                };
-
-                // 2. Bind port 53 socket (requires root)
-                let dns_socket = match std::net::UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT)) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[dns-forwarder-parent] Failed to bind DNS port 53: {}", e);
-                        unsafe {
-                            libc::close(child_ipc_fd);
-                            libc::close(parent_ipc_fd);
-                        }
-                        continue;
-                    }
-                };
-                let dns_socket_fd = dns_socket.into_raw_fd();
-
-                // 3. Bind upstream socket
-                let upstream_socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!(
-                            "[dns-forwarder-parent] Failed to bind upstream DNS client socket: {}",
-                            e
-                        );
-                        unsafe {
-                            libc::close(child_ipc_fd);
-                            libc::close(parent_ipc_fd);
-                            libc::close(dns_socket_fd);
-                        }
-                        continue;
-                    }
-                };
-                let upstream_socket_fd = upstream_socket.into_raw_fd();
-
-                let child =
-                    match spawn_dns_worker_process(child_ipc_fd, dns_socket_fd, upstream_socket_fd)
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("[dns-forwarder-parent] Failed to spawn worker: {}", e);
-                            unsafe {
-                                libc::close(child_ipc_fd);
-                                libc::close(parent_ipc_fd);
-                                libc::close(dns_socket_fd);
-                                libc::close(upstream_socket_fd);
-                            }
-                            continue;
-                        }
-                    };
-
-                unsafe {
-                    libc::close(child_ipc_fd);
-                    libc::close(dns_socket_fd);
-                    libc::close(upstream_socket_fd);
-                }
-
-                let child_pid = child.id();
-                child_pid_atomic.store(child_pid, std::sync::atomic::Ordering::SeqCst);
-
-                let monitor_handle = start_parent_dns_monitor(
-                    parent_ipc_fd,
-                    child_pid,
-                    lease_state.clone(),
-                    shutdown_rx.clone(),
-                );
-
-                match monitor_handle {
-                    Ok(h) => {
-                        let _ = h.await;
-                    }
-                    Err(e) => {
-                        eprintln!("[dns-forwarder-parent] Failed to start monitor task: {}", e);
-                        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
-                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                        unsafe {
-                            libc::close(parent_ipc_fd);
-                        }
-                    }
-                }
-            }
-        });
-
-        self.task_handle = Some(handle);
-        Ok(())
+        self.state.start_supervised(
+            setup_dns_forwarder_attempt,
+            move |parent_ipc_fd, child_pid, shutdown_rx| {
+                start_parent_dns_monitor(parent_ipc_fd, child_pid, lease_state.clone(), shutdown_rx)
+            },
+        )
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
-        let child_pid = self.child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
-
-        let _ = tx.send(true);
-        if child_pid != 0 {
-            println!(
-                "[dns-forwarder-parent] Stopping DNS worker process PID {}",
-                child_pid
-            );
-            terminate_worker(child_pid).await;
-        }
-
-        let _ = handle.await;
-        Ok(())
+        self.state.stop().await
     }
 }
