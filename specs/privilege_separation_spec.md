@@ -4,6 +4,9 @@ This document specifies the privilege separation architecture for `trimrouter`.
 
 Currently, `trimrouter` runs as the initialization process (PID 1) entirely as the `root` user (UID 0), meaning all network-facing packet parsers (DHCP, DNS, SNTP) operate with full system privileges. To protect against remote code execution vulnerabilities in third-party parsing libraries, `trimrouter` must isolate network-facing services into unprivileged child processes.
 
+> [!NOTE]
+> **Status: Implemented.** Chroot jail, UID/GID dropping, seccomp-BPF filters, and socket passing are all in place. The IPC protocol (§4) and process supervision (§3.4) are implemented.
+
 ---
 
 ## 1. Threat Model & Security Goals

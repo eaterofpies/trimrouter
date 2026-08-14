@@ -2,6 +2,9 @@
 
 The DHCP Server is an embedded service in `trimrouter` responsible for dynamically allocating and managing IPv4 addresses for local clients on the LAN interface.
 
+> [!NOTE]
+> **Status: Implemented.**
+
 ---
 
 ## 1. Socket and Routing Mechanics

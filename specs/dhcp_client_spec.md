@@ -2,6 +2,9 @@
 
 The DHCP Client is an embedded service in `trimrouter` responsible for negotiating IPv4 network configuration dynamically with an upstream DHCP server on the WAN interface.
 
+> [!NOTE]
+> **Status: Implemented.**
+
 ---
 
 ## 1. Socket and Packet Mechanics

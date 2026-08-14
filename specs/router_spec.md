@@ -4,11 +4,12 @@
 
 Crucially, **no other files** will be present on the target filesystem other than the Linux kernel and this binary (statically linked). It requires zero external helper utilities (no `iptables`, `nft`, `ip`, `dnsmasq`, `udev`, etc.) and configures itself via kernel command line parameters or automatic interface detection.
 
+> [!NOTE]
+> **Status: Partial.** Core routing, DHCP, DNS, SNTP, NAT, privilege separation, and interface lifecycle are all implemented. Two gaps remain: §2.5 (structured logging — currently raw stdout) is not yet implemented per [`logging_spec.md`](logging_spec.md); and the boot partition mount uses fixed device paths rather than the volume label scan specified in [`partition_layout_spec.md §4.4`](partition_layout_spec.md).
+
 ---
 
 ## 1. System Architecture
-
-The application is designed to run exclusively as the initialization process (PID 1) in a minimalist Linux environment (such as a container or virtual machine). It manages virtual filesystems, signal forwarding, orphan reaping, and launches the asynchronous network controller managing the routing and network services.
 
 ```
              [ Start ]
@@ -34,214 +35,85 @@ The application is designed to run exclusively as the initialization process (PI
 ## 2. Core Requirements
 
 ### 2.1 PID 1 (Init) Responsibilities
-When running as PID 1:
-1. **Virtual Filesystem (VFS) Mounting**:
-   - Mount `/proc` (procfs)
-   - Mount `/sys` (sysfs)
-   - Mount `/dev` (devtmpfs) to access terminal and network devices.
-   - Mount `/run` (tmpfs) for transient runtime state.
-2. **Signal Handling**:
-   - Standard init process signal masking/handling.
-   - Traps system termination and shutdown signals (`SIGINT`, `SIGTERM`, `SIGPWR`).
-   - Upon receiving any of these signals (e.g. from a supervisor request or direct kill), logs a teardown message, waits briefly, and calls `nix::sys::reboot::reboot(RebootMode::RB_POWER_OFF)` to halt the system. Full network and firewall teardown before poweroff is not yet implemented.
-3. **Orphan Reaping**:
-   - Run a non-blocking or asynchronous reaping loop using `waitpid` to prevent zombie processes.
-4. **Configuration Extraction**:
-   - Read and parse `/boot/config/trimrouter.toml` to extract network settings (e.g., `wan_mac = "52:54:00:12:34:56"`, `lan_mac = "52:54:00:12:34:57"`, `lan_ip = "192.168.1.1/24"`).
-   - The `wan_mac` and `lan_mac` parameters are strictly required under the `[network]` section. If either is missing or the configuration file cannot be read, the init process immediately panics (halts). Upon successful extraction, matching interfaces are renamed to the constants `wan` and `lan`.
-5. **Kernel Module Autoloading**:
-   - Probes a set of required kernel modules at startup (`load_required_modules()`) by calling a built-in `modprobe` emulator linked into the same binary.
-   - Listens for `NETLINK_KOBJECT_UEVENT` (uevent) broadcasts from the kernel and automatically loads modules matching the received `modalias` string by resolving dependencies from `modules.dep`.
-   - The binary detects whether it was invoked as `modprobe` (via `argv[0]`) and runs as a drop-in modprobe replacement when called by the kernel, requiring no external `modprobe` binary on the filesystem.
-5. **Panic & Unrecoverable Error Handling**:
-   - Registers a custom panic hook (`std::panic::set_hook`) to intercept Rust panics.
-   - If a panic or unrecoverable error occurs, logs the traceback or error message directly to `stdout`.
-   - Halts the system and hangs indefinitely (sleeps in an infinite loop) rather than rebooting or exiting (exiting would cause an unclean kernel panic), allowing diagnostic inspection of the console state.
-6. **Logging Destination**:
-   - Prints all logs and diagnostics directly to standard output/error (`stdout`/`stderr`). Since the kernel maps the console stream to `/dev/console`, the logs print directly into the host's QEMU monitor/serial console.
-7. **ACPI Power Button Monitor (evdev)**:
-   - Because a minimal initramfs does not run an ACPI daemon (like `acpid`) or a system manager (like `systemd-logind`), the kernel's ACPI poweroff interrupts are not handled by default.
-   - To catch QEMU ACPI `system_powerdown` events, the init process actively monitors input nodes `/dev/input/event0` to `/dev/input/event4` (populated automatically by the kernel via `devtmpfs`).
-   - It utilizes the portable `evdev` crate's asynchronous event stream API to filter for the standard `KEY_POWER` key-down event, triggering a clean system shutdown and hardware power-off.
 
-### 2.2 Routing, Address, & NAT Configuration (Kernel-Space)
+1. **Virtual Filesystem (VFS) Mounting**: Mount `/proc`, `/sys`, `/dev` (devtmpfs), and `/run` (tmpfs). Boot and log partition mounting is specified in [`partition_layout_spec.md`](partition_layout_spec.md).
+2. **Signal Handling**: Traps `SIGINT`, `SIGTERM`, `SIGPWR`. On receipt, logs a teardown message and calls `nix::sys::reboot::reboot(RebootMode::RB_POWER_OFF)` to halt. Full network/firewall teardown before poweroff is not yet implemented.
+3. **Orphan Reaping**: Runs a non-blocking reaping loop using `waitpid` to prevent zombie processes.
+4. **Configuration Extraction**: Reads and parses `/boot/config/trimrouter.toml`. `wan_mac` and `lan_mac` are strictly required — if either is missing or the file cannot be read, PID 1 panics (halts). See §3 for the full configuration schema.
+5. **Kernel Module Autoloading**: Probes required modules at startup via a built-in `modprobe` emulator. Listens for `NETLINK_KOBJECT_UEVENT` broadcasts and loads modules matching received `modalias` strings by resolving `modules.dep`. The binary also acts as a drop-in `modprobe` replacement when invoked as `argv[0] == "modprobe"`.
+6. **Panic Handling**: Registers a custom panic hook via `std::panic::set_hook`. On panic, logs the traceback to stdout and hangs indefinitely (to avoid an unclean kernel panic) rather than exiting.
+7. **ACPI Power Button**: Monitors `/dev/input/event0`–`event4` via the `evdev` crate for `KEY_POWER` key-down events to trigger a clean shutdown, since no `acpid` or `systemd-logind` is present.
 
-`trimrouter` relies entirely on the Linux kernel for IP packet routing, forwarding, and connection tracking (NAT/Masquerade). It configures the kernel programmatically using Netlink sockets, requiring no external file dependencies or helper binaries.
+### 2.2 Routing, Address & NAT Configuration
+
+`trimrouter` configures the kernel entirely via Netlink — no external binaries required.
 
 #### 2.2.1 IP Forwarding
-To allow packets to pass between the interfaces, `trimrouter` enables IPv4 forwarding in the kernel at startup:
-- Writes `"1"` to `/proc/sys/net/ipv4/ip_forward`.
+Writes `"1"` to `/proc/sys/net/ipv4/ip_forward` at startup.
 
 #### 2.2.2 Netlink Interface & Route Management (`NETLINK_ROUTE`)
-Using a routing Netlink socket (the standard `rtnetlink` interface), `trimrouter` performs the following operations asynchronously:
-1. **Loopback Interface (`lo`)**:
-   - Resolves the index of `lo` and sets its link state to `UP` (equivalent to `ip link set lo up`). The IP address `127.0.0.1/8` is automatically assigned to loopback by the kernel.
-2. **LAN Interface Link & Address**:
-   - Sets the LAN interface link state to `UP`.
-   - Clears existing IP addresses on the LAN interface.
-   - Assigns the static IP address (e.g., `192.168.1.1/24`) and adds the subnet route to the routing table.
-3. **WAN Interface Link**:
-   - Sets the WAN interface link state to `UP`.
-4. **Dynamic WAN Routing & Lease Expiry (via DHCP)**:
-   - **Lease Obtained**: When the WAN DHCP client obtains a lease:
-     - Assigns the leased IP address to the WAN interface (e.g., `10.0.2.15/24`).
-     - Adds a default gateway route (`0.0.0.0/0` via the DHCP-provided gateway IP) on the WAN interface.
-     - Automatically updates or replaces the default gateway route if the WAN lease changes.
-   - **Lease Lost / Expired**: If the WAN DHCP client loses its lease or it expires:
-     - Removes the assigned IP address from the WAN interface.
-     - Deletes the default gateway route associated with that lease to prevent routing blackholes.
+
+1. **Loopback (`lo`)**: Brings link `UP`. The kernel assigns `127.0.0.1/8` automatically.
+2. **LAN interface**: Brings link `UP`, clears existing addresses, assigns the static IP (e.g. `192.168.1.1/24`), and adds the subnet route.
+3. **WAN interface**: Brings link `UP`. Address is assigned dynamically by the DHCP client.
+4. **Dynamic WAN routing**:
+   - *Lease obtained*: Assigns the leased IP, adds a default gateway route (`0.0.0.0/0`). Replaces the route if the lease changes.
+   - *Lease lost/expired*: Removes the leased IP and default route to prevent routing blackholes.
 
 #### 2.2.3 Netfilter / nftables NAT Configuration (`NETLINK_NETFILTER`)
-To enable Source NAT (Masquerading), `trimrouter` communicates directly with the kernel's `nf_tables` subsystem over a netfilter Netlink socket. It constructs and sends standard netlink messages to build the following netfilter objects:
-1. **Table**:
-   - Creates a single IPv4 table named `trimrouter` under the `ip` family.
-2. **NAT Configuration (`nat_postrouting` chain)**:
-   - Creates a chain named `nat_postrouting` in the `trimrouter` table.
-   - Configures the chain as a base chain of type `nat`, hooked to `postrouting` (`NF_INET_POST_ROUTING`), priority `100` (`NF_IP_PRI_NAT_SRC`), and default policy `accept`.
-   - **Masquerade Rule**: Appends a rule matching outbound traffic on the WAN interface (e.g., matching the outgoing interface index `oif`) and targets `masquerade`.
-3. **Firewall / Input Filter Configuration (`filter_input` chain)**:
-   - Creates a chain named `filter_input` in the `trimrouter` table.
-   - Configures the chain as a base chain of type `filter`, hooked to `input` (`NF_INET_LOCAL_IN`), priority `0` (`NF_IP_PRI_FILTER`), and default policy `drop` (block all traffic by default).
-   - **Input Rules**:
-     - *Loopback Rule*: Accept all packets where the input interface (`iif`) is `lo`.
-     - *LAN Rule*: Accept all packets where the input interface (`iif`) is the LAN interface (allows LAN clients to access DNS, DHCP, and route packets).
-     - *WAN DHCP Client Rule*: Accept incoming DHCP client replies on the WAN interface (UDP destination port `68`).
-     - *ICMP Rule*: Accept ICMP packets on all interfaces (allows external and internal ping requests).
-     - *Stateful Connection Rule*: Accept packets with connection-tracking state (`ct state`) equal to `established` or `related`. This allows inbound packets that are part of an outbound connection initiated by a LAN client or the router itself.
-     - *Default Fallback*: All other unsolicited inbound packets (including all unsolicited traffic arriving on the WAN interface) are silently dropped.
+
+Creates an IPv4 table named `trimrouter` containing two chains:
+
+**`nat_postrouting`** — type `nat`, hook `postrouting`, priority `100`, policy `accept`:
+- Masquerade rule: matches outbound traffic on the WAN interface (`oif`) and applies `masquerade`.
+
+**`filter_input`** — type `filter`, hook `input`, priority `0`, policy `drop`:
+- Accept `iif == lo`
+- Accept `iif == lan`
+- Accept UDP `dport 68` on WAN (DHCP client replies)
+- Accept ICMP on all interfaces
+- Accept `ct state { established, related }`
+- Drop all other inbound traffic
+
+### 2.3 Network Services
+
+| Service | Spec |
+| :--- | :--- |
+| DHCP Client (WAN) | [`dhcp_client_spec.md`](dhcp_client_spec.md) |
+| DHCP Server (LAN) | [`dhcp_server_spec.md`](dhcp_server_spec.md) |
+| DNS Forwarder | [`dns_forwarder_spec.md`](dns_forwarder_spec.md) |
+| NTP Client (SNTP) | [`sntp_client_spec.md`](sntp_client_spec.md) |
+| Interface Lifecycle | [`interface_di_spec.md`](interface_di_spec.md) |
+
+### 2.4 Privilege Separation
+
+Network-facing services run as unprivileged child processes isolated via chroot, UID/GID dropping, capability clearing, and seccomp-BPF filters. See [`privilege_separation_spec.md`](privilege_separation_spec.md).
+
+### 2.5 Logging
+
+See [`logging_spec.md`](logging_spec.md). Currently unimplemented — PID 1 writes raw lines to stdout.
 
 ---
 
-### 2.3 Network Services (Embedded)
-All network services are implemented directly inside the `trimrouter` binary as concurrent asynchronous tasks. The detailed specification for each service is documented in its respective sub-specification:
+## 3. Configuration
 
-1. **[DHCP Client (WAN)](dhcp_client_spec.md)**: Negotiates dynamic IPv4 address leases, default routes, and DNS resolver configurations on the WAN interface using raw packet sockets (`AF_PACKET`).
-2. **[DHCP Server (LAN)](dhcp_server_spec.md)**: Manages dynamic IP configuration leases, address range validation, and conflict detection for clients on the local network (LAN) interface using raw packet sockets.
-3. **[DNS Forwarder](dns_forwarder_spec.md)**: An embedded UDP-only DNS proxy running on port 53 of the LAN interface that caches records, avoids ephemeral port exhaustion via socket reuse, and blocks cache poisoning spoofing attempts.
-4. **[NTP Client (SNTP)](sntp_client_spec.md)**: Periodically synchronizes the router system clock from time.google.com using the Simple Network Time Protocol (SNTP) and standard system time settings.
+Settings are read from `/boot/config/trimrouter.toml` on the boot partition:
 
-
-### 2.4 System Security & Privilege Separation
-To protect the system from remote code execution vulnerabilities in network packet parsing libraries, the application architecture relies on strict privilege separation:
-*   **[Privilege Separation Spec](privilege_separation_spec.md)**: Details the sandboxing, dynamic user IDs, capabilities dropping, socket passing, and IPC protocol used to isolate untrusted network-facing services from root PID 1 privileges.
-
-
-### 2.5 Logging & Timestamps
-- All standard output and error logs printed by `trimrouter` must include a standardized timestamp prefix with millisecond resolution in UTC format.
-- Format: `[YYYY-MM-DDTHH:MM:SS.mmmZ] [module] message` (e.g. `[2026-07-18T15:18:30.123Z] [init] Mounted /proc successfully.`).
----
-
-## 3. Configuration & Startup Parameters
-
-When running as PID 1, `trimrouter` settings are read from the TOML configuration file `/boot/config/trimrouter.toml` (located on the boot partition).
-
-Example configuration file layout:
 ```toml
 [network]
-# The IP address and mask to assign to the LAN interface
-lan_ip = "192.168.1.1/24"       # (Optional: defaults to "192.168.1.1/24")
-
-# The backup IP address and mask to shift to when a LAN/WAN subnet conflict is detected
-backup_lan_ip = "10.0.0.1/24"   # (Optional: defaults to "10.0.0.1/24")
-
-# The MAC addresses used to identify and map the WAN and LAN interfaces
-wan_mac = "52:54:00:12:34:56"   # (Required: maps WAN interface and renames it to wan)
-lan_mac = "52:54:00:12:34:57"   # (Required: maps LAN interface and renames it to lan)
+wan_mac = "52:54:00:12:34:56"   # Required — maps WAN interface, renames it to "wan"
+lan_mac = "52:54:00:12:34:57"   # Required — maps LAN interface, renames it to "lan"
+lan_ip = "192.168.1.1/24"       # Optional — defaults to "192.168.1.1/24"
+backup_lan_ip = "10.0.0.1/24"   # Optional — defaults to "10.0.0.1/24"
 
 [system]
-# Delay in seconds before auto-rebooting on panic (unset/omitted for infinite hang)
-reboot_delay = 10               # (Optional)
+reboot_delay = 10               # Optional — seconds before reboot on panic (omit for infinite hang)
 ```
 
-The `wan_mac` and `lan_mac` parameters are strictly required under the `[network]` section (with `lan_ip` defaulting to `192.168.1.1/24` and `backup_lan_ip` defaulting to `10.0.0.1/24` if omitted). If they are missing or if `/boot/config/trimrouter.toml` cannot be read, the init process will print a configuration error and panic (halt).
+If `wan_mac` or `lan_mac` is missing, or the file cannot be read, PID 1 prints a configuration error and panics.
 
 ---
 
-## 4. Technical Stack & Dependencies (Rust)
+## 4. Compilation
 
-- **Asynchronous Runtime**: `tokio` (multi-threaded executor, `features = ["full"]`).
-- **System Calls & Signals**: `nix` (using features `mount`, `signal`, `process`, `reboot`, `kmod`, `time`, `user`).
-- **Netlink / Routing**: `rtnetlink` (to manage link states, addresses, and route tables).
-- **Netlink Firewall**: `rustables` — a pure-Rust nftables builder/sender crate that communicates directly with the kernel's `nf_tables` subsystem over Netlink without FFI/C dependencies.
-- **Kernel Module Loading**: Built-in `modprobe` emulator using the `nix` `kmod` feature and a `NETLINK_KOBJECT_UEVENT` listener for dynamic module autoloading.
-- **DHCP Client & Server**: Raw packet sockets (`AF_PACKET` / `SOCK_RAW`) with a pure-Rust DHCP packet parser/builder.
-- **DNS Resolver/Proxy**: Custom minimal UDP proxy forwarding to parsed WAN DNS addresses.
-- **Configuration Parsing**: `toml` and `serde` (with `derive` feature) for type-safe TOML configuration deserialization.
-
----
-
-## 5. Compilation & Initramfs Packaging
-
-Since `trimrouter` runs in an environment with no other files, it must be compiled as a fully static binary.
-
-### 5.1 Static Compilation
-To ensure the binary does not depend on a dynamic interpreter (`ld-linux.so`) or host libraries (like `libc.so`, `libnftnl.so`, etc.), it must be compiled against the `musl` libc target:
-```bash
-# Install the MUSL target
-rustup target add x86_64-unknown-linux-musl
-
-# Build the static release binary
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-Verify that the binary is statically linked:
-```bash
-file target/x86_64-unknown-linux-musl/release/trimrouter
-# Expected output contains: statically linked
-
-ldd target/x86_64-unknown-linux-musl/release/trimrouter
-# Expected output: not a dynamic executable
-```
-
-### 5.2 QEMU-Based Testing & Verification Plan
-
-To verify `trimrouter`'s behavior as a real PID 1 init process, we boot it in QEMU alongside a second client VM connected over a virtual socket link.
-
-#### 5.2.1 Initramfs & VM Image Creation
-The build pipeline (`make` or `make test`) automatically:
-1. Calls `scripts/build_initramfs.sh` to construct the initramfs archive at `target/x86_64/initramfs.cpio.gz` including the statically linked `trimrouter` binary (mapped to `/init`) and required Linux kernel modules.
-2. Calls `scripts/build_image.sh` to package the kernel (`vmlinuz`), the initramfs (`initramfs.cpio.gz`), and a `cmdline.txt` parameter file into a partitioned, bootable FAT32 raw disk image file.
-   - **Configuration Override**: The output image (`target/<arch>/trimrouter.img`) depends directly on the configuration file path configured via the `TRIMROUTER_CONFIG` environment/command-line variable (default: `config/trimrouter.toml`). Modifying the configuration file or changing the path target triggers an automatic rebuild of the disk image without requiring a `make clean`.
-   - **Test Isolation**: Integration tests compile and run using a dedicated `target/<arch>/trimrouter-test.img` image that always packages the default `config/trimrouter.toml` settings, ensuring that user overrides do not impact test verification.
-
-On boot, `trimrouter` (as PID 1) will:
-1. Mount virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`).
-2. Synchronously load essential kernel drivers (including `virtio_blk`, `fat`, `vfat`, and NLS charsets).
-3. Identify and mount the primary boot partition of the disk image (e.g., `/dev/vda1`, `/dev/mmcblk0p1`) as **read-only** to `/boot`.
-4. Proceed to load configuration parameters and configure the network.
-
-#### 5.2.2 Running the Router VM
-We boot the router VM with the partitioned raw disk image attached as a VirtIO storage drive along with two virtual network interfaces:
-*   **eth0 (WAN)**: Connected to QEMU's User Network (which runs a built-in DHCP server providing IP addresses in the `10.0.2.0/24` range and NATting traffic to the host's internet).
-*   **eth1 (LAN)**: Connected to a local TCP socket listener (`127.0.0.1:1234`) acting as a virtual switch.
-
-```bash
-qemu-system-x86_64 \
-  -kernel /path/to/vmlinuz \
-  -initrd initramfs.cpio.gz \
-  -append "console=ttyS0 trimrouter.lan_ip=192.168.1.1/24 trimrouter.wan_mac=52:54:00:12:34:56 trimrouter.lan_mac=52:54:00:12:34:57" \
-  -drive file=target/x86_64/trimrouter.img,format=raw,media=disk,if=virtio \
-  -netdev user,id=wan0,net=10.0.2.0/24 \
-  -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
-  -netdev socket,id=lan0,listen=127.0.0.1:1234 \
-  -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
-  -nographic
-```
-
-#### 5.2.3 Running the Client VM
-To verify IP allocation, routing, and DNS resolution, boot a standard Linux distribution (e.g. Alpine) in a separate QEMU VM connected to the same socket switch:
-
-```bash
-qemu-system-x86_64 \
-  -kernel /path/to/vmlinuz-client \
-  -initrd /path/to/initramfs-client.img \
-  -netdev socket,id=lan_cli,connect=127.0.0.1:1234 \
-  -device virtio-net-pci,netdev=lan_cli,mac=52:54:00:12:34:58 \
-  -nographic
-```
-
-Once booted, the client VM will:
-1. Run a standard DHCP client on its interface, which receives an IP address (e.g. `192.168.1.100`), default gateway (`192.168.1.1`), and DNS resolver (`192.168.1.1`) from `trimrouter`'s server.
-2. Direct DNS queries to `192.168.1.1` (forwarded to the upstream gateway `10.0.2.2` by `trimrouter`).
-3. Send ICMP packets or TCP streams out to the Internet, which the kernel of `trimrouter` NATs and forwards through `wan`.
-
+The binary must be compiled as a fully static MUSL target. See the README for build and test instructions.

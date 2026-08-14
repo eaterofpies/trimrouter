@@ -88,7 +88,37 @@ make qemu
 ## Raspberry Pi Image Pipeline
 
 `trimrouter` includes a fully unprivileged pipeline to build bootable raw FAT32 SD card images for Raspberry Pi hardware (Pi Zero through Pi 4, including Compute Modules):
+
 ```bash
 make image-<arch>   # e.g. make image-arm64, make image-armhf
 ```
-This outputs a bootable flash image at `target/<arch>/trimrouter.img`. For full instructions on hardware deployment and ARM emulation testing, refer to the [specs/sd_card_image_spec.md](specs/sd_card_image_spec.md) document.
+
+This outputs a bootable flash image at `target/<arch>/trimrouter.img`.
+
+### Flash to Hardware
+
+```bash
+sudo dd if=target/arm64/trimrouter.img of=/dev/sdX bs=4M status=progress conv=fsync
+```
+
+*(Replace `/dev/sdX` with the target block device. The log partition is created automatically on first boot.)*
+
+### Test with QEMU (ARM64)
+
+Boot using QEMU's generic `virt` machine for full virtio network support:
+
+```bash
+qemu-system-aarch64 \
+    -M virt \
+    -cpu cortex-a53 \
+    -m 1024 \
+    -kernel target/arm64/pi_boot/kernel8.img \
+    -initrd target/arm64/pi_initramfs.cpio.gz \
+    -drive file=target/arm64/trimrouter.img,format=raw,media=disk,if=virtio \
+    -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
+    -netdev user,id=wan0 \
+    -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
+    -netdev user,id=lan0 \
+    -append "console=ttyAMA0 root=/dev/ram0 rdinit=/init quiet" \
+    -nographic
+```

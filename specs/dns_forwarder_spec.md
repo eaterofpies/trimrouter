@@ -2,6 +2,9 @@
 
 The DNS Forwarder is a local DNS proxy service in `trimrouter` that resolves DNS queries for LAN clients by forwarding them to upstream DNS resolvers, caching responses, and defending against cache poisoning and port exhaustion.
 
+> [!NOTE]
+> **Status: Implemented.**
+
 ---
 
 ## 1. Network & Socket Architecture

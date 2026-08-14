@@ -2,6 +2,9 @@
 
 This specification details the architecture for unifying WAN and LAN interface lifecycles. Instead of separate event loops, watchdogs, and hardcoded service initializations, both interfaces will be managed by a common runtime component that dynamically spawns, monitors, and deletes relevant service containers depending on interface presence.
 
+> [!NOTE]
+> **Status: Implemented.**
+
 ---
 ## 1. Architectural Overview
 

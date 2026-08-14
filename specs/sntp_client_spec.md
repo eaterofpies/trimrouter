@@ -2,6 +2,9 @@
 
 The SNTP Client is an embedded service in `trimrouter` that periodically synchronizes the system clock with `time.google.com` using the Simple Network Time Protocol (SNTP).
 
+> [!NOTE]
+> **Status: Implemented.**
+
 ---
 
 ## 1. Lifecycle and Dependencies
