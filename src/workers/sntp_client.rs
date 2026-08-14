@@ -1,5 +1,7 @@
 use crate::managers::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
-use crate::managers::utils::{drop_privileges, resolve_dns_a_record, wait_shutdown};
+use crate::managers::utils::{
+    SNTP_GID, SNTP_UID, drop_privileges, resolve_dns_a_record, wait_shutdown,
+};
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,9 +26,10 @@ pub async fn run_sntp_client_worker(ipc_fd: RawFd) -> Result<(), std::io::Error>
     let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
 
     // Drop privileges
-    drop_privileges().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    drop_privileges(SNTP_UID, SNTP_GID)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     println!(
-        "[sntp-client-worker] Privileges dropped successfully (running as nobody inside chroot jail)."
+        "[sntp-client-worker] Privileges dropped successfully (running as sntp inside chroot jail)."
     );
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);

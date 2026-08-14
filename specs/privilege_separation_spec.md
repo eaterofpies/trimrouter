@@ -31,7 +31,7 @@ Currently, `trimrouter` runs as the initialization process (PID 1) entirely as t
                  /        /               \        \
                /        /                   \        \
   [ dhcp-client ]  [ dhcp-server ]  [ dns-forwarder ]  [ sntp-client ]
-     (nobody)         (nobody)          (nobody)         (nobody)
+   (UID 10002)      (UID 10003)       (UID 10004)      (UID 10001)
 ```
 
 ### 2.1 The Privileged Parent (PID 1 Manager)
@@ -50,10 +50,10 @@ Every service is spawned as a child process of the parent. The child drops privi
 
 | Worker Service | Target User/Group | Required Socket FDs | Required Capabilities | Sandboxing Mechanics |
 | :--- | :--- | :--- | :--- | :--- |
-| **DHCP Client** | `nobody` (65534) | Passed `AF_PACKET` socket | None | User Namespace, chroot, Seccomp |
-| **DHCP Server** | `nobody` (65534) | Passed `AF_PACKET` socket | None | User Namespace, chroot, Seccomp |
-| **DNS Forwarder** | `nobody` (65534) | Passed `AF_INET` UDP port 53 socket | None | User Namespace, chroot, Seccomp |
-| **SNTP Client** | `nobody` (65534) | Passed `AF_INET` UDP socket | None | User Namespace, chroot, Seccomp |
+| **DHCP Client** | `dhcp-client` (10002) | Passed `AF_PACKET` socket | None | User Namespace, chroot, Seccomp |
+| **DHCP Server** | `dhcp-server` (10003) | Passed `AF_PACKET` socket | None | User Namespace, chroot, Seccomp |
+| **DNS Forwarder** | `dns-forwarder` (10004) | Passed `AF_INET` UDP port 53 socket | None | User Namespace, chroot, Seccomp |
+| **SNTP Client** | `sntp` (10001) | Passed `AF_INET` UDP socket | None | User Namespace, chroot, Seccomp |
 
 ---
 
@@ -78,7 +78,7 @@ Opening raw/privileged sockets in the parent *before* spawning the child and dro
 ### 3.2 Programmatic Privilege Reduction
 Each worker drops privileges using the following sequence:
 1.  **Chroot**: Calls `chroot("/run/empty")` (a directory created by PID 1 on a `tmpfs` mount, owned by `root:root` with strict read-only `0555` permissions) and `chdir("/")` to lock the worker in an empty, non-writable root directory.
-2.  **User Namespace & ID Shift**: Shifts the process's effective UID and GID to `65534` (`nobody`).
+2.  **User Namespace & ID Shift**: Shifts the process's effective UID and GID to its designated unique system user/group (e.g., `10001` for `sntp`).
 3.  **Capability Dropping**: Drops all capabilities from the bounding, effective, and permitted sets completely.
 4.  **Seccomp Syscall Whitelisting**: Installs a strict Seccomp-BPF filter allowing only required system calls (e.g., `read`, `write`, `recvmsg`, `sendmsg`, `epoll_wait`, `nanosleep`, `exit`).
 

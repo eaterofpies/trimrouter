@@ -1,5 +1,7 @@
 use crate::managers::ipc::{DnsParentToWorkerMsg, recv_msg};
-use crate::managers::utils::{drop_privileges, wait_shutdown};
+use crate::managers::utils::{
+    DNS_FORWARDER_GID, DNS_FORWARDER_UID, drop_privileges, wait_shutdown,
+};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
@@ -65,9 +67,10 @@ pub async fn run_dns_forwarder_worker(
     let (ipc_reader, _ipc_writer) = ipc_stream.into_split();
 
     // Drop privileges
-    drop_privileges().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    drop_privileges(DNS_FORWARDER_UID, DNS_FORWARDER_GID)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     println!(
-        "[dns-forwarder-worker] Privileges dropped successfully (running as nobody inside chroot jail)."
+        "[dns-forwarder-worker] Privileges dropped successfully (running as dns-forwarder inside chroot jail)."
     );
 
     let dns_socket = Arc::new(dns_socket);

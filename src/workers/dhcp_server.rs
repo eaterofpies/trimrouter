@@ -1,7 +1,7 @@
 use crate::managers::ipc::{DhcpServerParentToWorkerMsg, recv_msg};
 use crate::managers::utils::{
-    drop_privileges, get_interface_mac, parse_dhcp_payload, read_raw_packet, send_raw_packet,
-    wait_shutdown,
+    DHCP_SERVER_GID, DHCP_SERVER_UID, drop_privileges, get_interface_mac, parse_dhcp_payload,
+    read_raw_packet, send_raw_packet, wait_shutdown,
 };
 use crate::packet::build_raw_packet;
 use pnet::packet::ethernet::EthernetPacket;
@@ -211,7 +211,7 @@ pub async fn run_dhcp_server_worker(
         );
     }
 
-    if let Err(e) = drop_privileges() {
+    if let Err(e) = drop_privileges(DHCP_SERVER_UID, DHCP_SERVER_GID) {
         eprintln!(
             "[dhcp-server-worker] FATAL: Failed to drop privileges: {}",
             e
@@ -219,7 +219,7 @@ pub async fn run_dhcp_server_worker(
         std::process::exit(1);
     }
     println!(
-        "[dhcp-server-worker] Privileges dropped successfully (running as nobody inside chroot jail)."
+        "[dhcp-server-worker] Privileges dropped successfully (running as dhcp-server inside chroot jail)."
     );
 
     let mac = get_interface_mac(&lan_interface)

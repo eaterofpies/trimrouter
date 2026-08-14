@@ -11,6 +11,16 @@ pub const NOBODY_GID: u32 = 65534;
 pub const SELF_EXE_PATH: &str = "/proc/self/exe";
 pub const ROUTER_BINARY_PATH: &str = "/bin/trimrouter";
 
+// Unique isolated service UID/GID configurations
+pub const SNTP_UID: u32 = 10001;
+pub const SNTP_GID: u32 = 10001;
+pub const DHCP_CLIENT_UID: u32 = 10002;
+pub const DHCP_CLIENT_GID: u32 = 10002;
+pub const DHCP_SERVER_UID: u32 = 10003;
+pub const DHCP_SERVER_GID: u32 = 10003;
+pub const DNS_FORWARDER_UID: u32 = 10004;
+pub const DNS_FORWARDER_GID: u32 = 10004;
+
 // =========================================================================
 // Shared WAN Lease Info
 // =========================================================================
@@ -532,7 +542,7 @@ pub fn apply_seccomp() -> Result<(), std::io::Error> {
     Ok(())
 }
 
-pub fn drop_privileges() -> Result<(), std::io::Error> {
+pub fn drop_privileges(uid: u32, gid: u32) -> Result<(), std::io::Error> {
     use nix::unistd::{Gid, Uid, setgid, setuid};
 
     std::fs::create_dir_all(CHROOT_JAIL_PATH)?;
@@ -556,9 +566,9 @@ pub fn drop_privileges() -> Result<(), std::io::Error> {
 
     caps::clear(None, caps::CapSet::Bounding).map_err(std::io::Error::other)?;
 
-    setgid(Gid::from_raw(NOBODY_GID)).map_err(std::io::Error::other)?;
+    setgid(Gid::from_raw(gid)).map_err(std::io::Error::other)?;
 
-    setuid(Uid::from_raw(NOBODY_UID)).map_err(std::io::Error::other)?;
+    setuid(Uid::from_raw(uid)).map_err(std::io::Error::other)?;
 
     caps::clear(None, caps::CapSet::Inheritable).map_err(std::io::Error::other)?;
     caps::clear(None, caps::CapSet::Effective).map_err(std::io::Error::other)?;

@@ -1,8 +1,9 @@
 use crate::managers::dhcp_client::{configure_wan, deconfigure_wan};
 use crate::managers::ipc::{DhcpClientToParentMsg, send_msg};
 use crate::managers::utils::{
-    CleanOption, RawPacketSocket, SharedWanLease, WanLease, drop_privileges, get_interface_mac,
-    mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload, wait_shutdown,
+    CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, SharedWanLease, WanLease,
+    drop_privileges, get_interface_mac, mask_to_prefix_len as utils_mask_to_prefix_len,
+    parse_dhcp_payload, wait_shutdown,
 };
 use crate::packet::build_raw_packet;
 use pnet::util::MacAddr;
@@ -600,7 +601,7 @@ pub async fn run_dhcp_client_worker(
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
     let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
 
-    if let Err(e) = drop_privileges() {
+    if let Err(e) = drop_privileges(DHCP_CLIENT_UID, DHCP_CLIENT_GID) {
         eprintln!(
             "[dhcp-client-worker] FATAL: Failed to drop privileges: {}",
             e
@@ -608,7 +609,7 @@ pub async fn run_dhcp_client_worker(
         std::process::exit(1);
     }
     println!(
-        "[dhcp-client-worker] Privileges dropped successfully (running as nobody inside chroot jail)."
+        "[dhcp-client-worker] Privileges dropped successfully (running as dhcp-client inside chroot jail)."
     );
 
     let dummy_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
