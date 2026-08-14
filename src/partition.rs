@@ -12,19 +12,7 @@ const BOOT_MOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 // MBR Layout Constants
 const MBR_SECTOR_SIZE: usize = 512;
-const MBR_SIGNATURE_OFFSET: usize = 510;
-const MBR_BOOT_SIG_1: u8 = 0x55;
-const MBR_BOOT_SIG_2: u8 = 0xAA;
-const MBR_PART2_ENTRY_OFFSET: usize = 462;
-const MBR_PART2_ENTRY_SIZE: usize = 16;
 const MBR_PART_TYPE_FAT32_LBA: u8 = 0x0C;
-const MBR_PART_OFFSET_SYS_TYPE: usize = 4;
-const MBR_PART_OFFSET_START_LBA: usize = 8;
-const MBR_PART_OFFSET_SECTORS: usize = 12;
-
-// FAT32 BPB detection constants
-const FAT32_VOL_LABEL_OFFSET: usize = 71;
-const FAT32_VOL_LABEL_LEN: usize = 11;
 
 // Device node polling constants
 const DEV_NODE_POLL_RETRIES: u32 = 50;
@@ -78,7 +66,7 @@ fn write_mbr_partition_2(parent_disk: &str) -> Result<(), RouterError> {
     }
     let p2_sectors = disk_sectors - START_SECTOR;
 
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom};
     let mut disk_file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -90,33 +78,25 @@ fn write_mbr_partition_2(parent_disk: &str) -> Result<(), RouterError> {
             ))
         })?;
 
-    let mut mbr = [0u8; MBR_SECTOR_SIZE];
-    disk_file
-        .read_exact(&mut mbr)
-        .map_err(|e| RouterError::Generic(format!("Failed to read MBR: {}", e)))?;
+    let mut mbr = mbrman::MBR::read_from(&mut disk_file, MBR_SECTOR_SIZE as u32)
+        .map_err(|e| RouterError::Generic(format!("Failed to read MBR: {:?}", e)))?;
 
-    if mbr[MBR_SIGNATURE_OFFSET] != MBR_BOOT_SIG_1
-        || mbr[MBR_SIGNATURE_OFFSET + 1] != MBR_BOOT_SIG_2
-    {
-        return Err(RouterError::Generic(
-            "Invalid MBR boot signature".to_string(),
-        ));
-    }
-
-    let entry = &mut mbr[MBR_PART2_ENTRY_OFFSET..MBR_PART2_ENTRY_OFFSET + MBR_PART2_ENTRY_SIZE];
-    entry.fill(0);
-    entry[MBR_PART_OFFSET_SYS_TYPE] = MBR_PART_TYPE_FAT32_LBA;
-    entry[MBR_PART_OFFSET_START_LBA..MBR_PART_OFFSET_START_LBA + 4]
-        .copy_from_slice(&(START_SECTOR as u32).to_le_bytes());
-    entry[MBR_PART_OFFSET_SECTORS..MBR_PART_OFFSET_SECTORS + 4]
-        .copy_from_slice(&(p2_sectors.min(u32::MAX as u64) as u32).to_le_bytes());
+    mbr[2] = mbrman::MBRPartitionEntry {
+        boot: mbrman::BOOT_INACTIVE,
+        first_chs: mbrman::CHS::empty(),
+        sys: MBR_PART_TYPE_FAT32_LBA,
+        last_chs: mbrman::CHS::empty(),
+        starting_lba: START_SECTOR as u32,
+        sectors: p2_sectors.min(u32::MAX as u64) as u32,
+    };
 
     disk_file
         .seek(SeekFrom::Start(0))
         .map_err(|e| RouterError::Generic(format!("Failed to seek MBR: {}", e)))?;
-    disk_file
-        .write_all(&mbr)
-        .map_err(|e| RouterError::Generic(format!("Failed to write MBR: {}", e)))?;
+
+    mbr.write_into(&mut disk_file)
+        .map_err(|e| RouterError::Generic(format!("Failed to write MBR: {:?}", e)))?;
+
     disk_file
         .sync_all()
         .map_err(|e| RouterError::Generic(format!("Failed to flush MBR: {}", e)))?;
@@ -178,26 +158,13 @@ fn check_partition_entry(entry: fs::DirEntry) -> Result<Option<(String, String)>
         Err(_) => return Ok(None),
     };
 
-    let mut boot_sector = [0u8; MBR_SECTOR_SIZE];
-    use std::io::Read;
-    if file.read_exact(&mut boot_sector).is_err() {
-        return Ok(None);
-    }
-
-    if boot_sector[MBR_SIGNATURE_OFFSET] != MBR_BOOT_SIG_1
-        || boot_sector[MBR_SIGNATURE_OFFSET + 1] != MBR_BOOT_SIG_2
-    {
-        return Ok(None);
-    }
-
-    let label_offset = FAT32_VOL_LABEL_OFFSET;
-    let label = &boot_sector[label_offset..label_offset + FAT32_VOL_LABEL_LEN];
-    let label_str = match std::str::from_utf8(label) {
-        Ok(s) => s.trim(),
+    let fs = match fatfs::FileSystem::new(&mut file, fatfs::FsOptions::new()) {
+        Ok(fs) => fs,
         Err(_) => return Ok(None),
     };
 
-    if label_str != "TRIMROUTER" {
+    let label = fs.volume_label();
+    if label.trim() != "TRIMROUTER" {
         return Ok(None);
     }
 

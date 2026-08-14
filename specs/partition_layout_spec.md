@@ -161,11 +161,10 @@ Baked-in device paths (e.g. `/dev/mmcblk0p1`) are not used because the kernel na
 
 At build time, the boot partition is stamped with the fixed FAT32 volume label `TRIMROUTER` (see §2). At runtime, PID 1 identifies the boot partition by:
 
-1. **Enumerate block devices**: Read `/sys/block/` to list every block device and its partitions.
-2. **Read raw boot sector**: Open each partition device and read the first 512 bytes without mounting it.
-3. **Verify FAT32 signature**: Check that bytes 510–511 equal `0x55 0xAA`. Skip any partition that does not match.
-4. **Match volume label**: Read bytes 71–81 of the boot sector (the FAT32 BPB volume label field). If the trimmed value equals `TRIMROUTER`, this is the boot partition.
-5. **Identify parent disk**: Record the parent disk of the matched partition (e.g. `/dev/mmcblk0` for `/dev/mmcblk0p1`). The log partition device node (`p2`) is derived from this disk after first-boot creation in §5.
+1. **Enumerate block devices**: Read `/sys/class/block/` to list every block device and its partitions.
+2. **Attempt FAT32 parse**: Open each partition device and use the `fatfs` crate to parse it as a FAT filesystem. Any partition that is not a valid FAT volume is skipped.
+3. **Match volume label**: Read the FAT32 volume label via `fs.volume_label()`. If the trimmed value equals `TRIMROUTER`, this is the boot partition.
+4. **Identify parent disk**: Record the parent disk of the matched partition (e.g. `/dev/mmcblk0` for `/dev/mmcblk0p1`). The log partition device node (`p2`) is derived from this disk after first-boot creation in §5.
 
 The scan iterates all partitions and accepts the first match.
 
@@ -214,8 +213,8 @@ The creation step runs when partition 2 does **not** exist on the parent disk id
 
 The creation sequence executes synchronously, after the boot partition is mounted but before any services start:
 
-1. **Write MBR partition 2 entry**: Rewrite the MBR at a known byte offset in the first sector to add a new primary FAT32 partition starting at sector `247808` (121 MiB ÷ 512 bytes/sector) and extending to the last usable sector of the disk. Issue `BLKRRPART` to instruct the kernel to re-read the updated partition table.
-2. **Format as FAT32**: Format the new partition as FAT32 in-place — equivalent to `mformat`. The partition is created at its full final size so no later resize step is ever needed.
+1. **Write MBR partition 2 entry**: Use the `mbrman` crate to parse the existing MBR, insert a new FAT32 LBA partition entry (`type 0x0C`) starting at sector `247808` (121 MiB ÷ 512 bytes/sector) and extending to the last usable sector of the disk. Write the updated MBR back to disk and issue `BLKRRPART` to instruct the kernel to re-read the updated partition table.
+2. **Format as FAT32**: Attempt to mount the partition. If the mount fails (e.g. `EINVAL` on an unformatted device), format it as FAT32 using the `fatfs` crate, then retry the mount. The partition is created at its full final size so no later resize step is ever needed.
 3. **Mount**: Mount the newly formatted partition read-write at `/var/log`.
 
 > [!IMPORTANT]
@@ -223,10 +222,11 @@ The creation sequence executes synchronously, after the boot partition is mounte
 
 ### 5.3 Implementation Note
 
-The implementation details are deferred. The spec establishes the **contract**:
-- The partition-existence check ensures idempotency with no additional state.
+The implementation uses the `mbrman` crate for structured MBR read/write and the `fatfs` crate for both volume label scanning and log partition formatting. The contract upheld:
+- The partition-existence check (`/sys/class/block/<name>`) ensures idempotency with no additional state.
+- The mount-first approach eliminates unnecessary formatting on subsequent boots.
 - The FAT32 format creates the filesystem at full drive capacity in one step — no in-place resize is ever required.
-- The operation must not corrupt or modify partition 1 (the boot partition) in any way.
+- The MBR is written before `/dev/vda1` is mounted so `BLKRRPART` succeeds (the kernel rejects partition table rereads if any partition on the disk is mounted).
 
 ---
 
