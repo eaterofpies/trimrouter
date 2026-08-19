@@ -437,9 +437,7 @@ impl DhcpClientInternal {
                 dns_servers: dns_servers.to_vec(),
             };
             let mut writer = writer_mutex.lock().await;
-            send_msg(&mut *writer, &msg)
-                .await
-                .map_err(|e| DhcpError::Io(e))?;
+            send_msg(&mut *writer, &msg).await.map_err(DhcpError::Io)?;
             Ok(())
         } else {
             let changed = {
@@ -590,7 +588,7 @@ pub async fn run_dhcp_client_worker(
     let mac = match get_interface_mac(&wan_interface).await {
         Ok(m) => m,
         Err(e) => {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+            return Err(std::io::Error::other(e));
         }
     };
     let client_socket = DhcpClientSocket::from_raw_socket(socket, mac);

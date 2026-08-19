@@ -72,6 +72,9 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
             panic!("FATAL: Failed to mount boot partition: {}", e);
         }
 
+        // Make full module tree available via EROFS mount
+        kmod::activate_boot_modules();
+
         if let Err(e) = setup_log_partition(sys.as_ref(), &boot_dev, &parent_disk) {
             println!("[init] WARNING: Failed to setup log partition: {}", e);
         }

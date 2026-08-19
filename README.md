@@ -36,15 +36,15 @@ You need a Rust toolchain and the target `x86_64-unknown-linux-musl` installed:
 ```bash
 rustup target add x86_64-unknown-linux-musl
 ```
-You will also need `cpio`, `qemu-system-x86_64`, `parted`, `mtools`, and standard build utilities (`make`, `gcc`).
+You will also need `cpio`, `qemu-system-x86_64`, `parted`, `mtools`, `binutils`, `systemd-boot-efi`, `ovmf`, `erofs-utils` (for `mkfs.erofs`), and `make`.
 
 ### Building and Packaging
 
-Compile the static release binary, package it into a compressed `cpio` initramfs archive, and wrap it into a bootable FAT32 VM disk image:
+Compile the static release binary, package it into a compressed `cpio` initramfs archive, and wrap it into a bootable UEFI VM disk image:
 ```bash
 make
 ```
-This generates the bootable raw VM disk image at `target/x86_64/trimrouter.img` (which bundles the kernel `vmlinuz` and `initramfs.cpio.gz` containing the statically linked `trimrouter` binary mapped to `/init` and required Linux kernel modules).
+This generates the bootable raw VM disk image at `target/x86_64/trimrouter.img` (which bundles the Unified Kernel Image `EFI/BOOT/BOOTX64.EFI` containing the kernel, initramfs, and `trimrouter` binary, plus the full kernel module tree in `modules.erofs`).
 
 #### Custom Configuration Override
 Build the image with a custom configuration:

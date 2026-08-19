@@ -78,6 +78,9 @@ async fn main() {
             std::process::exit(1);
         }
 
+        // Activate EROFS module tree and trigger delayed coldplug discovery
+        trimrouter::kmod::activate_boot_modules();
+
         if let Err(e) = setup_log_partition(sys.as_ref(), &boot_dev, &parent_disk) {
             std::eprintln!("[test] FATAL: Failed to setup log partition: {}", e);
             std::process::exit(1);

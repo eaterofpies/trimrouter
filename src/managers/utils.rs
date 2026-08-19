@@ -529,15 +529,12 @@ pub fn apply_seccomp() -> Result<(), std::io::Error> {
         SeccompAction::Allow, // match allows syscall
         std::env::consts::ARCH
             .try_into()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+            .map_err(std::io::Error::other)?,
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    .map_err(std::io::Error::other)?;
 
-    let prog: BpfProgram = filter
-        .try_into()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    seccompiler::apply_filter(&prog)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let prog: BpfProgram = filter.try_into().map_err(std::io::Error::other)?;
+    seccompiler::apply_filter(&prog).map_err(std::io::Error::other)?;
 
     Ok(())
 }

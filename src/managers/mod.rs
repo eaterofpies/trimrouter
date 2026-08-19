@@ -248,6 +248,7 @@ impl ExternalWorker {
         };
 
         let mut cmd = Command::new(binary_path);
+        cmd.arg0("trimrouter");
         cmd.arg("worker");
         cmd.arg(service_name);
         for arg in args {

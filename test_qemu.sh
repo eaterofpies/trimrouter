@@ -24,11 +24,20 @@ echo "Press Ctrl+A then X to exit QEMU"
 echo "===================================================="
 
 if [ "$ARCH" = "x86_64" ]; then
+    OVMF=""
+    for candidate in /usr/share/OVMF/OVMF.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do
+        if [ -f "$candidate" ]; then
+            OVMF="$candidate"
+            break
+        fi
+    done
+    if [ -z "$OVMF" ]; then
+        echo "[qemu] ERROR: OVMF UEFI firmware not found. Install ovmf: sudo apt-get install -y ovmf"
+        exit 1
+    fi
     exec qemu-system-x86_64 \
       -m 256 \
-      -kernel "$KERNEL" \
-      -initrd "$INITRAMFS" \
-      -append "console=ttyS0 quiet panic=-1 net.ifnames=0" \
+      -bios "$OVMF" \
       -drive file="$IMAGE",format=raw,media=disk,if=virtio \
       -netdev user,id=wan0,net=10.0.2.0/24 \
       -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \

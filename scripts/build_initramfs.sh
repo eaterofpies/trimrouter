@@ -33,7 +33,7 @@ STAGING="target/${ARCH}/staging"
 TEST_BOOT="target/${ARCH}/test_boot"
 BINARY="target/${RUST_TARGET}/release/trimrouter"
 TEST_BINARY="target/${RUST_TARGET}/release/integration_test"
-DIRECT_DEPS="virtio_net virtio_pci virtio_mmio virtio_blk usb_storage uas sd_mod mmc_block sdhci sdhci_pci ahci nft_masq nft_chain_nat nft_ct fat vfat nls_cp437 nls_ascii nls_utf8"
+DIRECT_DEPS="virtio_net virtio_pci virtio_mmio virtio_blk usb_storage uas sd_mod mmc_block sdhci sdhci_pci ahci nvme erofs nft_masq nft_chain_nat nft_ct fat vfat nls_cp437 nls_ascii nls_utf8"
 
 echo "[build] Creating initramfs staging area for ${ARCH} (mode: ${MODE})..."
 rm -rf "$STAGING"
@@ -47,7 +47,8 @@ if [ "$MODE" = "test" ]; then
 else
     echo "[build] Copying production trimrouter as /init..."
     cp "$BINARY" "$STAGING/init"
-    chmod +x "$STAGING/init"
+    cp "$BINARY" "$STAGING/bin/trimrouter"
+    chmod +x "$STAGING/init" "$STAGING/bin/trimrouter"
 fi
 
 mknod -m 600 "$STAGING/dev/console" c 5 1 2>/dev/null || true

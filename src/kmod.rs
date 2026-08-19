@@ -1,3 +1,4 @@
+use nix::mount::MsFlags;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -281,16 +282,71 @@ pub fn load_module_with_dependencies(mod_name: &str) {
     }
 }
 
+type ModuleAlias = (Vec<char>, String);
+type AliasCache = Option<Vec<ModuleAlias>>;
+
+static ALIAS_CACHE: OnceLock<Mutex<AliasCache>> = OnceLock::new();
+
+fn get_alias_cache() -> &'static Mutex<AliasCache> {
+    ALIAS_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+pub fn invalidate_alias_cache() {
+    if let Ok(mut guard) = get_alias_cache().lock() {
+        *guard = None;
+    }
+}
+
+pub fn activate_boot_modules() {
+    let kdir = get_kernel_release();
+    if kdir.is_empty() {
+        eprintln!("[init] Skipping boot module activation: unknown kernel release");
+        return;
+    }
+    let boot_img = Path::new("/boot/modules.erofs");
+    let lib_mods = Path::new("/lib/modules");
+    if !boot_img.exists() {
+        eprintln!(
+            "[init] No module image {} found on boot partition",
+            boot_img.display()
+        );
+        return;
+    }
+
+    load_module_with_dependencies("erofs");
+
+    if let Err(e) = nix::mount::mount(
+        Some(boot_img),
+        lib_mods,
+        Some("erofs"),
+        MsFlags::MS_RDONLY,
+        None::<&Path>,
+    ) {
+        eprintln!("[init] WARNING: failed to mount EROFS module image: {}", e);
+        return;
+    }
+
+    println!(
+        "[init] Mounted {} over /lib/modules (full module set)",
+        boot_img.display()
+    );
+    invalidate_alias_cache();
+    trigger_uevents();
+}
+
 pub fn load_required_modules() {
     let kdir = get_kernel_release();
-    // Only load essential modules needed during early boot:
-    // - virtio_net/pci/mmio: Essential for device discovery; explicit loading prevents race conditions
-    //   where network configuration runs before the virtual interfaces have finished registering.
-    // - nft_chain_nat & nft_ct: Kernel netlink API does not trigger modprobe autoloading for NAT base
-    //   chains or connection tracking state hooks. They must be loaded beforehand.
+    // Only load essential modules needed during early boot to discover and mount /boot:
     let modules = [
         "virtio_pci",
         "virtio_mmio",
+        "virtio_blk",
+        "ahci",
+        "nvme",
+        "sd_mod",
+        "fat",
+        "vfat",
+        "erofs",
         "nft_chain_nat",
         "nft_ct",
         "nft_masq",
@@ -348,37 +404,50 @@ fn wildcard_match(pattern: &[char], input: &[char]) -> bool {
     false
 }
 
+fn parse_modules_alias_line(line: &str) -> Option<(Vec<char>, String)> {
+    let mut parts = line.split_whitespace();
+    let is_alias = parts.next()? == "alias";
+    if !is_alias {
+        return None;
+    }
+    let pattern = parts.next()?;
+    let module = parts.next()?;
+    Some((pattern.chars().collect(), module.to_string()))
+}
+
+fn load_alias_list(kdir: &str) -> Vec<(Vec<char>, String)> {
+    let alias_file_path = Path::new("/lib/modules").join(kdir).join("modules.alias");
+    let Ok(content) = fs::read_to_string(alias_file_path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(parse_modules_alias_line)
+        .collect()
+}
+
 fn resolve_alias(alias_or_name: &str) -> Vec<String> {
     let kdir = get_kernel_release();
     if kdir.is_empty() {
         return vec![alias_or_name.to_string()];
     }
-    let alias_file_path = Path::new("/lib/modules").join(kdir).join("modules.alias");
-    if !alias_file_path.exists() {
-        return vec![alias_or_name.to_string()];
-    }
 
-    let content = match fs::read_to_string(&alias_file_path) {
-        Ok(c) => c,
+    let mut cache_guard = match get_alias_cache().lock() {
+        Ok(g) => g,
         Err(_) => return vec![alias_or_name.to_string()],
     };
 
+    let list = cache_guard.get_or_insert_with(|| load_alias_list(&kdir));
     let input_chars: Vec<char> = alias_or_name.chars().collect();
     let mut matches = Vec::new();
 
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 && parts[0] == "alias" {
-            let pattern = parts[1];
-            let module_name = parts[2];
-            let pattern_chars: Vec<char> = pattern.chars().collect();
-            if wildcard_match(&pattern_chars, &input_chars) {
-                println!(
-                    "[modprobe] Resolved alias {} to module {}",
-                    alias_or_name, module_name
-                );
-                matches.push(module_name.to_string());
-            }
+    for (pattern_chars, module_name) in list {
+        if wildcard_match(pattern_chars, &input_chars) {
+            println!(
+                "[modprobe] Resolved alias {} to module {}",
+                alias_or_name, module_name
+            );
+            matches.push(module_name.clone());
         }
     }
 
@@ -388,39 +457,39 @@ fn resolve_alias(alias_or_name: &str) -> Vec<String> {
     matches
 }
 
+fn process_device_entry(entry: fs::DirEntry) {
+    let Ok(ft) = entry.file_type() else {
+        return;
+    };
+    let path = entry.path();
+    if ft.is_dir() {
+        traverse_and_trigger(&path);
+    } else if path.file_name().is_some_and(|name| name == "uevent") {
+        let _ = fs::write(&path, "add");
+    }
+}
+
+fn traverse_and_trigger(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        process_device_entry(entry);
+    }
+}
+
 pub fn trigger_uevents() {
     println!("[uevent] Triggering coldplug uevents...");
     let sys_devices = Path::new("/sys/devices");
-    if !sys_devices.exists() {
-        return;
+    if sys_devices.exists() {
+        traverse_and_trigger(sys_devices);
     }
-
-    fn traverse_and_trigger(dir: &Path) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if let Ok(ft) = entry.file_type() {
-                    let path = entry.path();
-                    if ft.is_dir() {
-                        traverse_and_trigger(&path);
-                    } else if path.file_name().is_some_and(|name| name == "uevent") {
-                        let _ = fs::write(&path, "add");
-                    }
-                }
-            }
-        }
-    }
-
-    traverse_and_trigger(sys_devices);
 }
 
 pub fn start_uevent_listener() {
     println!("[uevent] Spawning uevent listener thread...");
     std::thread::spawn(move || {
         println!("[uevent] Uevent listener thread spawned.");
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            trigger_uevents();
-        });
         if let Err(e) = run_uevent_listener() {
             eprintln!("[uevent] Error in uevent listener: {}", e);
         }

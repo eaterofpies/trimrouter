@@ -4,6 +4,7 @@ use dhcproto::Decodable;
 use pnet::packet::Packet;
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::net::UnixListener;
@@ -230,10 +231,26 @@ async fn main() {
     }
 }
 
+fn find_ovmf_firmware() -> PathBuf {
+    const CANDIDATES: [&str; 4] = [
+        "/usr/share/OVMF/OVMF.fd",
+        "/usr/share/ovmf/OVMF.fd",
+        "/usr/share/qemu/OVMF.fd",
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+    ];
+    for candidate in &CANDIDATES {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return path;
+        }
+    }
+    panic!("OVMF UEFI firmware not found. Please install `ovmf` (e.g. `apt-get install -y ovmf`).");
+}
+
 async fn startup_stage() -> TestEnv {
-    // A. Build the test target initramfs
+    // A. Build the test target disk image
     let test_arch = std::env::var("TEST_ARCH").unwrap_or_else(|_| "x86_64".to_string());
-    let target_path = format!("target/{test_arch}/initramfs-test.cpio.gz");
+    let target_path = format!("target/{test_arch}/trimrouter-test.img");
     let build_status = Command::new("make")
         .arg(target_path)
         .arg(format!("ARCH={test_arch}"))
@@ -242,7 +259,7 @@ async fn startup_stage() -> TestEnv {
         .expect("Failed to run make");
     assert!(
         build_status.success(),
-        "Failed to build test initramfs via make"
+        "Failed to build test image via make"
     );
 
     // Ensure target directory exists
@@ -299,15 +316,6 @@ async fn startup_stage() -> TestEnv {
         ("qemu-system-x86_64", vec![])
     };
 
-    let console = if test_arch == "x86_64" {
-        "ttyS0"
-    } else {
-        "ttyAMA0"
-    };
-    let append_arg = format!("console={} loglevel=3 panic=1 net.ifnames=0", console);
-
-    let kernel = format!("target/{test_arch}/test_boot/vmlinuz");
-    let initrd = format!("target/{test_arch}/initramfs-test.cpio.gz");
     let image = format!("target/{test_arch}/trimrouter-test.img");
     let drive_arg = format!("file={},format=raw,media=disk,if=virtio", image);
 
@@ -323,16 +331,28 @@ async fn startup_stage() -> TestEnv {
     };
 
     let mut args = extra_args;
+    args.extend(["-m".to_string(), "256".to_string()]);
+
+    if test_arch == "x86_64" {
+        let ovmf_path = find_ovmf_firmware();
+        args.extend(["-bios".to_string(), ovmf_path.to_string_lossy().to_string()]);
+    } else {
+        let console = "ttyAMA0";
+        let append_arg = format!("console={} loglevel=3 panic=1 net.ifnames=0", console);
+        let kernel = format!("target/{test_arch}/test_boot/vmlinuz");
+        let initrd = format!("target/{test_arch}/initramfs-test.cpio.gz");
+        args.extend([
+            "-kernel".to_string(),
+            kernel,
+            "-initrd".to_string(),
+            initrd,
+            "-append".to_string(),
+            append_arg,
+        ]);
+    }
+
     args.extend(
         [
-            "-m",
-            "256",
-            "-kernel",
-            &kernel,
-            "-initrd",
-            &initrd,
-            "-append",
-            &append_arg,
             "-drive",
             &drive_arg,
             "-netdev",

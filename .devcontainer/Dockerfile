@@ -9,21 +9,26 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
     bash \
+    binutils \
+    ca-certificates \
     clang \
     cpio \
     curl \
-    ca-certificates \
+    erofs-utils \
     git \
+    kmod \
     less \
     libclang-dev \
     linux-image-cloud-amd64 \
     make \
     mtools \
+    ovmf \
     parted \
     qemu-system-arm \
     qemu-system-x86 \
     ssh \
     sudo \
+    systemd-boot-efi \
     vim \
     xz-utils
 

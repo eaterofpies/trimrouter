@@ -16,6 +16,16 @@ CURDIR=$(pwd)
 IMAGE="target/${ARCH}/${IMAGE_NAME}"
 mkdir -p "target/${ARCH}"
 
+# Build a read-only EROFS image from the kernel module tree.
+# EROFS is case-sensitive, compressed, and mounted file-backed at boot.
+build_modules_erofs() {
+    local src="$1"
+    local out="$2"
+    echo "[build-image] Building EROFS module image from $src..."
+    mkfs.erofs -zlz4hc "$out" "$src"
+    ls -lh "$out" | awk '{print "  EROFS image:", $5, $9}'
+}
+
 case "$ARCH" in
     x86_64)
         RUST_TARGET="x86_64-unknown-linux-musl"
@@ -27,22 +37,48 @@ case "$ARCH" in
             INITRAMFS="target/x86_64/initramfs.cpio.gz"
         fi
 
-        echo "[build-image] Building disk image for x86_64..."
-        
-        # 1. Allocate blank raw disk image
+        echo "[build-image] Building disk image for x86_64 (UEFI)..."
+
+        # 1. Allocate blank raw disk image with EFI System Partition (MBR table, ESP flag)
         dd if=/dev/zero of="$IMAGE" bs=1M count=128 2>/dev/null
-        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 121MiB
-        
+        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 121MiB set 1 esp on
+
         # 2. Format partition as FAT32 with label TRIMROUTER
         mformat -v TRIMROUTER -i "${IMAGE}@@1M" -F
-        
-        # 3. Write boot payloads to the image
-        mcopy -i "${IMAGE}@@1M" "$KERNEL" ::/vmlinuz
-        mcopy -i "${IMAGE}@@1M" "$INITRAMFS" ::/initramfs.cpio.gz
-        echo "console=ttyS0 quiet panic=-1 net.ifnames=0" > "target/x86_64/cmdline.txt"
-        mcopy -i "${IMAGE}@@1M" "target/x86_64/cmdline.txt" ::/cmdline.txt
+
+        # 3. Build Unified Kernel Image (UKI) for UEFI firmware
+        STUB="/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+        UKI_OUT="target/x86_64/BOOTX64.EFI"
+        CMDLINE_FILE="target/x86_64/cmdline.txt"
+        printf "console=tty0 console=ttyS0,115200 loglevel=3 panic=1 net.ifnames=0" > "$CMDLINE_FILE"
+
+        if [ ! -f "$STUB" ]; then
+            echo "[build-image] ERROR: systemd-boot EFI stub not found at $STUB"
+            echo "[build-image] Install it with: sudo apt-get install -y systemd-boot-efi"
+            exit 1
+        fi
+
+        objcopy \
+            --add-section .cmdline="$CMDLINE_FILE" --change-section-vma .cmdline=0x14dfb0000 \
+            --add-section .linux="$KERNEL" --change-section-vma .linux=0x14dfc0000 \
+            --add-section .initrd="$INITRAMFS" --change-section-vma .initrd=0x14ebd0000 \
+            "$STUB" "$UKI_OUT"
+
+        # 4. Write EFI boot payloads to the FAT32 partition
+        mmd -i "${IMAGE}@@1M" ::/EFI 2>/dev/null || true
+        mmd -i "${IMAGE}@@1M" ::/EFI/BOOT 2>/dev/null || true
+        mcopy -i "${IMAGE}@@1M" "$UKI_OUT" ::/EFI/BOOT/BOOTX64.EFI
+
+        # 5. Write command-line and configuration files
+        mcopy -i "${IMAGE}@@1M" "$CMDLINE_FILE" ::/cmdline.txt
         mmd -i "${IMAGE}@@1M" ::/config 2>/dev/null || true
         mcopy -i "${IMAGE}@@1M" "${CONFIG_FILE}" ::/config/trimrouter.toml
+
+        # 6. Bundle full module tree into EROFS image
+        if [ -d "target/${ARCH}/test_boot/lib/modules" ]; then
+            build_modules_erofs "target/${ARCH}/test_boot/lib/modules" "target/${ARCH}/modules.erofs"
+            mcopy -i "${IMAGE}@@1M" "target/${ARCH}/modules.erofs" ::/modules.erofs
+        fi
         ;;
 
     arm64|armhf)

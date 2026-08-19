@@ -19,6 +19,10 @@ pub async fn run(args: Vec<String>) {
     };
 
     match cli.command {
+        Some(Commands::Init { .. }) => {
+            let sys = Arc::new(RealSystem);
+            init::run_as_init(sys).await;
+        }
         Some(Commands::Worker { service }) => {
             worker::run_worker(service).await;
         }
