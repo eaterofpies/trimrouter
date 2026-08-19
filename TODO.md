@@ -12,3 +12,6 @@
 - Panic doesn't stop routing / other services. Should it?
 - Remove compressed module loading support if the kernel can do it
 - Revisit Seccomp-BPF filters to establish per-service fine-grained allowed syscall lists, and pass pre-bound SNTP sockets from the parent to completely remove socket/bind/connect calls from workers
+- Switch to a UEFI boot process on x86 and x86 tests
+- Include all storage kernel modules in the initrd as it doesn't work on real hardware
+- Copy all kernel modules to an EROFS image and copy that to the boot partition. Mount the EROFS image as soon as /boot has been mounted.
