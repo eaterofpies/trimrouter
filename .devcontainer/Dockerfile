@@ -19,7 +19,7 @@ RUN apt-get update \
     kmod \
     less \
     libclang-dev \
-    linux-image-cloud-amd64 \
+    linux-image-amd64 \
     make \
     mtools \
     ovmf \

@@ -59,10 +59,11 @@ The FAT32 boot partition stores all files required for kernel boot and system st
 
 | Path in Partition | Source | Description |
 | :--- | :--- | :--- |
-| `/vmlinuz` | `target/x86_64/test_boot/vmlinuz` | Linux kernel image (extracted from Debian cloud package) |
+| `/vmlinuz` | `target/x86_64/test_boot/vmlinuz` | Linux kernel image (extracted from Debian generic package) |
 | `/initramfs.cpio.gz` | `target/x86_64/initramfs.cpio.gz` | Compressed initramfs CPIO archive containing the `trimrouter` binary as `/init` and kernel modules |
 | `/cmdline.txt` | Generated at build time | Kernel command line: `console=ttyS0 quiet panic=-1 net.ifnames=0` |
 | `/config/trimrouter.toml` | `config/trimrouter.toml` (or `TRIMROUTER_CONFIG` override) | Router TOML configuration file |
+| `/modules.erofs` | `target/x86_64/modules.erofs` | Read-only EROFS compressed image containing the full kernel module tree |
 
 ### 3.2 arm64 / armhf (Raspberry Pi)
 
@@ -187,11 +188,14 @@ Both partitions are mounted as part of the ordered PID 1 startup sequence, after
 
 ```
 1. mount_virtual_filesystems()          → /proc, /sys, /dev (devtmpfs), /run (tmpfs)
-2. wait_for_boot_partition()            → scans labels and returns when TRIMROUTER is found
-3. ensure_log_partition_in_mbr()        → updates MBR and re-reads partition table if needed
-4. mount_boot_partition()               → mounts /boot (vfat, read-only)
-5. setup_log_partition()                 → mounts /var/log (formats FAT32 first if mount fails)
-6. configure_network()                  → interfaces, NAT, services
+2. trigger_uevents()                    → early hardware coldplug discovery
+3. load_required_modules()              → early filesystem & netfilter modules
+4. wait_for_boot_partition()            → scans labels and returns when TRIMROUTER is found
+5. ensure_log_partition_in_mbr()        → updates MBR and re-reads partition table if needed
+6. mount_boot_partition()               → mounts /boot (vfat, read-only)
+7. activate_boot_modules()              → mounts /boot/modules.erofs over /lib/modules & triggers coldplug uevents
+8. setup_log_partition()                 → mounts /var/log (formats FAT32 first if mount fails)
+9. configure_network()                  → interfaces, NAT, services
    └─ for each worker spawn:
       open log file                     → /var/log/system.log (append mode)
       create pipe()                     → worker stdout/stderr → pipe read end

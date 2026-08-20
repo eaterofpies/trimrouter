@@ -59,6 +59,7 @@ async fn main() {
             std::process::exit(1);
         }
         kmod::start_uevent_listener();
+        kmod::trigger_uevents();
         kmod::load_required_modules();
         let (boot_dev, parent_disk) = match wait_for_boot_partition() {
             Ok(res) => res,

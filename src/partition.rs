@@ -57,14 +57,6 @@ fn write_mbr_partition_2(parent_disk: &str) -> Result<(), RouterError> {
         .ok_or_else(|| RouterError::Generic("Non-UTF8 parent disk path".to_string()))?;
 
     let disk_sectors = get_partition_sectors(disk_name)?;
-    const START_SECTOR: u64 = 247808;
-    if disk_sectors <= START_SECTOR {
-        return Err(RouterError::Generic(format!(
-            "Disk is too small for log partition (size: {} sectors, required > {} sectors)",
-            disk_sectors, START_SECTOR
-        )));
-    }
-    let p2_sectors = disk_sectors - START_SECTOR;
 
     use std::io::{Seek, SeekFrom};
     let mut disk_file = fs::OpenOptions::new()
@@ -81,12 +73,21 @@ fn write_mbr_partition_2(parent_disk: &str) -> Result<(), RouterError> {
     let mut mbr = mbrman::MBR::read_from(&mut disk_file, MBR_SECTOR_SIZE as u32)
         .map_err(|e| RouterError::Generic(format!("Failed to read MBR: {:?}", e)))?;
 
+    let start_sector = (mbr[1].starting_lba + mbr[1].sectors) as u64;
+    if disk_sectors <= start_sector {
+        return Err(RouterError::Generic(format!(
+            "Disk is too small for log partition (size: {} sectors, required > {} sectors)",
+            disk_sectors, start_sector
+        )));
+    }
+    let p2_sectors = disk_sectors - start_sector;
+
     mbr[2] = mbrman::MBRPartitionEntry {
         boot: mbrman::BOOT_INACTIVE,
         first_chs: mbrman::CHS::empty(),
         sys: MBR_PART_TYPE_FAT32_LBA,
         last_chs: mbrman::CHS::empty(),
-        starting_lba: START_SECTOR as u32,
+        starting_lba: start_sector as u32,
         sectors: p2_sectors.min(u32::MAX as u64) as u32,
     };
 

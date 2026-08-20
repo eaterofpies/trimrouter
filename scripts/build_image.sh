@@ -40,8 +40,8 @@ case "$ARCH" in
         echo "[build-image] Building disk image for x86_64 (UEFI)..."
 
         # 1. Allocate blank raw disk image with EFI System Partition (MBR table, ESP flag)
-        dd if=/dev/zero of="$IMAGE" bs=1M count=128 2>/dev/null
-        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 121MiB set 1 esp on
+        dd if=/dev/zero of="$IMAGE" bs=1M count=256 2>/dev/null
+        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 240MiB set 1 esp on
 
         # 2. Format partition as FAT32 with label TRIMROUTER
         mformat -v TRIMROUTER -i "${IMAGE}@@1M" -F
@@ -173,10 +173,13 @@ case "$ARCH" in
                 "kernel/net/ipv6"
                 "kernel/fs/fat"
                 "kernel/fs/nls"
+                "kernel/fs/erofs"
                 "kernel/drivers/block"
                 "kernel/drivers/ata"
                 "kernel/drivers/scsi"
+                "kernel/drivers/nvme"
                 "kernel/drivers/usb/storage"
+                "kernel/drivers/usb/host"
                 "kernel/drivers/mmc"
             )
             for dir_path in "${DIRECT_DIRS[@]}"; do

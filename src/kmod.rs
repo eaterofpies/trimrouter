@@ -54,6 +54,18 @@ fn find_module_recursive(dir: &Path, base_name: &str) -> Option<PathBuf> {
 }
 
 fn find_module_file(name: &str) -> Option<PathBuf> {
+    // Raw modaliases contain subsystem prefixes with colons (e.g. `acpi:PNP0A03:`, `platform:alarmtimer`).
+    // Real module file names never contain colons. Returning None immediately avoids expensive
+    // recursive disk directory scans for non-existent module files when a modalias has no match.
+    if name.contains(':') {
+        return None;
+    }
+    let normalized = name.replace('_', "-");
+    if let Some(dep_map) = get_or_load_dep_map()
+        && let Some((path, _)) = dep_map.get(&normalized)
+    {
+        return Some(path.clone());
+    }
     let kdir = get_kernel_release();
     if kdir.is_empty() {
         return None;
@@ -192,7 +204,7 @@ fn load_module_with_dep_map(
         resolve_deps_recursive(actual_name, dep_map, &mut resolved, &mut visited);
 
         if resolved.is_empty() {
-            if load_single_module(actual_name).is_ok() {
+            if !actual_name.contains(':') && load_single_module(actual_name).is_ok() {
                 any_success = true;
             }
             continue;
@@ -235,16 +247,9 @@ fn load_module_with_dep_map(
 }
 
 pub fn load_module_with_dependencies(mod_name: &str) {
-    let kdir = get_kernel_release();
-    if kdir.is_empty() {
-        let candidates = resolve_alias(mod_name);
-        let mut any_success = false;
-        for actual_name in &candidates {
-            if load_single_module(actual_name).is_ok() {
-                any_success = true;
-            }
-        }
-        if !any_success {
+    if let Some(dep_map) = get_or_load_dep_map() {
+        // Suppress errors for raw hardware modaliases (contain ':') that don't match any kernel module
+        if !load_module_with_dep_map(mod_name, &dep_map) && !mod_name.contains(':') {
             eprintln!(
                 "[init] ERROR: All candidate modules for {} failed to load!",
                 mod_name
@@ -253,33 +258,49 @@ pub fn load_module_with_dependencies(mod_name: &str) {
         return;
     }
 
-    let modules_dir = Path::new("/lib/modules").join(&kdir);
-    let dep_file_path = modules_dir.join("modules.dep");
-
-    if !dep_file_path.exists() {
-        let candidates = resolve_alias(mod_name);
-        let mut any_success = false;
-        for actual_name in &candidates {
-            if load_single_module(actual_name).is_ok() {
-                any_success = true;
-            }
+    let candidates = resolve_alias(mod_name);
+    let mut any_success = false;
+    for actual_name in &candidates {
+        if load_single_module(actual_name).is_ok() {
+            any_success = true;
         }
-        if !any_success {
-            eprintln!(
-                "[init] ERROR: All candidate modules for {} failed to load!",
-                mod_name
-            );
-        }
-        return;
     }
-
-    let dep_map = parse_modules_dep(&dep_file_path, &modules_dir);
-    if !load_module_with_dep_map(mod_name, &dep_map) {
+    // Suppress errors for raw hardware modaliases (contain ':') that don't match any kernel module
+    if !any_success && !mod_name.contains(':') {
         eprintln!(
             "[init] ERROR: All candidate modules for {} failed to load!",
             mod_name
         );
     }
+}
+
+type DepMap = HashMap<String, (PathBuf, Vec<String>)>;
+static DEP_CACHE: OnceLock<Mutex<Option<DepMap>>> = OnceLock::new();
+
+fn get_dep_cache() -> &'static Mutex<Option<DepMap>> {
+    DEP_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn get_or_load_dep_map() -> Option<DepMap> {
+    let kdir = get_kernel_release();
+    if kdir.is_empty() {
+        return None;
+    }
+    let mut cache_guard = match get_dep_cache().lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+    if let Some(map) = cache_guard.as_ref() {
+        return Some(map.clone());
+    }
+    let modules_dir = Path::new("/lib/modules").join(&kdir);
+    let dep_file_path = modules_dir.join("modules.dep");
+    if !dep_file_path.exists() {
+        return None;
+    }
+    let map = parse_modules_dep(&dep_file_path, &modules_dir);
+    *cache_guard = Some(map.clone());
+    Some(map)
 }
 
 type ModuleAlias = (Vec<char>, String);
@@ -291,8 +312,11 @@ fn get_alias_cache() -> &'static Mutex<AliasCache> {
     ALIAS_CACHE.get_or_init(|| Mutex::new(None))
 }
 
-pub fn invalidate_alias_cache() {
+pub fn invalidate_module_caches() {
     if let Ok(mut guard) = get_alias_cache().lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = get_dep_cache().lock() {
         *guard = None;
     }
 }
@@ -330,52 +354,32 @@ pub fn activate_boot_modules() {
         "[init] Mounted {} over /lib/modules (full module set)",
         boot_img.display()
     );
-    invalidate_alias_cache();
+    invalidate_module_caches();
     trigger_uevents();
 }
 
 pub fn load_required_modules() {
-    let kdir = get_kernel_release();
-    // Only load essential modules needed during early boot to discover and mount /boot:
+    // Only load essential filesystem and netfilter modules needed during early boot:
     let modules = [
-        "virtio_pci",
-        "virtio_mmio",
-        "virtio_blk",
-        "ahci",
-        "nvme",
-        "sd_mod",
         "fat",
         "vfat",
         "erofs",
+        "nls_cp437",
+        "nls_ascii",
+        "nls_utf8",
+        "nls_iso8859_1",
         "nft_chain_nat",
         "nft_ct",
         "nft_masq",
     ];
 
-    if kdir.is_empty() {
+    if let Some(dep_map) = get_or_load_dep_map() {
+        for mod_name in &modules {
+            let _ = load_module_with_dep_map(mod_name, &dep_map);
+        }
+    } else {
         for mod_name in &modules {
             load_module_with_dependencies(mod_name);
-        }
-        return;
-    }
-
-    let modules_dir = Path::new("/lib/modules").join(&kdir);
-    let dep_file_path = modules_dir.join("modules.dep");
-
-    if !dep_file_path.exists() {
-        for mod_name in &modules {
-            load_module_with_dependencies(mod_name);
-        }
-        return;
-    }
-
-    let dep_map = parse_modules_dep(&dep_file_path, &modules_dir);
-    for mod_name in &modules {
-        if !load_module_with_dep_map(mod_name, &dep_map) {
-            eprintln!(
-                "[init] ERROR: Failed to load required boot module: {}",
-                mod_name
-            );
         }
     }
 }
@@ -511,6 +515,7 @@ fn handle_uevent(uevent: kobject_uevent::UEvent) {
 fn run_uevent_listener() -> Result<(), Box<dyn std::error::Error>> {
     use kobject_uevent::UEvent;
     use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_KOBJECT_UEVENT};
+    use nix::sys::socket::{setsockopt, sockopt};
 
     println!("[uevent] Creating Netlink socket...");
     let mut socket = Socket::new(NETLINK_KOBJECT_UEVENT)?;
@@ -518,12 +523,26 @@ fn run_uevent_listener() -> Result<(), Box<dyn std::error::Error>> {
     println!("[uevent] Binding Netlink socket...");
     socket.bind(&addr)?;
 
+    // Increase socket receive buffer size to 16MB to avoid packet drops during coldplug storms
+    let rcvbuf_size = 16 * 1024 * 1024;
+    let _ = setsockopt(&socket, sockopt::RcvBuf, &rcvbuf_size);
+
     println!("[uevent] Netlink uevent listener started successfully.");
 
     let mut buf = [0u8; 8192];
     loop {
         let mut slice = &mut buf[..];
-        let n = socket.recv(&mut slice, 0)?;
+        let n = match socket.recv(&mut slice, 0) {
+            Ok(n) => n,
+            Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                eprintln!(
+                    "[uevent] ENOBUFS: socket buffer overflow detected, rescanning hardware for missed devices..."
+                );
+                trigger_uevents();
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         match UEvent::from_netlink_packet(&buf[..n]) {
             Ok(uevent) => handle_uevent(uevent),
             Err(e) => {

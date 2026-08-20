@@ -33,7 +33,7 @@ STAGING="target/${ARCH}/staging"
 TEST_BOOT="target/${ARCH}/test_boot"
 BINARY="target/${RUST_TARGET}/release/trimrouter"
 TEST_BINARY="target/${RUST_TARGET}/release/integration_test"
-DIRECT_DEPS="virtio_net virtio_pci virtio_mmio virtio_blk usb_storage uas sd_mod mmc_block sdhci sdhci_pci ahci nvme erofs nft_masq nft_chain_nat nft_ct fat vfat nls_cp437 nls_ascii nls_utf8"
+DIRECT_DEPS="virtio_net virtio_pci virtio_mmio virtio_blk virtio_scsi usb_storage uas xhci_pci xhci_pci_renesas xhci_hcd ehci_pci ehci_hcd uhci_hcd ohci_pci ohci_hcd sd_mod scsi_mod mmc_block sdhci sdhci_pci sdhci_acpi rtsx_pci_sdmmc rtsx_usb_sdmmc ahci libahci ata_piix ata_generic sata_nv sata_via sata_sis sata_sil sata_sil24 pata_acpi pata_amd nvme nvme_core erofs nft_masq nft_chain_nat nft_ct fat vfat nls_cp437 nls_ascii nls_utf8 nls_iso8859_1"
 
 echo "[build] Creating initramfs staging area for ${ARCH} (mode: ${MODE})..."
 rm -rf "$STAGING"

@@ -58,6 +58,7 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
         if let Err(e) = mount_virtual_filesystems(sys.as_ref()) {
             panic!("FATAL: Failed to mount virtual filesystems: {}", e);
         }
+        kmod::trigger_uevents();
         kmod::load_required_modules();
         let (boot_dev, parent_disk) = match wait_for_boot_partition() {
             Ok(res) => res,

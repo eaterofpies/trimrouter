@@ -13,11 +13,11 @@ fi
 case "$ARCH" in
     x86_64)
         DEB_ARCH="amd64"
-        KERNEL_PKG="linux-image-cloud-amd64"
+        KERNEL_PKG="linux-image-amd64"
         ;;
     arm64)
         DEB_ARCH="arm64"
-        KERNEL_PKG="linux-image-cloud-arm64"
+        KERNEL_PKG="linux-image-arm64"
         ;;
     armhf)
         DEB_ARCH="armhf"
@@ -77,6 +77,12 @@ cp boot/vmlinuz-* ./vmlinuz
 # Support usr-merged directory layout in trixie release
 if [ -d usr/lib ] && [ ! -d lib ]; then
     ln -s usr/lib lib
+fi
+
+KVER=$(ls lib/modules 2>/dev/null | head -n 1)
+if [ -n "$KVER" ]; then
+    echo "Generating kernel module dependency database for $KVER..."
+    depmod -b "${CURDIR}/${TEST_BOOT}" "$KVER"
 fi
 
 touch .kernel_extracted
