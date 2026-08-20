@@ -33,9 +33,12 @@ case "$ARCH" in
         KERNEL="target/x86_64/test_boot/vmlinuz"
         if [ "$IMAGE_NAME" = "trimrouter-test.img" ]; then
             INITRAMFS="target/x86_64/initramfs-test.cpio.gz"
+            DEFAULT_CMDLINE="console=tty0 console=ttyS0,115200 loglevel=7 panic=1 net.ifnames=0"
         else
             INITRAMFS="target/x86_64/initramfs.cpio.gz"
+            DEFAULT_CMDLINE="console=ttyS0,115200 console=tty0 loglevel=7 panic=1 net.ifnames=0"
         fi
+        CMDLINE="${TRIMROUTER_CMDLINE:-$DEFAULT_CMDLINE}"
 
         echo "[build-image] Building disk image for x86_64 (UEFI)..."
 
@@ -50,7 +53,7 @@ case "$ARCH" in
         STUB="/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
         UKI_OUT="target/x86_64/BOOTX64.EFI"
         CMDLINE_FILE="target/x86_64/cmdline.txt"
-        printf "console=tty0 console=ttyS0,115200 loglevel=3 panic=1 net.ifnames=0" > "$CMDLINE_FILE"
+        printf "%s" "$CMDLINE" > "$CMDLINE_FILE"
 
         if [ ! -f "$STUB" ]; then
             echo "[build-image] ERROR: systemd-boot EFI stub not found at $STUB"

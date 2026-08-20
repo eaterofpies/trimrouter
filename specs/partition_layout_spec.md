@@ -61,7 +61,7 @@ The FAT32 boot partition stores all files required for kernel boot and system st
 | :--- | :--- | :--- |
 | `/vmlinuz` | `target/x86_64/test_boot/vmlinuz` | Linux kernel image (extracted from Debian generic package) |
 | `/initramfs.cpio.gz` | `target/x86_64/initramfs.cpio.gz` | Compressed initramfs CPIO archive containing the `trimrouter` binary as `/init` and kernel modules |
-| `/cmdline.txt` | Generated at build time | Kernel command line: `console=ttyS0 quiet panic=-1 net.ifnames=0` |
+| `/cmdline.txt` | Generated at build time | Kernel command line: `console=ttyS0,115200 console=tty0 loglevel=7 panic=1 net.ifnames=0` (customizable via `TRIMROUTER_CMDLINE`) |
 | `/config/trimrouter.toml` | `config/trimrouter.toml` (or `TRIMROUTER_CONFIG` override) | Router TOML configuration file |
 | `/modules.erofs` | `target/x86_64/modules.erofs` | Read-only EROFS compressed image containing the full kernel module tree |
 
