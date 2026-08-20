@@ -1,14 +1,14 @@
 #[macro_export]
 macro_rules! println {
     ($($arg:tt)*) => {{
-        $crate::logging::log_raw(&format!($($arg)*));
+        $crate::logging::log_raw_with_level($crate::logging::Level::Info, &format!($($arg)*));
     }};
 }
 
 #[macro_export]
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
-        $crate::logging::log_raw(&format!($($arg)*));
+        $crate::logging::log_raw_with_level($crate::logging::Level::Error, &format!($($arg)*));
     }};
 }
 

@@ -5,8 +5,13 @@ pub async fn test_logging_subsystem() -> Result<(), String> {
     let log_file = Path::new("/var/log/system.log");
 
     // Write verification entries through unified logger
-    trimrouter::logging::log("test-logger", "Logging subsystem integration test start");
     trimrouter::logging::log(
+        log::Level::Info,
+        "test-logger",
+        "Logging subsystem integration test start",
+    );
+    trimrouter::logging::log(
+        log::Level::Info,
         "test-logger",
         "Logging subsystem integration test verification line",
     );
@@ -27,21 +32,26 @@ pub async fn test_logging_subsystem() -> Result<(), String> {
         return Err(format!("Log file {} is empty", log_file.display()));
     }
 
-    if !contents.contains("[test-logger] Logging subsystem integration test verification line") {
-        return Err("Log file does not contain expected logged message".to_string());
+    if !contents
+        .contains("[INFO] [test-logger] Logging subsystem integration test verification line")
+    {
+        return Err(
+            "Log file does not contain expected logged message with [INFO] level".to_string(),
+        );
     }
 
-    // Verify ISO 8601 UTC timestamp format "[YYYY-MM-DDTHH:MM:SSZ] [service] message"
+    // Verify ISO 8601 UTC timestamp format "[YYYY-MM-DDTHH:MM:SSZ] [LEVEL] [service] message"
     let mut found_valid_format = false;
     for line in contents.lines() {
-        if line.starts_with('[') && line.contains("Z] [") {
+        if line.starts_with('[') && line.contains("Z] [INFO] [") {
             found_valid_format = true;
             break;
         }
     }
     if !found_valid_format {
         return Err(
-            "No log line with standard ISO 8601 timestamp format found in system.log".to_string(),
+            "No log line with standard ISO 8601 timestamp and [INFO] level format found in system.log"
+                .to_string(),
         );
     }
 

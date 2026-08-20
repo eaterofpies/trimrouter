@@ -1,8 +1,15 @@
+use kobject_uevent::{ActionType, UEvent};
+use log::{debug, error, info, warn};
+use netlink_sys::{protocols::NETLINK_KOBJECT_UEVENT, Socket, SocketAddr};
 use nix::mount::MsFlags;
+use nix::sys::socket::{setsockopt, sockopt};
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 
 /// Tracks already-loaded kernel modules in user-space.
 /// While the Linux kernel handles duplicate loads safely by returning `EEXIST` (which we catch and ignore),
@@ -78,10 +85,10 @@ fn find_module_file(name: &str) -> Option<PathBuf> {
 /// Flag to finit_module indicating that the file is compressed and the kernel should decompress it.
 const MODULE_INIT_COMPRESSED_FILE: u32 = 0x0004;
 
-fn load_module(path: &Path) -> Result<(), std::io::Error> {
-    println!("[init] Loading kernel module: {:?}", path);
+fn load_module(path: &Path) -> Result<(), io::Error> {
+    debug!("[init] Loading kernel module: {:?}", path);
     let file = fs::File::open(path)?;
-    let param = std::ffi::CString::new("").unwrap();
+    let param = CString::new("").unwrap();
 
     let mut flags = nix::kmod::ModuleInitFlags::empty();
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
@@ -92,16 +99,16 @@ fn load_module(path: &Path) -> Result<(), std::io::Error> {
     if let Err(e) = nix::kmod::finit_module(&file, &param, flags)
         && e != nix::errno::Errno::EEXIST
     {
-        return Err(std::io::Error::other(e.to_string()));
+        return Err(io::Error::other(e.to_string()));
     }
     Ok(())
 }
 
-fn load_single_module(mod_name: &str) -> Result<(), std::io::Error> {
+fn load_single_module(mod_name: &str) -> Result<(), io::Error> {
     let path = match find_module_file(mod_name) {
         Some(p) => p,
         None => {
-            println!(
+            debug!(
                 "[init] Module {} not found in /lib/modules, assuming built-in or not needed.",
                 mod_name
             );
@@ -110,10 +117,10 @@ fn load_single_module(mod_name: &str) -> Result<(), std::io::Error> {
     };
 
     if let Err(e) = load_module(&path) {
-        eprintln!("[init] Failed to load module {}: {}", mod_name, e);
+        error!("[init] Failed to load module {}: {}", mod_name, e);
         Err(e)
     } else {
-        println!("[init] Successfully loaded module {}", mod_name);
+        info!("[init] Successfully loaded module {}", mod_name);
         Ok(())
     }
 }
@@ -228,10 +235,10 @@ fn load_module_with_dep_map(
             if !loaded.contains(&stem) {
                 drop(loaded);
                 if let Err(e) = load_module(&path) {
-                    eprintln!("[init] Failed to load module {} ({:?}): {}", stem, path, e);
+                    error!("[init] Failed to load module {} ({:?}): {}", stem, path, e);
                     all_resolved_loaded = false;
                 } else {
-                    println!("[init] Successfully loaded module {}", stem);
+                    info!("[init] Successfully loaded module {}", stem);
                     get_loaded_modules().lock().unwrap().insert(stem.clone());
                 }
             }
@@ -250,7 +257,7 @@ pub fn load_module_with_dependencies(mod_name: &str) {
     if let Some(dep_map) = get_or_load_dep_map() {
         // Suppress errors for raw hardware modaliases (contain ':') that don't match any kernel module
         if !load_module_with_dep_map(mod_name, &dep_map) && !mod_name.contains(':') {
-            eprintln!(
+            error!(
                 "[init] ERROR: All candidate modules for {} failed to load!",
                 mod_name
             );
@@ -267,7 +274,7 @@ pub fn load_module_with_dependencies(mod_name: &str) {
     }
     // Suppress errors for raw hardware modaliases (contain ':') that don't match any kernel module
     if !any_success && !mod_name.contains(':') {
-        eprintln!(
+        error!(
             "[init] ERROR: All candidate modules for {} failed to load!",
             mod_name
         );
@@ -430,7 +437,7 @@ fn load_alias_list(kdir: &str) -> Vec<(Vec<char>, String)> {
         .collect()
 }
 
-fn resolve_alias(alias_or_name: &str) -> Vec<String> {
+pub fn resolve_alias(alias_or_name: &str) -> Vec<String> {
     let kdir = get_kernel_release();
     if kdir.is_empty() {
         return vec![alias_or_name.to_string()];
@@ -447,7 +454,7 @@ fn resolve_alias(alias_or_name: &str) -> Vec<String> {
 
     for (pattern_chars, module_name) in list {
         if wildcard_match(pattern_chars, &input_chars) {
-            println!(
+            debug!(
                 "[modprobe] Resolved alias {} to module {}",
                 alias_or_name, module_name
             );
@@ -483,7 +490,7 @@ fn traverse_and_trigger(dir: &Path) {
 }
 
 pub fn trigger_uevents() {
-    println!("[uevent] Triggering coldplug uevents...");
+    debug!("[uevent] Triggering coldplug uevents...");
     let sys_devices = Path::new("/sys/devices");
     if sys_devices.exists() {
         traverse_and_trigger(sys_devices);
@@ -491,43 +498,37 @@ pub fn trigger_uevents() {
 }
 
 pub fn start_uevent_listener() {
-    println!("[uevent] Spawning uevent listener thread...");
-    std::thread::spawn(move || {
-        println!("[uevent] Uevent listener thread spawned.");
+    debug!("[uevent] Spawning uevent listener thread...");
+    thread::spawn(move || {
+        debug!("[uevent] Uevent listener thread spawned.");
         if let Err(e) = run_uevent_listener() {
-            eprintln!("[uevent] Error in uevent listener: {}", e);
+            error!("[uevent] Error in uevent listener: {}", e);
         }
     });
 }
 
-fn handle_uevent(uevent: kobject_uevent::UEvent) {
-    use kobject_uevent::ActionType;
-
+fn handle_uevent(uevent: UEvent) {
     // Handle kernel module autoloading
     if uevent.action == ActionType::Add
         && let Some(modalias) = uevent.env.get("MODALIAS")
     {
-        println!("[uevent] Discovered device with modalias: {}", modalias);
+        debug!("[uevent] Discovered device with modalias: {}", modalias);
         load_module_with_dependencies(modalias);
     }
 }
 
 fn run_uevent_listener() -> Result<(), Box<dyn std::error::Error>> {
-    use kobject_uevent::UEvent;
-    use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_KOBJECT_UEVENT};
-    use nix::sys::socket::{setsockopt, sockopt};
-
-    println!("[uevent] Creating Netlink socket...");
+    debug!("[uevent] Creating Netlink socket...");
     let mut socket = Socket::new(NETLINK_KOBJECT_UEVENT)?;
     let addr = SocketAddr::new(0, 1); // Group 1 is the standard multicast group for uevents
-    println!("[uevent] Binding Netlink socket...");
+    debug!("[uevent] Binding Netlink socket...");
     socket.bind(&addr)?;
 
     // Increase socket receive buffer size to 16MB to avoid packet drops during coldplug storms
     let rcvbuf_size = 16 * 1024 * 1024;
     let _ = setsockopt(&socket, sockopt::RcvBuf, &rcvbuf_size);
 
-    println!("[uevent] Netlink uevent listener started successfully.");
+    info!("[uevent] Netlink uevent listener started successfully.");
 
     let mut buf = [0u8; 8192];
     loop {
@@ -535,7 +536,7 @@ fn run_uevent_listener() -> Result<(), Box<dyn std::error::Error>> {
         let n = match socket.recv(&mut slice, 0) {
             Ok(n) => n,
             Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
-                eprintln!(
+                warn!(
                     "[uevent] ENOBUFS: socket buffer overflow detected, rescanning hardware for missed devices..."
                 );
                 trigger_uevents();
@@ -547,7 +548,7 @@ fn run_uevent_listener() -> Result<(), Box<dyn std::error::Error>> {
             Ok(uevent) => handle_uevent(uevent),
             Err(e) => {
                 // Malformed or non-UTF8 packets can occasionally arrive; log a warning but keep running
-                eprintln!("[uevent] Warning: Failed to parse uevent packet: {}", e);
+                warn!("[uevent] Warning: Failed to parse uevent packet: {}", e);
             }
         }
     }

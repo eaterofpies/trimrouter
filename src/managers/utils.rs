@@ -1,4 +1,5 @@
 use crate::error::RouterError;
+use log::warn;
 use pnet::util::MacAddr;
 use rtnetlink::packet_route::link::LinkAttribute;
 use std::net::Ipv4Addr;
@@ -616,7 +617,7 @@ pub async fn handle_supervisor_restart_delay(
 ) -> bool {
     if *attempt > 0 {
         let delay = std::time::Duration::from_secs(std::cmp::min(1 << *attempt, 60));
-        println!(
+        warn!(
             "[{}-parent] Worker crashed/exited. Restarting in {:?}",
             service_name, delay
         );
@@ -636,8 +637,8 @@ pub async fn handle_supervisor_restart_delay(
 pub async fn terminate_worker(pid: u32) {
     let pid = nix::unistd::Pid::from_raw(pid as i32);
     if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
-        eprintln!(
-            "[utils] Warning: Failed to send SIGTERM to worker process {}: {}",
+        warn!(
+            "[utils] Failed to send SIGTERM to worker process {}: {}",
             pid, e
         );
     }
@@ -649,8 +650,8 @@ pub async fn terminate_worker(pid: u32) {
         if start.elapsed() > std::time::Duration::from_secs(1)
             && let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL)
         {
-            eprintln!(
-                "[utils] Warning: Failed to send SIGKILL to worker process {}: {}",
+            warn!(
+                "[utils] Failed to send SIGKILL to worker process {}: {}",
                 pid, e
             );
         }

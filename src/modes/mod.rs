@@ -1,6 +1,7 @@
 use crate::cli::{Cli, Commands, TrimrouterSubcommands};
 use crate::system::RealSystem;
 use clap::Parser;
+use log::error;
 use std::process::exit;
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ pub async fn run(args: Vec<String>) {
     let cli = match Cli::try_parse_from(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to parse arguments: {}", e);
+            error!("Failed to parse arguments: {}", e);
             exit(1);
         }
     };
@@ -28,7 +29,7 @@ pub async fn run(args: Vec<String>) {
         }
         Some(Commands::Modprobe { module_name, .. }) => {
             if let Err(e) = modprobe::run_as_modprobe(module_name) {
-                eprintln!("[modprobe] ERROR: {}", e);
+                error!("[modprobe] ERROR: {}", e);
                 exit(1);
             }
             exit(0);
@@ -42,7 +43,7 @@ pub async fn run(args: Vec<String>) {
             sub: Some(TrimrouterSubcommands::Modprobe { module_name, .. }),
         }) => {
             if let Err(e) = modprobe::run_as_modprobe(module_name) {
-                eprintln!("[modprobe] ERROR: {}", e);
+                error!("[modprobe] ERROR: {}", e);
                 exit(1);
             }
             exit(0);

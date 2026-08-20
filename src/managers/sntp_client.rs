@@ -1,8 +1,22 @@
-use super::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
-use super::utils::{SharedWanLease, create_ipc_fds};
+use super::ipc::{recv_msg, send_msg, SntpClientToParentMsg, SntpParentToWorkerMsg};
+use super::utils::{create_ipc_fds, SharedWanLease};
 use super::{ExternalWorker, Service, ServiceError};
-use std::os::unix::io::RawFd;
+use log::{error, info};
+use nix::sys::signal::{kill, Signal};
+use nix::sys::time::TimeSpec;
+use nix::time::{clock_settime, ClockId};
+use nix::unistd::Pid;
+use std::io::Error as IoError;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
+use tokio::sync::watch::Receiver;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::interval;
 
 pub struct SntpClient {
     lease_state: SharedWanLease,
@@ -24,16 +38,16 @@ impl SntpClient {
 
 async fn run_wan_status_monitor(
     lease_state: SharedWanLease,
-    shared_ipc_writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    shared_ipc_writer: Arc<Mutex<OwnedWriteHalf>>,
+    mut shutdown_rx: Receiver<bool>,
 ) {
     let mut last_wan_status = false;
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut interval_timer = interval(Duration::from_secs(1));
 
     while !*shutdown_rx.borrow() {
         tokio::select! {
             _ = shutdown_rx.changed() => {}
-            _ = interval.tick() => {
+            _ = interval_timer.tick() => {
                 let has_wan = lease_state.lock().unwrap().ip.is_some();
                 if has_wan != last_wan_status {
                     if update_wan_status(&shared_ipc_writer, has_wan).await.is_err() {
@@ -47,20 +61,20 @@ async fn run_wan_status_monitor(
 }
 
 async fn update_wan_status(
-    shared_ipc_writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    shared_ipc_writer: &Arc<Mutex<OwnedWriteHalf>>,
     has_wan: bool,
-) -> Result<(), std::io::Error> {
+) -> Result<(), IoError> {
     let msg = SntpParentToWorkerMsg::SetWanStatus { active: has_wan };
     let mut writer = shared_ipc_writer.lock().await;
     send_msg(&mut *writer, &msg).await
 }
 
 async fn run_parent_ipc_receiver(
-    mut ipc_reader: tokio::net::unix::OwnedReadHalf,
+    mut ipc_reader: OwnedReadHalf,
     child_pid: u32,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: Receiver<bool>,
 ) {
-    println!(
+    info!(
         "[sntp-client-parent] Supervising SNTP client worker (PID {})",
         child_pid
     );
@@ -76,12 +90,12 @@ async fn run_parent_ipc_receiver(
         }
     }
 
-    let pid = nix::unistd::Pid::from_raw(child_pid as i32);
-    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    let pid = Pid::from_raw(child_pid as i32);
+    let _ = kill(pid, Signal::SIGKILL);
 }
 
 async fn handle_parent_ipc_message(
-    res: Result<Option<SntpClientToParentMsg>, std::io::Error>,
+    res: Result<Option<SntpClientToParentMsg>, IoError>,
 ) -> bool {
     match res {
         Ok(Some(SntpClientToParentMsg::SetSystemTime {
@@ -92,25 +106,25 @@ async fn handle_parent_ipc_message(
             true
         }
         Ok(None) => {
-            println!("[sntp-client-parent] Worker IPC socket closed.");
+            info!("[sntp-client-parent] Worker IPC socket closed.");
             false
         }
         Err(e) => {
-            eprintln!("[sntp-client-parent] IPC recv error: {}", e);
+            error!("[sntp-client-parent] IPC recv error: {}", e);
             false
         }
     }
 }
 
 fn set_system_clock(seconds: i64, nanoseconds: i64) {
-    let timespec = nix::sys::time::TimeSpec::new(seconds, nanoseconds);
-    if let Err(e) = nix::time::clock_settime(nix::time::ClockId::CLOCK_REALTIME, timespec) {
-        eprintln!(
-            "[sntp-client-parent] ERROR: Failed to set system clock: {}",
+    let timespec = TimeSpec::new(seconds, nanoseconds);
+    if let Err(e) = clock_settime(ClockId::CLOCK_REALTIME, timespec) {
+        error!(
+            "[sntp-client-parent] Failed to set system clock: {}",
             e
         );
     } else {
-        println!("[sntp-client-parent] Successfully set system clock.");
+        info!("[sntp-client-parent] Successfully set system clock.");
     }
 }
 
@@ -118,16 +132,13 @@ fn start_parent_sntp_monitor(
     parent_ipc_fd: RawFd,
     child_pid: u32,
     lease_state: SharedWanLease,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<tokio::task::JoinHandle<()>, ServiceError> {
-    use std::os::unix::io::FromRawFd;
-    use std::os::unix::net::UnixStream as StdUnixStream;
-
+    shutdown_rx: Receiver<bool>,
+) -> Result<JoinHandle<()>, ServiceError> {
     let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
     std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
-    let ipc_stream = tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let ipc_stream = UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
-    let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
+    let shared_ipc_writer = Arc::new(Mutex::new(ipc_writer));
 
     // Spawn WAN status monitor task
     let shutdown_rx_clone = shutdown_rx.clone();

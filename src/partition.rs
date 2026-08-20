@@ -1,7 +1,10 @@
 use crate::error::RouterError;
 use crate::system::SystemOps;
+use log::{debug, info, warn};
 use nix::mount::MsFlags;
-use std::fs;
+use std::fs::{self, DirEntry, File, OpenOptions};
+use std::io::{Error as IoError, Seek, SeekFrom};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,7 +32,7 @@ fn get_partition_sectors(p2_name: &str) -> Result<u64, RouterError> {
     Ok(sectors)
 }
 
-fn reread_partition_table(fd: std::os::unix::io::RawFd) {
+fn reread_partition_table(fd: RawFd) {
     #[cfg(target_env = "musl")]
     const BLKRRPART: libc::c_int = 0x125F;
     #[cfg(not(target_env = "musl"))]
@@ -38,13 +41,13 @@ fn reread_partition_table(fd: std::os::unix::io::RawFd) {
     unsafe {
         let res = libc::ioctl(fd, BLKRRPART);
         if res < 0 {
-            let err = std::io::Error::last_os_error();
-            println!(
-                "[init] Warning: BLKRRPART ioctl failed: {}. Partition table changes might require a reboot.",
+            let err = IoError::last_os_error();
+            warn!(
+                "[init] BLKRRPART ioctl failed: {}. Partition table changes might require a reboot.",
                 err
             );
         } else {
-            println!("[init] BLKRRPART ioctl succeeded.");
+            debug!("[init] BLKRRPART ioctl succeeded.");
         }
     }
 }
@@ -58,8 +61,7 @@ fn write_mbr_partition_2(parent_disk: &str) -> Result<(), RouterError> {
 
     let disk_sectors = get_partition_sectors(disk_name)?;
 
-    use std::io::{Seek, SeekFrom};
-    let mut disk_file = fs::OpenOptions::new()
+    let mut disk_file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(parent_disk)
@@ -102,14 +104,12 @@ fn write_mbr_partition_2(parent_disk: &str) -> Result<(), RouterError> {
         .sync_all()
         .map_err(|e| RouterError::Generic(format!("Failed to flush MBR: {}", e)))?;
 
-    println!("[init] MBR partition 2 entry written. Rereading partition table...");
-    use std::os::unix::io::AsRawFd;
+    info!("[init] MBR partition 2 entry written. Rereading partition table...");
     reread_partition_table(disk_file.as_raw_fd());
     Ok(())
 }
 
 fn format_partition_as_fat32(p2_dev: &str) -> Result<(), RouterError> {
-    use std::fs::OpenOptions;
     let mut p2_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -121,7 +121,7 @@ fn format_partition_as_fat32(p2_dev: &str) -> Result<(), RouterError> {
             ))
         })?;
 
-    println!("[init] Formatting {} using fatfs crate...", p2_dev);
+    debug!("[init] Formatting {} using fatfs crate...", p2_dev);
 
     let options = fatfs::FormatVolumeOptions::new()
         .fat_type(fatfs::FatType::Fat32)
@@ -134,14 +134,14 @@ fn format_partition_as_fat32(p2_dev: &str) -> Result<(), RouterError> {
         .sync_all()
         .map_err(|e| RouterError::Generic(format!("Failed to flush partition: {}", e)))?;
 
-    println!(
+    info!(
         "[init] Partition {} formatted successfully using fatfs.",
         p2_dev
     );
     Ok(())
 }
 
-fn check_partition_entry(entry: fs::DirEntry) -> Result<Option<(String, String)>, RouterError> {
+fn check_partition_entry(entry: DirEntry) -> Result<Option<(String, String)>, RouterError> {
     let name = entry.file_name().into_string().unwrap_or_default();
     if name.is_empty() {
         return Ok(None);
@@ -154,7 +154,7 @@ fn check_partition_entry(entry: fs::DirEntry) -> Result<Option<(String, String)>
     }
 
     let dev_path = format!("/dev/{}", name);
-    let mut file = match fs::File::open(&dev_path) {
+    let mut file = match File::open(&dev_path) {
         Ok(f) => f,
         Err(_) => return Ok(None),
     };
@@ -180,7 +180,7 @@ fn check_partition_entry(entry: fs::DirEntry) -> Result<Option<(String, String)>
     let parent_name = parent_name_os.to_string_lossy().into_owned();
     let parent_disk_path = format!("/dev/{}", parent_name);
 
-    println!(
+    info!(
         "[init] Found boot partition at {} on parent disk {}",
         dev_path, parent_disk_path
     );
@@ -227,7 +227,7 @@ pub fn ensure_log_partition_in_mbr(boot_dev: &str, parent_disk: &str) -> Result<
     let p2_dev_path = format!("/dev/{}", p2_name);
 
     if !Path::new(&p2_sys_path).exists() {
-        println!("[init] Partition 2 does not exist in MBR. Creating partition entry...");
+        info!("[init] Partition 2 does not exist in MBR. Creating partition entry...");
         write_mbr_partition_2(parent_disk)?;
 
         let mut found = false;
@@ -250,7 +250,7 @@ pub fn ensure_log_partition_in_mbr(boot_dev: &str, parent_disk: &str) -> Result<
 
 pub fn wait_for_boot_partition() -> Result<(String, String), RouterError> {
     let start = Instant::now();
-    println!("[init] Waiting for boot partition to become available...");
+    info!("[init] Waiting for boot partition to become available...");
 
     while start.elapsed() < BOOT_MOUNT_TIMEOUT {
         if let Ok(res) = find_boot_partition() {
@@ -266,7 +266,7 @@ pub fn wait_for_boot_partition() -> Result<(String, String), RouterError> {
 
 pub fn mount_boot_partition<S: SystemOps>(sys: &S, boot_dev: &str) -> Result<(), RouterError> {
     if let Err(e) = fs::create_dir_all(BOOT_MOUNT_POINT) {
-        println!(
+        warn!(
             "[init] Warning: failed to create {} directory: {}",
             BOOT_MOUNT_POINT, e
         );
@@ -281,7 +281,7 @@ pub fn mount_boot_partition<S: SystemOps>(sys: &S, boot_dev: &str) -> Result<(),
     )
     .map_err(|e| RouterError::Generic(format!("Failed to mount boot partition: {}", e)))?;
 
-    println!(
+    info!(
         "[init] Successfully mounted {} on {} as read-only.",
         boot_dev, BOOT_MOUNT_POINT
     );
@@ -314,7 +314,7 @@ pub fn setup_log_partition<S: SystemOps>(
     let p2_dev_path = format!("/dev/{}", p2_name);
 
     if let Err(e) = fs::create_dir_all("/var/log") {
-        println!("[init] Warning: failed to create /var/log: {}", e);
+        warn!("[init] Warning: failed to create /var/log: {}", e);
     }
 
     if let Err(e) = sys.mount(
@@ -324,7 +324,7 @@ pub fn setup_log_partition<S: SystemOps>(
         MsFlags::empty(),
         None,
     ) {
-        println!(
+        warn!(
             "[init] Log partition mount failed: {}. Formatting and retrying...",
             e
         );
@@ -345,6 +345,6 @@ pub fn setup_log_partition<S: SystemOps>(
         })?;
     }
 
-    println!("[init] Log partition mounted successfully on /var/log.");
+    info!("[init] Log partition mounted successfully on /var/log.");
     Ok(())
 }

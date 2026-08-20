@@ -1,12 +1,18 @@
-use crate::managers::ipc::{DnsParentToWorkerMsg, recv_msg};
+use crate::managers::ipc::{recv_msg, DnsParentToWorkerMsg};
 use crate::managers::utils::{
-    DNS_FORWARDER_GID, DNS_FORWARDER_UID, drop_privileges, wait_shutdown,
+    drop_privileges, wait_shutdown, DNS_FORWARDER_GID, DNS_FORWARDER_UID,
 };
+use log::{error, info, warn};
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
-use std::os::unix::io::RawFd;
+use std::io::{Error as IoError, ErrorKind};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::net::unix::OwnedReadHalf;
+use tokio::net::{UdpSocket, UnixStream};
+use tokio::sync::watch::{channel, Receiver, Sender};
 
 // =========================================================================
 // DNS Constants & Config
@@ -45,31 +51,28 @@ pub async fn run_dns_forwarder_worker(
     ipc_fd: RawFd,
     dns_socket_fd: RawFd,
     upstream_socket_fd: RawFd,
-) -> Result<(), std::io::Error> {
-    use std::os::unix::io::FromRawFd;
-    use std::os::unix::net::UnixStream as StdUnixStream;
-
-    println!("[dns-forwarder-worker] Starting unprivileged DNS forwarder worker...");
+) -> Result<(), IoError> {
+    info!("[dns-forwarder-worker] Starting unprivileged DNS forwarder worker...");
 
     // Convert raw FDs
-    let std_dns_socket = unsafe { std::net::UdpSocket::from_raw_fd(dns_socket_fd) };
-    let std_upstream_socket = unsafe { std::net::UdpSocket::from_raw_fd(upstream_socket_fd) };
+    let std_dns_socket = unsafe { StdUdpSocket::from_raw_fd(dns_socket_fd) };
+    let std_upstream_socket = unsafe { StdUdpSocket::from_raw_fd(upstream_socket_fd) };
 
     std_dns_socket.set_nonblocking(true)?;
     std_upstream_socket.set_nonblocking(true)?;
 
-    let dns_socket = tokio::net::UdpSocket::from_std(std_dns_socket)?;
-    let upstream_socket = tokio::net::UdpSocket::from_std(std_upstream_socket)?;
+    let dns_socket = UdpSocket::from_std(std_dns_socket)?;
+    let upstream_socket = UdpSocket::from_std(std_upstream_socket)?;
 
     let std_ipc = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
     std_ipc.set_nonblocking(true)?;
-    let ipc_stream = tokio::net::UnixStream::from_std(std_ipc)?;
+    let ipc_stream = UnixStream::from_std(std_ipc)?;
     let (ipc_reader, _ipc_writer) = ipc_stream.into_split();
 
     // Drop privileges
     drop_privileges(DNS_FORWARDER_UID, DNS_FORWARDER_GID)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
-    println!(
+        .map_err(|e| IoError::new(ErrorKind::PermissionDenied, e))?;
+    info!(
         "[dns-forwarder-worker] Privileges dropped successfully (running as dns-forwarder inside chroot jail)."
     );
 
@@ -80,7 +83,7 @@ pub async fn run_dns_forwarder_worker(
     let pending_queries: PendingQueries = Arc::new(Mutex::new(HashMap::new()));
     let upstream_dns = Arc::new(Mutex::new(Vec::<Ipv4Addr>::new()));
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = channel(false);
 
     // Spawn IPC monitor task to receive upstream DNS servers dynamically
     tokio::spawn(run_dns_ipc_monitor(
@@ -116,9 +119,9 @@ pub async fn run_dns_forwarder_worker(
 }
 
 async fn run_dns_ipc_monitor(
-    mut reader: tokio::net::unix::OwnedReadHalf,
+    mut reader: OwnedReadHalf,
     upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: Sender<bool>,
 ) {
     loop {
         match recv_msg::<DnsParentToWorkerMsg, _>(&mut reader).await {
@@ -127,12 +130,12 @@ async fn run_dns_ipc_monitor(
                 *lock = servers;
             }
             Ok(None) => {
-                println!("[dns-forwarder-worker] Parent closed IPC. Shutting down.");
+                info!("[dns-forwarder-worker] Parent closed IPC. Shutting down.");
                 let _ = shutdown_tx.send(true);
                 break;
             }
             Err(e) => {
-                eprintln!(
+                error!(
                     "[dns-forwarder-worker] IPC read error: {}. Shutting down.",
                     e
                 );
@@ -145,15 +148,15 @@ async fn run_dns_ipc_monitor(
 
 fn dispatch_pending_query(
     pending: PendingQuery,
-    from_addr: std::net::SocketAddr,
+    from_addr: SocketAddr,
     resp_buf: &[u8],
     len: usize,
     xid: u16,
 ) {
-    if from_addr.ip() == std::net::IpAddr::V4(pending.upstream_ip) {
+    if from_addr.ip() == IpAddr::V4(pending.upstream_ip) {
         let _ = pending.tx.send(resp_buf[..len].to_vec());
     } else {
-        eprintln!(
+        warn!(
             "[dns-forwarder] WARNING: Received DNS spoof attempt! IP {} mismatch for xid {}",
             from_addr.ip(),
             xid
@@ -205,10 +208,10 @@ async fn run_upstream_receiver(
 }
 
 async fn handle_upstream_error(
-    e: std::io::Error,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    e: IoError,
+    shutdown_rx: &mut Receiver<bool>,
 ) {
-    eprintln!("[dns-forwarder] Upstream socket read error: {}", e);
+    error!("[dns-forwarder] Upstream socket read error: {}", e);
     tokio::select! {
         _ = wait_shutdown(shutdown_rx) => {}
         _ = tokio::time::sleep(Duration::from_millis(100)) => {}
@@ -217,7 +220,7 @@ async fn handle_upstream_error(
 
 async fn run_cache_cleanup(
     cache: SharedCache,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: Receiver<bool>,
 ) {
     loop {
         if *shutdown_rx.borrow() {
@@ -237,12 +240,12 @@ async fn run_cache_cleanup(
 }
 
 async fn process_next_query(
-    socket: &Arc<tokio::net::UdpSocket>,
-    upstream_socket: &Arc<tokio::net::UdpSocket>,
+    socket: &Arc<UdpSocket>,
+    upstream_socket: &Arc<UdpSocket>,
     cache: &SharedCache,
     pending_queries: &PendingQueries,
     upstream_dns: &Arc<Mutex<Vec<Ipv4Addr>>>,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: &mut Receiver<bool>,
     buf: &mut [u8],
 ) -> bool {
     let recv_fut = socket.recv_from(buf);
@@ -284,12 +287,12 @@ async fn process_next_query(
 }
 
 async fn run_query_loop(
-    socket: Arc<tokio::net::UdpSocket>,
-    upstream_socket: Arc<tokio::net::UdpSocket>,
+    socket: Arc<UdpSocket>,
+    upstream_socket: Arc<UdpSocket>,
     cache: SharedCache,
     pending_queries: PendingQueries,
     upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: Receiver<bool>,
 ) {
     let mut buf = [0u8; RECV_BUF_SIZE];
     loop {
@@ -313,10 +316,10 @@ async fn run_query_loop(
 }
 
 async fn handle_query_loop_error(
-    e: std::io::Error,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    e: IoError,
+    shutdown_rx: &mut Receiver<bool>,
 ) {
-    eprintln!(
+    warn!(
         "[dns-forwarder] Socket receive error: {}. Retrying in 1s...",
         e
     );

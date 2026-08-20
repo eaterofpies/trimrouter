@@ -1,11 +1,14 @@
 use crate::error::RouterError;
+use log::{error, info, warn};
 use nix::mount::MsFlags;
 use nix::sys::reboot::RebootMode;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::fs;
 use std::panic;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 pub trait SystemOps: Send + Sync + 'static {
@@ -74,73 +77,71 @@ impl SystemOps for RealSystem {
 }
 
 pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), RouterError> {
-    println!("[init] Mounting virtual filesystems...");
+    info!("[init] Mounting virtual filesystems...");
 
     sys.mount(None, "/proc", "proc", MsFlags::empty(), None)
         .map_err(|e| RouterError::Generic(format!("Failed to mount /proc: {}", e)))?;
-    println!("[init] Mounted /proc successfully.");
+    info!("[init] Mounted /proc successfully.");
 
     sys.mount(None, "/sys", "sysfs", MsFlags::empty(), None)
         .map_err(|e| RouterError::Generic(format!("Failed to mount /sys: {}", e)))?;
-    println!("[init] Mounted /sys successfully.");
+    info!("[init] Mounted /sys successfully.");
 
     sys.mount(None, "/dev", "devtmpfs", MsFlags::empty(), None)
         .map_err(|e| RouterError::Generic(format!("Failed to mount /dev: {}", e)))?;
-    println!("[init] Mounted /dev successfully.");
+    info!("[init] Mounted /dev successfully.");
 
     sys.mount(None, "/run", "tmpfs", MsFlags::empty(), None)
         .map_err(|e| RouterError::Generic(format!("Failed to mount /run: {}", e)))?;
-    println!("[init] Mounted /run successfully.");
+    info!("[init] Mounted /run successfully.");
 
     // Set kernel modprobe helper path to trigger lazy loading
     if let Err(e) = fs::write("/proc/sys/kernel/modprobe", "/sbin/modprobe") {
-        println!(
+        warn!(
             "[init] Warning: Failed to set /proc/sys/kernel/modprobe: {}",
             e
         );
     } else {
-        println!("[init] Configured kernel modprobe path to /sbin/modprobe.");
+        info!("[init] Configured kernel modprobe path to /sbin/modprobe.");
     }
 
     Ok(())
 }
 
-use std::sync::atomic::AtomicI32;
-
 // -1 = infinite (default), >=0 = delay in seconds
 pub static REBOOT_DELAY: AtomicI32 = AtomicI32::new(-1);
 
 fn log_panic_info(info: &std::panic::PanicHookInfo<'_>) {
-    eprintln!("====================================================");
-    eprintln!("CRITICAL: TRIMROUTER PANICKED!");
+    error!("====================================================");
+    error!("CRITICAL: TRIMROUTER PANICKED!");
     if let Some(s) = info.payload().downcast_ref::<&str>() {
-        eprintln!("Panic Cause: {}", s);
+        error!("Panic Cause: {}", s);
     } else if let Some(s) = info.payload().downcast_ref::<String>() {
-        eprintln!("Panic Cause: {}", s);
+        error!("Panic Cause: {}", s);
     } else {
-        eprintln!("Panic Cause: Unknown");
+        error!("Panic Cause: Unknown");
     }
     if let Some(loc) = info.location() {
-        eprintln!("Location: {}:{}:{}", loc.file(), loc.line(), loc.column());
+        error!("Location: {}:{}:{}", loc.file(), loc.line(), loc.column());
     }
-    eprintln!("====================================================");
+    error!("====================================================");
 }
 
 fn halt_on_panic<S: SystemOps>(sys: &S) {
     if sys.getpid() != Pid::from_raw(1) {
         return;
     }
-    let delay = REBOOT_DELAY.load(std::sync::atomic::Ordering::Relaxed);
+    let delay = REBOOT_DELAY.load(Ordering::Relaxed);
 
     if delay >= 0 {
-        eprintln!("[init] Rebooting in {} seconds...", delay);
-        std::thread::sleep(Duration::from_secs(delay as u64));
-        eprintln!("[init] Rebooting system now...");
+        error!("[init] Rebooting in {} seconds...", delay);
+        thread::sleep(Duration::from_secs(delay as u64));
+        error!("[init] Rebooting system now...");
         let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
     } else {
-        eprintln!("[init] System halted. Hanging indefinitely on panic...");
+        error!("[init] System halted. Hanging indefinitely on panic...");
         loop {
-            std::thread::sleep(Duration::from_secs(3600));
+            thread::sleep(Duration::from_secs(3600));
         }
     }
 }

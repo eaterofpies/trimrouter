@@ -6,6 +6,7 @@ pub mod lan_manager;
 pub mod sntp_client;
 pub mod utils;
 
+use log::{error, info};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{self, BufRead, BufReader, Read};
@@ -138,7 +139,7 @@ impl ExternalWorker {
                 let (worker_service, parent_ipc_fd) = match setup_attempt() {
                     Ok(res) => res,
                     Err(e) => {
-                        eprintln!("[{}-parent] Setup attempt failed: {:?}", service_name, e);
+                        error!("[{}-parent] Setup attempt failed: {:?}", service_name, e);
                         continue;
                     }
                 };
@@ -155,7 +156,7 @@ impl ExternalWorker {
                 ) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("[{}-parent] Spawn failed: {:?}", service_name, e);
+                        error!("[{}-parent] Spawn failed: {:?}", service_name, e);
                         unsafe {
                             let _ = libc::close(parent_ipc_fd);
                         }
@@ -170,7 +171,7 @@ impl ExternalWorker {
                     match run_monitor(parent_ipc_fd, child_pid, shutdown_rx.clone()) {
                         Ok(h) => h,
                         Err(e) => {
-                            eprintln!(
+                            error!(
                                 "[{}-parent] Failed to start monitor task: {:?}",
                                 service_name, e
                             );
@@ -199,7 +200,7 @@ impl ExternalWorker {
 
         let _ = tx.send(true);
         if child_pid != 0 {
-            println!(
+            info!(
                 "[{}-parent] Stopping worker process PID {}",
                 self.service_name, child_pid
             );

@@ -1,13 +1,21 @@
-use super::ipc::{DhcpServerParentToWorkerMsg, send_msg};
+use super::ipc::{send_msg, DhcpServerParentToWorkerMsg};
 use super::utils::setup_worker_sockets;
 use super::{ExternalWorker, Service, ServiceError};
 use futures_util::StreamExt;
-use rtnetlink::MulticastGroup;
+use log::info;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use rtnetlink::packet_core::NetlinkPayload;
-use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
-use std::os::unix::io::RawFd;
+use rtnetlink::packet_route::RouteNetlinkMessage;
+use rtnetlink::MulticastGroup;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
+use tokio::net::UnixStream;
+use tokio::sync::watch::Receiver;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 pub struct DhcpServer {
     lan_interface: String,
@@ -32,16 +40,13 @@ impl DhcpServer {
 fn start_parent_arp_listener(
     parent_ipc_fd: RawFd,
     child_pid: u32,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<tokio::task::JoinHandle<()>, ServiceError> {
-    use std::os::unix::io::FromRawFd;
-    use std::os::unix::net::UnixStream as StdUnixStream;
-
+    mut shutdown_rx: Receiver<bool>,
+) -> Result<JoinHandle<()>, ServiceError> {
     let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
     std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
-    let ipc_stream = tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let ipc_stream = UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
     let (_, ipc_writer) = ipc_stream.into_split();
-    let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
+    let shared_ipc_writer = Arc::new(Mutex::new(ipc_writer));
 
     let connection_fut = rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]);
     let (connection, _handle, mut messages) = match connection_fut {
@@ -56,7 +61,7 @@ fn start_parent_arp_listener(
     tokio::spawn(connection);
 
     let handle = tokio::spawn(async move {
-        println!(
+        info!(
             "[dhcp-server-parent] Supervising DHCP server worker (PID {})",
             child_pid
         );
@@ -96,8 +101,8 @@ fn start_parent_arp_listener(
             }
         }
 
-        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        let pid = Pid::from_raw(child_pid as i32);
+        let _ = kill(pid, Signal::SIGKILL);
     });
 
     Ok(handle)
@@ -106,7 +111,7 @@ fn start_parent_arp_listener(
 fn setup_dhcp_server_attempt(
     lan_interface: &str,
     lan_ip: &str,
-) -> Result<(crate::cli::WorkerService, std::os::unix::io::RawFd), ServiceError> {
+) -> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
     let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) = setup_worker_sockets(lan_interface)
         .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
     Ok((

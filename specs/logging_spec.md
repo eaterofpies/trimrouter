@@ -18,27 +18,30 @@ The file is opened in **append mode** so that output accumulates across worker r
 
 ## 2. Log Line Format
 
-Each line written to `system.log` is stamped and tagged by PID 1 before being written:
+Each line written to `system.log` is stamped, prioritized by log level, and tagged with the service name:
 
 ```
-[<UTC timestamp>] [<service>] <message>
+[<UTC timestamp>] [<LEVEL>] [<service>] <message>
 ```
 
 Example:
 
 ```
-[2026-08-14T14:30:00Z] [init] Mounted /boot successfully.
-[2026-08-14T14:30:01Z] [dhcp-client] Sending DHCPDISCOVER on wan...
-[2026-08-14T14:30:01Z] [dns-forwarder] Listening on 192.168.1.1:53
-[2026-08-14T14:30:02Z] [dhcp-client] DHCPOFFER received from 10.0.2.2
+[2026-08-14T14:30:00Z] [INFO] [init] Mounted /boot successfully.
+[2026-08-14T14:30:01Z] [WARN] [dhcp-client] Sending DHCPDISCOVER on wan...
+[2026-08-14T14:30:01Z] [INFO] [dns-forwarder] Listening on 192.168.1.1:53
+[2026-08-14T14:30:02Z] [INFO] [dhcp-client] DHCPOFFER received from 10.0.2.2
+[2026-08-14T14:30:03Z] [DEBUG] [dns-forwarder] Cache query hit for router.lan
+[2026-08-14T14:30:04Z] [ERROR] [lan-manager] Failed to bind raw socket: permission denied
 ```
 
-Timestamps are UTC in ISO 8601 format. The `[service]` tag corresponds to one of: `init`, `dhcp-client`, `dhcp-server`, `dns-forwarder`, `sntp`.
+Timestamps are UTC in ISO 8601 format. The `[<LEVEL>]` tag corresponds to standard Rust `log` crate levels: `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`. The `[<service>]` tag corresponds to the module or service target (e.g., `init`, `dhcp-client`, `dhcp-server`, `dns-forwarder`, `sntp`).
 
-Individual service output can be filtered from the unified log with any text tool, e.g.:
+Individual service output or severity levels can be filtered from the unified log with any text tool, e.g.:
 
 ```bash
 grep '\[dhcp-client\]' system.log
+grep '\[ERROR\]' system.log
 ```
 
 ---
@@ -79,14 +82,15 @@ If reclamation cannot free enough space (all rotated files have already been del
 
 ## 4. Configuration
 
-The size limit is configurable in `trimrouter.toml` under the `[logging]` section:
+Logging configuration is specified in `trimrouter.toml` under the `[logging]` section:
 
 ```toml
 [logging]
 max_log_size_mb = 100   # (Optional: defaults to 100 MiB)
+level = "info"          # (Optional: "error", "warn", "info", "debug", "trace" — defaults to "info")
 ```
 
-If the `[logging]` section or `max_log_size_mb` key is absent, the default of `100 MiB` is used.
+If the `[logging]` section or any key is absent, defaults are used (`max_log_size_mb = 100`, `level = "info"`). Messages below the configured log level are filtered out before writing to disk.
 
 ---
 

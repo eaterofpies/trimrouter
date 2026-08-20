@@ -1,9 +1,21 @@
-use super::ipc::{DnsParentToWorkerMsg, send_msg};
-use super::utils::{SharedWanLease, create_ipc_fds};
+use super::ipc::{send_msg, DnsParentToWorkerMsg};
+use super::utils::{create_ipc_fds, SharedWanLease};
 use super::{ExternalWorker, Service, ServiceError};
-use std::net::Ipv4Addr;
-use std::os::unix::io::{IntoRawFd, RawFd};
+use log::info;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+use std::io::{Error as IoError, ErrorKind};
+use std::net::{Ipv4Addr, UdpSocket};
+use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
+use tokio::sync::watch::Receiver;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::interval;
 
 const DNS_PORT: u16 = 53;
 
@@ -26,19 +38,19 @@ impl DnsForwarder {
 }
 
 async fn run_parent_dns_monitor(
-    ipc_reader: tokio::net::unix::OwnedReadHalf,
-    shared_ipc_writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    ipc_reader: OwnedReadHalf,
+    shared_ipc_writer: Arc<Mutex<OwnedWriteHalf>>,
     child_pid: u32,
     lease_state: SharedWanLease,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: Receiver<bool>,
 ) {
-    println!(
+    info!(
         "[dns-forwarder-parent] Supervising DNS forwarder worker (PID {})",
         child_pid
     );
 
     let mut last_dns_servers: Vec<Ipv4Addr> = Vec::new();
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut interval_timer = interval(Duration::from_secs(1));
     let mut eof_buf = [0u8; 1];
 
     while !*shutdown_rx.borrow() {
@@ -50,10 +62,10 @@ async fn run_parent_dns_monitor(
                 }
                 match ipc_reader.try_read(&mut eof_buf) {
                     Ok(0) => {
-                        println!("[dns-forwarder-parent] Worker closed IPC. Shutting down monitor.");
+                        info!("[dns-forwarder-parent] Worker closed IPC. Shutting down monitor.");
                         break;
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                         // Not EOF, just woke up
                     }
                     _ => {
@@ -61,7 +73,7 @@ async fn run_parent_dns_monitor(
                     }
                 }
             }
-            _ = interval.tick() => {
+            _ = interval_timer.tick() => {
                 let current_servers = {
                     let lease = lease_state.lock().unwrap();
                     lease.dns_servers.clone()
@@ -77,15 +89,15 @@ async fn run_parent_dns_monitor(
         }
     }
 
-    let pid = nix::unistd::Pid::from_raw(child_pid as i32);
-    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    let pid = Pid::from_raw(child_pid as i32);
+    let _ = kill(pid, Signal::SIGKILL);
 }
 
 async fn update_upstream_resolvers(
-    shared_ipc_writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    shared_ipc_writer: &Arc<Mutex<OwnedWriteHalf>>,
     servers: &[Ipv4Addr],
-) -> Result<(), std::io::Error> {
-    println!(
+) -> Result<(), IoError> {
+    info!(
         "[dns-forwarder-parent] Upstream DNS servers updated: {:?}",
         servers
     );
@@ -100,16 +112,13 @@ fn start_parent_dns_monitor(
     parent_ipc_fd: RawFd,
     child_pid: u32,
     lease_state: SharedWanLease,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<tokio::task::JoinHandle<()>, ServiceError> {
-    use std::os::unix::io::FromRawFd;
-    use std::os::unix::net::UnixStream as StdUnixStream;
-
+    shutdown_rx: Receiver<bool>,
+) -> Result<JoinHandle<()>, ServiceError> {
     let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
     std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
-    let ipc_stream = tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let ipc_stream = UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
-    let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
+    let shared_ipc_writer = Arc::new(Mutex::new(ipc_writer));
 
     let handle = tokio::spawn(run_parent_dns_monitor(
         ipc_reader,
@@ -123,11 +132,11 @@ fn start_parent_dns_monitor(
 }
 
 fn setup_dns_forwarder_attempt()
--> Result<(crate::cli::WorkerService, std::os::unix::io::RawFd), ServiceError> {
+-> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
     let (parent_ipc_fd, child_ipc_fd) = create_ipc_fds()?;
-    let dns_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT))?;
+    let dns_socket = UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT))?;
     let dns_socket_fd = dns_socket.into_raw_fd();
-    let upstream_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let upstream_socket = UdpSocket::bind("0.0.0.0:0")?;
     let upstream_socket_fd = upstream_socket.into_raw_fd();
 
     Ok((

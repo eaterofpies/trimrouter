@@ -63,6 +63,12 @@ lan_mac = "52:54:00:12:34:57"
 # Optional static LAN gateway IP and subnet (default: "192.168.1.1/24")
 lan_ip = "192.168.1.1/24"
 
+[logging]
+# Optional maximum size for active log before rotation in MiB (default: 100)
+max_log_size_mb = 100
+# Optional log level filter: "error", "warn", "info", "debug", "trace" (default: "info")
+level = "info"
+
 [system]
 # Optional reboot delay in seconds on panic (defaults to infinite hang if omitted)
 # reboot_delay = 10

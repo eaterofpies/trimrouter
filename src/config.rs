@@ -4,15 +4,17 @@ use pnet::util::MacAddr;
 use serde::Deserialize;
 use std::str::FromStr;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LoggingConfig {
     pub max_log_size_mb: u64,
+    pub level: log::LevelFilter,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             max_log_size_mb: 100,
+            level: log::LevelFilter::Info,
         }
     }
 }
@@ -66,6 +68,7 @@ struct SystemSection {
 #[derive(Deserialize)]
 struct LoggingSection {
     max_log_size_mb: Option<u64>,
+    level: Option<String>,
 }
 
 impl RouterConfig {
@@ -93,24 +96,32 @@ impl RouterConfig {
             .network
             .lan_ip
             .unwrap_or_else(|| "192.168.1.1/24".to_string());
-
         let backup_lan_ip = parsed
             .network
             .backup_lan_ip
-            .clone()
             .unwrap_or_else(|| "10.0.0.1/24".to_string());
 
-        let reboot_delay = parsed
-            .system
+        let reboot_delay = parsed.system.and_then(|s| s.reboot_delay);
+
+        let max_log_size_mb = parsed
+            .logging
             .as_ref()
-            .and_then(|sys_sec| sys_sec.reboot_delay);
+            .and_then(|l| l.max_log_size_mb)
+            .unwrap_or(100);
+
+        let log_level = match parsed.logging.as_ref().and_then(|l| l.level.as_deref()) {
+            Some(lvl_str) => log::LevelFilter::from_str(lvl_str).map_err(|_| {
+                RouterError::Generic(format!(
+                    "Invalid logging level '{}'. Must be one of: error, warn, info, debug, trace",
+                    lvl_str
+                ))
+            })?,
+            None => log::LevelFilter::Info,
+        };
 
         let logging = LoggingConfig {
-            max_log_size_mb: parsed
-                .logging
-                .as_ref()
-                .and_then(|l| l.max_log_size_mb)
-                .unwrap_or(100),
+            max_log_size_mb,
+            level: log_level,
         };
 
         Ok(RouterConfig {
@@ -247,10 +258,12 @@ mod tests {
             lan_mac = "52:54:00:12:34:57"
             [logging]
             max_log_size_mb = 50
+            level = "debug"
         "#
         .to_string();
         let cfg = RouterConfig::parse(&sys).unwrap();
         assert_eq!(cfg.logging.max_log_size_mb, 50);
+        assert_eq!(cfg.logging.level, log::LevelFilter::Debug);
     }
 
     #[test]
@@ -264,5 +277,20 @@ mod tests {
         .to_string();
         let cfg = RouterConfig::parse(&sys).unwrap();
         assert_eq!(cfg.logging.max_log_size_mb, 100);
+        assert_eq!(cfg.logging.level, log::LevelFilter::Info);
+    }
+
+    #[test]
+    fn test_config_parsing_logging_invalid_level() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            [logging]
+            level = "super_verbose"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
     }
 }

@@ -8,11 +8,13 @@ use crate::error::RouterError;
 use crate::managers::{self, Service};
 use crate::network;
 use futures_util::{StreamExt, TryStreamExt};
+use log::{error, info, warn};
 use pnet::util::MacAddr;
 use rtnetlink::packet_core::NetlinkPayload;
+use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
 use rtnetlink::packet_route::RouteNetlinkMessage;
-use rtnetlink::packet_route::link::{LinkAttribute, LinkMessage};
 use rtnetlink::{LinkUnspec, MulticastGroup};
+use std::collections::{HashMap, HashSet};
 
 /// Dynamic Router Service wrapper for execution management.
 pub enum RouterService {
@@ -71,7 +73,7 @@ impl ManagedInterface {
     pub async fn start_services(&mut self) {
         for service in &mut self.active_services {
             if let Err(e) = service.start().await {
-                eprintln!(
+                error!(
                     "[interface] Failed to start service on interface {}: {}",
                     self.name, e
                 );
@@ -129,7 +131,7 @@ pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
     tokio::spawn(connection);
 
     // Map of interface index -> (name, MAC, has_link)
-    let mut link_states = std::collections::HashMap::new();
+    let mut link_states = HashMap::new();
 
     // Initial scan to populate current link states
     let mut links = handle.link().get().execute();
@@ -145,12 +147,12 @@ pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
             let has_link = link_msg
                 .header
                 .flags
-                .contains(rtnetlink::packet_route::link::LinkFlags::LowerUp);
+                .contains(LinkFlags::LowerUp);
             link_states.insert(index, (n.clone(), addr, has_link));
 
             if has_link {
                 let speed = get_link_speed(&n);
-                println!(
+                info!(
                     "[interface] Interface {} (MAC: {}) got link (speed: {})",
                     n, addr, speed
                 );
@@ -159,12 +161,12 @@ pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
     }
 
     // Local set tracking discovered interfaces to deduplicate logs (no static globals needed)
-    let mut detected_indices = std::collections::HashSet::new();
+    let mut detected_indices = HashSet::new();
 
     // Initial check (catch up on startup for all interfaces)
     for iface in &mut interfaces {
         if let Some((index, name)) = find_interface_by_mac(iface.mac).await {
-            println!(
+            info!(
                 "[interface] Interface {} (MAC: {}) detected at startup. Renaming and starting services...",
                 iface.name, iface.mac
             );
@@ -215,7 +217,7 @@ fn parse_link_attributes(attributes: Vec<LinkAttribute>) -> (Option<String>, Opt
 
 /// Formats and logs the newly detected network device's MAC address.
 fn log_detected_device(name: &str, mac: MacAddr) {
-    println!(
+    info!(
         "[interface] Detected network device: {} (MAC: {})",
         name, mac
     );
@@ -225,8 +227,8 @@ fn log_detected_device(name: &str, mac: MacAddr) {
 async fn process_netlink_message(
     rtnl_msg: RouteNetlinkMessage,
     interfaces: &mut [ManagedInterface],
-    detected_indices: &mut std::collections::HashSet<u32>,
-    link_states: &mut std::collections::HashMap<u32, (String, MacAddr, bool)>,
+    detected_indices: &mut HashSet<u32>,
+    link_states: &mut HashMap<u32, (String, MacAddr, bool)>,
 ) -> Result<(), RouterError> {
     match rtnl_msg {
         RouteNetlinkMessage::NewLink(link_msg) => {
@@ -244,8 +246,8 @@ async fn process_netlink_message(
 async fn handle_new_link_event(
     link_msg: LinkMessage,
     interfaces: &mut [ManagedInterface],
-    detected_indices: &mut std::collections::HashSet<u32>,
-    link_states: &mut std::collections::HashMap<u32, (String, MacAddr, bool)>,
+    detected_indices: &mut HashSet<u32>,
+    link_states: &mut HashMap<u32, (String, MacAddr, bool)>,
 ) -> Result<(), RouterError> {
     let index = link_msg.header.index;
     let (name, address) = parse_link_attributes(link_msg.attributes);
@@ -271,17 +273,17 @@ async fn handle_new_link_event(
     let has_link = link_msg
         .header
         .flags
-        .contains(rtnetlink::packet_route::link::LinkFlags::LowerUp);
+        .contains(LinkFlags::LowerUp);
     let prev_link = link_states.get(&index).map(|s| s.2);
     if prev_link != Some(has_link) {
         if has_link {
             let speed = get_link_speed(&n);
-            println!(
+            info!(
                 "[interface] Interface {} (MAC: {}) got link (speed: {})",
                 n, addr, speed
             );
         } else {
-            println!("[interface] Interface {} (MAC: {}) lost link", n, addr);
+            warn!("[interface] Interface {} (MAC: {}) lost link", n, addr);
         }
         link_states.insert(index, (n.clone(), addr, has_link));
     }
@@ -304,15 +306,15 @@ async fn handle_new_link_event(
 async fn handle_del_link_event(
     link_msg: LinkMessage,
     interfaces: &mut [ManagedInterface],
-    detected_indices: &mut std::collections::HashSet<u32>,
-    link_states: &mut std::collections::HashMap<u32, (String, MacAddr, bool)>,
+    detected_indices: &mut HashSet<u32>,
+    link_states: &mut HashMap<u32, (String, MacAddr, bool)>,
 ) {
     let index = link_msg.header.index;
     detected_indices.remove(&index);
     if let Some((n, addr, has_link)) = link_states.remove(&index)
         && has_link
     {
-        println!("[interface] Interface {} (MAC: {}) lost link", n, addr);
+        warn!("[interface] Interface {} (MAC: {}) lost link", n, addr);
     }
     for iface in interfaces {
         handle_del_link(iface, index).await;
@@ -341,7 +343,7 @@ async fn handle_new_link(
 ) -> Result<(), RouterError> {
     if mac == iface.mac {
         if iface.active_index.is_none() {
-            println!(
+            info!(
                 "[interface] Interface {} (MAC: {}) appeared. Renaming and starting services...",
                 iface.name, iface.mac
             );
@@ -354,7 +356,7 @@ async fn handle_new_link(
         // Collision: another interface has our target name but different MAC.
         // Rename it out of the way.
         let temp_name = format!("{}_old_{}", iface.name, index);
-        println!(
+        warn!(
             "[interface] Interface name collision: renaming existing interface {} (index {}) to {} to free up the name",
             iface.name, index, temp_name
         );
@@ -366,7 +368,7 @@ async fn handle_new_link(
 /// Handles dynamic cleanup of services when an active interface disappears.
 async fn handle_del_link(iface: &mut ManagedInterface, index: u32) {
     if iface.active_index == Some(index) {
-        println!(
+        warn!(
             "[interface] Interface {} (MAC: {}) disappeared. Stopping and deleting services...",
             iface.name, iface.mac
         );
@@ -406,13 +408,13 @@ pub async fn rename_and_up_interface(
         return Ok(());
     }
 
-    println!(
+    info!(
         "[interface] Renaming interface {} (index {}) to {} based on MAC {}",
         current_name, index, target_name, mac
     );
 
     rename_interface_by_index(index, target_name).await?;
-    println!(
+    info!(
         "[interface] Renamed interface from {} to {} (index {})",
         current_name, target_name, index
     );

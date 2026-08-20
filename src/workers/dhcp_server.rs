@@ -1,14 +1,18 @@
-use crate::managers::ipc::{DhcpServerParentToWorkerMsg, recv_msg};
+use crate::managers::ipc::{recv_msg, DhcpServerParentToWorkerMsg};
 use crate::managers::utils::{
-    DHCP_SERVER_GID, DHCP_SERVER_UID, drop_privileges, get_interface_mac, parse_dhcp_payload,
-    read_raw_packet, send_raw_packet, wait_shutdown,
+    drop_privileges, get_interface_mac, parse_dhcp_payload, read_raw_packet, send_raw_packet,
+    wait_shutdown, DHCP_SERVER_GID, DHCP_SERVER_UID,
 };
 use crate::packet::build_raw_packet;
+use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode, OptionCode};
+use dhcproto::{Encodable, Encoder};
+use log::{debug, error, info, warn};
 use pnet::packet::ethernet::EthernetPacket;
 use pnet::util::MacAddr;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
 use std::net::Ipv4Addr;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
@@ -179,10 +183,7 @@ pub async fn run_dhcp_server_worker(
     lan_interface: String,
     lan_ip: String,
 ) -> Result<(), std::io::Error> {
-    use std::os::unix::io::FromRawFd;
-    use std::os::unix::net::UnixStream as StdUnixStream;
-
-    println!(
+    info!(
         "[dhcp-server-worker] Starting unprivileged LAN DHCP server worker on {}...",
         lan_interface
     );
@@ -205,20 +206,20 @@ pub async fn run_dhcp_server_worker(
     let start_ip = hosts.next();
     let end_ip = hosts.next_back();
     if let (Some(start), Some(end)) = (start_ip, end_ip) {
-        println!(
+        debug!(
             "[dhcp-server-worker] Dynamic lease pool: {} to {}",
             start, end
         );
     }
 
     if let Err(e) = drop_privileges(DHCP_SERVER_UID, DHCP_SERVER_GID) {
-        eprintln!(
+        error!(
             "[dhcp-server-worker] FATAL: Failed to drop privileges: {}",
             e
         );
         std::process::exit(1);
     }
-    println!(
+    info!(
         "[dhcp-server-worker] Privileges dropped successfully (running as dhcp-server inside chroot jail)."
     );
 
@@ -243,7 +244,7 @@ pub async fn run_dhcp_server_worker(
                     update_lease_from_neighbor(mac, ip_address, &leases_clone).await;
                 }
                 Ok(None) | Err(_) => {
-                    println!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
+                    info!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
                     let _ = shutdown_tx.send(true);
                     break;
                 }
@@ -280,7 +281,7 @@ async fn receive_next_packet(
     match res {
         Ok(n) => Ok(Some(n)),
         Err(e) => {
-            eprintln!("[dhcp-server] Socket read error: {}. Recreating socket.", e);
+            error!("[dhcp-server] Socket read error: {}. Recreating socket.", e);
             Err(e)
         }
     }
@@ -342,30 +343,30 @@ async fn process_incoming_packet(
     };
     let src_mac = eth.get_source();
     if dhcp.giaddr().is_unspecified() && src_mac != client_mac {
-        eprintln!(
+        warn!(
             "[dhcp-server] WARNING: Dropping spoofed DHCP packet: L2 source MAC ({}) does not match chaddr ({})!",
             src_mac, client_mac
         );
         return;
     }
 
-    let msg_type = match dhcp.opts().get(dhcproto::v4::OptionCode::MessageType) {
-        Some(dhcproto::v4::DhcpOption::MessageType(mtype)) => *mtype,
+    let msg_type = match dhcp.opts().get(OptionCode::MessageType) {
+        Some(DhcpOption::MessageType(mtype)) => *mtype,
         _ => return,
     };
 
     match msg_type {
-        dhcproto::v4::MessageType::Discover => {
+        MessageType::Discover => {
             handle_dhcp_discover(async_sock, &config, &dhcp, client_mac, leases).await;
         }
-        dhcproto::v4::MessageType::Request => {
+        MessageType::Request => {
             handle_dhcp_request(async_sock, &config, &dhcp, client_mac, leases).await;
         }
-        dhcproto::v4::MessageType::Decline => {
+        MessageType::Decline => {
             let mut leases_guard = leases.lock().await;
             handle_dhcp_decline(client_mac, &mut leases_guard);
         }
-        dhcproto::v4::MessageType::Release => {
+        MessageType::Release => {
             let mut leases_guard = leases.lock().await;
             handle_dhcp_release(client_mac, &mut leases_guard);
         }
@@ -375,7 +376,7 @@ async fn process_incoming_packet(
 
 fn handle_dhcp_decline(client_mac: MacAddr, leases: &mut LeaseTable) {
     if let Some(lease) = leases.remove(&client_mac) {
-        println!(
+        info!(
             "[dhcp-server] Received DHCPDECLINE from client MAC: {}. Removed lease for IP: {}.",
             client_mac, lease.ip
         );
@@ -384,7 +385,7 @@ fn handle_dhcp_decline(client_mac: MacAddr, leases: &mut LeaseTable) {
 
 fn handle_dhcp_release(client_mac: MacAddr, leases: &mut LeaseTable) {
     if let Some(lease) = leases.remove(&client_mac) {
-        println!(
+        info!(
             "[dhcp-server] Received DHCPRELEASE from client MAC: {}. Released lease for IP: {}.",
             client_mac, lease.ip
         );
@@ -394,14 +395,11 @@ fn handle_dhcp_release(client_mac: MacAddr, leases: &mut LeaseTable) {
 /// Builds and encodes the common DHCPOFFER / DHCPACK payload, differing only
 /// in `msg_type`. Returns the encoded bytes or an error string.
 fn build_dhcp_reply_payload(
-    msg_type: dhcproto::v4::MessageType,
-    dhcp: &dhcproto::v4::Message,
+    msg_type: MessageType,
+    dhcp: &Message,
     leased_ip: Ipv4Addr,
     config: &ServerConfig,
 ) -> Result<Vec<u8>, String> {
-    use dhcproto::v4::{DhcpOption, Message, Opcode};
-    use dhcproto::{Encodable, Encoder};
-
     let mut reply = Message::default();
     reply.set_opcode(Opcode::BootReply);
     reply.set_xid(dhcp.xid());
@@ -436,13 +434,10 @@ fn build_dhcp_reply_payload(
 
 async fn send_dhcp_nak(
     async_sock: &AsyncFd<RawFd>,
-    dhcp: &dhcproto::v4::Message,
+    dhcp: &Message,
     client_mac: MacAddr,
     config: &ServerConfig,
 ) {
-    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
-    use dhcproto::{Encodable, Encoder};
-
     let mut nak = Message::default();
     nak.set_opcode(Opcode::BootReply);
     nak.set_xid(dhcp.xid());
@@ -454,7 +449,7 @@ async fn send_dhcp_nak(
 
     let mut payload = Vec::new();
     if let Err(e) = nak.encode(&mut Encoder::new(&mut payload)) {
-        eprintln!("[dhcp-server] ERROR: Failed to encode DHCPNAK: {}", e);
+        error!("[dhcp-server] Failed to encode DHCPNAK: {}", e);
         return;
     }
 
@@ -469,6 +464,7 @@ async fn send_dhcp_nak(
         dhcproto::v4::CLIENT_PORT,
         &payload,
     );
+
     send_raw_packet(async_sock, &frame).await;
 }
 
@@ -560,7 +556,7 @@ async fn probe_and_allocate_ip(
     loop {
         let ip = get_next_candidate(config, client_mac, leases).await?;
 
-        println!(
+        debug!(
             "[dhcp-server] Probing if IP {} is already in use on the LAN...",
             ip
         );
@@ -571,7 +567,7 @@ async fn probe_and_allocate_ip(
             if owner_mac == client_mac {
                 return Some(ip);
             }
-            println!(
+            warn!(
                 "[dhcp-server] CONFLICT DETECTED: IP {} is active on LAN with MAC {}. Marking as temporarily reserved.",
                 ip, owner_mac
             );
@@ -591,11 +587,11 @@ async fn probe_and_allocate_ip(
 async fn handle_dhcp_discover(
     async_sock: Arc<AsyncFd<RawFd>>,
     config: &ServerConfig,
-    dhcp: &dhcproto::v4::Message,
+    dhcp: &Message,
     client_mac: MacAddr,
     leases: Arc<tokio::sync::Mutex<LeaseTable>>,
 ) {
-    println!(
+    debug!(
         "[dhcp-server] Received DHCPDISCOVER from client MAC: {}",
         client_mac
     );
@@ -613,7 +609,7 @@ async fn handle_dhcp_discover(
     }
 
     let Some(leased_ip) = leased_ip else {
-        eprintln!("[dhcp-server] DHCP IP pool exhausted!");
+        error!("[dhcp-server] DHCP IP pool exhausted!");
         return;
     };
 
@@ -629,10 +625,10 @@ async fn handle_dhcp_discover(
     }
 
     let payload =
-        match build_dhcp_reply_payload(dhcproto::v4::MessageType::Offer, dhcp, leased_ip, config) {
+        match build_dhcp_reply_payload(MessageType::Offer, dhcp, leased_ip, config) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[dhcp-server] ERROR: {}", e);
+                error!("[dhcp-server] ERROR: {}", e);
                 return;
             }
         };
@@ -649,18 +645,17 @@ async fn handle_dhcp_discover(
     );
 
     send_raw_packet(&async_sock, &frame).await;
-    println!(
+    info!(
         "[dhcp-server] Sent DHCPOFFER of IP: {} to client.",
         leased_ip
     );
 }
 
 async fn get_requested_or_existing_ip(
-    dhcp: &dhcproto::v4::Message,
+    dhcp: &Message,
     client_mac: MacAddr,
     leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
 ) -> Option<Ipv4Addr> {
-    use dhcproto::v4::{DhcpOption, OptionCode};
     let requested_ip_opt = match dhcp.opts().get(OptionCode::RequestedIpAddress) {
         Some(DhcpOption::RequestedIpAddress(ip)) => Some(*ip),
         _ => None,
@@ -689,7 +684,7 @@ async fn verify_arp_conflict(
     config: &ServerConfig,
     leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
 ) -> bool {
-    println!(
+    debug!(
         "[dhcp-server] Performing ARP verification for requested IP {}...",
         leased_ip
     );
@@ -699,7 +694,7 @@ async fn verify_arp_conflict(
     if let Some(owner_mac) = leases_guard.get_mac_by_ip(leased_ip)
         && owner_mac != client_mac
     {
-        eprintln!(
+        warn!(
             "[dhcp-server] CONFLICT DETECTED: IP {} is active on LAN with MAC {} (requested by {}).",
             leased_ip, owner_mac, client_mac
         );
@@ -732,16 +727,16 @@ async fn confirm_lease(
 
 async fn send_dhcp_ack(
     async_sock: &AsyncFd<RawFd>,
-    dhcp: &dhcproto::v4::Message,
+    dhcp: &Message,
     client_mac: MacAddr,
     leased_ip: Ipv4Addr,
     config: &ServerConfig,
 ) {
     let payload =
-        match build_dhcp_reply_payload(dhcproto::v4::MessageType::Ack, dhcp, leased_ip, config) {
+        match build_dhcp_reply_payload(MessageType::Ack, dhcp, leased_ip, config) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[dhcp-server] ERROR: {}", e);
+                error!("[dhcp-server] ERROR: {}", e);
                 return;
             }
         };
@@ -758,17 +753,17 @@ async fn send_dhcp_ack(
     );
 
     send_raw_packet(async_sock, &frame).await;
-    println!("[dhcp-server] Sent DHCPACK of IP: {} to client.", leased_ip);
+    info!("[dhcp-server] Sent DHCPACK of IP: {} to client.", leased_ip);
 }
 
 async fn handle_dhcp_request(
     async_sock: Arc<AsyncFd<RawFd>>,
     config: &ServerConfig,
-    dhcp: &dhcproto::v4::Message,
+    dhcp: &Message,
     client_mac: MacAddr,
     leases: Arc<tokio::sync::Mutex<LeaseTable>>,
 ) {
-    println!(
+    debug!(
         "[dhcp-server] Received DHCPREQUEST from client MAC: {}",
         client_mac
     );
@@ -778,7 +773,7 @@ async fn handle_dhcp_request(
     };
 
     if !validate_requested_ip_lock(leased_ip, client_mac, config, &leases).await {
-        eprintln!(
+        warn!(
             "[dhcp-server] WARNING: Client {} requested invalid or conflicting IP {}. Sending NAK.",
             client_mac, leased_ip
         );

@@ -1,10 +1,11 @@
 use crate::system::SystemOps;
+use log::{debug, error, warn};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::time::{Duration, sleep};
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::{sleep, Duration};
 
 async fn fallback_polling_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     while !shutdown_flag.load(Ordering::Relaxed) {
@@ -14,12 +15,12 @@ async fn fallback_polling_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<A
 }
 
 pub async fn start_orphan_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
-    println!("[reaper] Starting orphan process reaper task...");
+    debug!("[reaper] Starting orphan process reaper task...");
 
     let mut sigchld_stream = match signal(SignalKind::child()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            warn!(
                 "[reaper] Error creating SIGCHLD stream: {}. Falling back to polling.",
                 e
             );
@@ -43,14 +44,14 @@ pub async fn start_orphan_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<A
 fn try_reap_zombie<S: SystemOps>(sys: &S) -> bool {
     match sys.waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
         Ok(WaitStatus::Exited(pid, code)) => {
-            println!(
+            debug!(
                 "[reaper] Reaped child process (PID {}) which exited with status {}",
                 pid, code
             );
             true
         }
         Ok(WaitStatus::Signaled(pid, sig, _)) => {
-            println!(
+            warn!(
                 "[reaper] Reaped child process (PID {}) which terminated with signal {}",
                 pid, sig
             );
@@ -59,7 +60,7 @@ fn try_reap_zombie<S: SystemOps>(sys: &S) -> bool {
         Ok(WaitStatus::StillAlive) => false,
         Err(nix::Error::ECHILD) => false,
         Err(e) => {
-            eprintln!("[reaper] waitpid error: {}", e);
+            error!("[reaper] waitpid error: {}", e);
             false
         }
         _ => false,

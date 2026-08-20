@@ -94,7 +94,7 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        trimrouter::logging::init_logging(config.logging.max_log_size_mb);
+        trimrouter::logging::init_logging(config.logging.max_log_size_mb, config.logging.level);
 
         // Test 0: Network Device Discovery (Waiting for interfaces to appear via MAC)
         std::println!("[test] Starting Network Device Discovery test...");

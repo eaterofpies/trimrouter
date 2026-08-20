@@ -1,21 +1,24 @@
 use crate::error::RouterError;
-use crate::managers::utils::{SharedWanLease, mask_to_prefix_len};
+use crate::managers::utils::{mask_to_prefix_len, SharedWanLease};
 use crate::managers::{DhcpServer, Service, ServiceError};
 use crate::network;
 use futures_util::{StreamExt, TryStreamExt};
 use ipnet::Ipv4Net;
-use rtnetlink::MulticastGroup;
+use log::{debug, error, info, warn};
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::link::LinkAttribute;
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
+use rtnetlink::MulticastGroup;
+use tokio::sync::watch::Sender;
+use tokio::task::JoinHandle;
 
 pub struct LanManager {
     lan_interface: String,
     initial_ip: String,
     backup_ip: String,
     lease_state: SharedWanLease,
-    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown_tx: Option<Sender<bool>>,
+    task_handle: Option<JoinHandle<()>>,
 }
 
 impl LanManager {
@@ -38,10 +41,6 @@ impl LanManager {
 
 impl Service for LanManager {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        if self.task_handle.is_some() {
-            return Err(ServiceError::AlreadyRunning);
-        }
-
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
@@ -51,7 +50,7 @@ impl Service for LanManager {
         let lease_state = self.lease_state.clone();
 
         let handle = tokio::spawn(async move {
-            println!(
+            info!(
                 "[lan-manager] Starting LAN manager service on {}...",
                 lan_interface
             );
@@ -59,14 +58,14 @@ impl Service for LanManager {
             // 1. Initial IP configuration
             let current_ip = initial_ip.clone();
             if let Err(e) = network::configure_interface_ip(&lan_interface, &current_ip).await {
-                eprintln!("[lan-manager] Failed to configure initial LAN IP: {}", e);
+                error!("[lan-manager] Failed to configure initial LAN IP: {}", e);
                 return;
             }
 
             // 2. Start child DHCP server
             let mut dhcp_server = DhcpServer::new(lan_interface.clone(), current_ip.clone());
             if let Err(e) = dhcp_server.start().await {
-                eprintln!("[lan-manager] Failed to start LAN DHCP server: {}", e);
+                error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
                 return;
             }
 
@@ -77,14 +76,14 @@ impl Service for LanManager {
             ]) {
                 Ok(res) => res,
                 Err(e) => {
-                    eprintln!("[lan-manager] Failed to create multicast netlink: {}", e);
+                    error!("[lan-manager] Failed to create multicast netlink: {}", e);
                     let _ = dhcp_server.stop().await;
                     return;
                 }
             };
             tokio::spawn(connection);
 
-            println!("[lan-manager] Conflict monitoring started.");
+            debug!("[lan-manager] Conflict monitoring started.");
 
             // Run initial check
             let mut active_ip = current_ip.clone();
@@ -130,11 +129,11 @@ impl Service for LanManager {
                 }
             }
 
-            println!("[lan-manager] Stopping LAN DHCP server...");
+            info!("[lan-manager] Stopping LAN DHCP server...");
             if let Err(e) = dhcp_server.stop().await {
-                eprintln!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
+                error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
             }
-            println!("[lan-manager] LAN manager service stopped.");
+            info!("[lan-manager] LAN manager service stopped.");
         });
 
         self.task_handle = Some(handle);
@@ -142,15 +141,14 @@ impl Service for LanManager {
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
         let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
+        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
         let _ = tx.send(true);
         let _ = handle.await;
         Ok(())
     }
 }
 
-/// Helper function to perform conflict checking and resolution for LAN manager
 async fn check_and_resolve(
     lan_interface: &str,
     current_ip: &mut String,
@@ -158,29 +156,31 @@ async fn check_and_resolve(
     lease_state: &SharedWanLease,
     dhcp_server: &mut DhcpServer,
 ) -> bool {
-    let (wan_ip, wan_mask) = {
+    let wan_opt = {
         let lease = lease_state.lock().unwrap();
-        (lease.ip, lease.mask)
+        if let (Some(ip), Some(mask)) = (lease.ip, lease.mask) {
+            Some((ip, mask))
+        } else {
+            None
+        }
     };
 
-    let (Some(w_ip), Some(w_mask)) = (wan_ip, wan_mask) else {
-        return false; // No WAN IP, no conflict possible
-    };
-
-    let Ok(wan_prefix) = mask_to_prefix_len(w_mask) else {
+    let Some((wan_ip, wan_mask)) = wan_opt else {
         return false;
     };
 
-    let Ok(wan_net) = format!("{}/{}", w_ip, wan_prefix).parse::<Ipv4Net>() else {
+    let Ok(wan_prefix) = mask_to_prefix_len(wan_mask) else {
         return false;
     };
-
+    let Ok(wan_net) = Ipv4Net::new(wan_ip, wan_prefix) else {
+        return false;
+    };
     let Ok(lan_net) = current_ip.parse::<Ipv4Net>() else {
         return false;
     };
 
     if wan_net.contains(&lan_net.network()) || lan_net.contains(&wan_net.network()) {
-        println!(
+        warn!(
             "[lan-manager] CONFLICT DETECTED: WAN subnet ({}) overlaps with LAN subnet ({}).",
             wan_net, lan_net
         );
@@ -191,41 +191,41 @@ async fn check_and_resolve(
             return false;
         }
 
-        println!("[lan-manager] Stopping LAN DHCP server...");
+        info!("[lan-manager] Stopping LAN DHCP server...");
         if let Err(e) = dhcp_server.stop().await {
-            eprintln!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
+            error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
         }
 
         if let Some(index) = get_interface_index(lan_interface).await {
-            println!(
+            debug!(
                 "[lan-manager] Cleaning up IP addresses on interface {}...",
                 lan_interface
             );
             if let Err(e) = flush_ipv4_addresses(lan_interface, index).await {
-                eprintln!("[lan-manager] Failed to flush LAN interface IPs: {}", e);
+                error!("[lan-manager] Failed to flush LAN interface IPs: {}", e);
             }
         } else {
-            eprintln!("[lan-manager] Failed to get index for {}", lan_interface);
+            error!("[lan-manager] Failed to get index for {}", lan_interface);
         }
 
-        println!(
+        info!(
             "[lan-manager] Reconfiguring interface {} with new subnet {}...",
             lan_interface, new_ip
         );
         if let Err(e) = network::configure_interface_ip(lan_interface, &new_ip).await {
-            eprintln!("[lan-manager] Failed to reconfigure LAN IP: {}", e);
+            error!("[lan-manager] Failed to reconfigure LAN IP: {}", e);
             return false;
         }
 
         *current_ip = new_ip.clone();
 
-        println!("[lan-manager] Restarting LAN DHCP server on new subnet...");
+        info!("[lan-manager] Restarting LAN DHCP server on new subnet...");
         *dhcp_server = DhcpServer::new(lan_interface.to_string(), current_ip.clone());
         if let Err(e) = dhcp_server.start().await {
-            eprintln!("[lan-manager] Failed to start LAN DHCP server: {}", e);
+            error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
         }
 
-        println!("[lan-manager] LAN subnet shifted successfully.");
+        info!("[lan-manager] LAN subnet shifted successfully.");
         return true;
     }
     false
@@ -261,12 +261,12 @@ async fn flush_ipv4_addresses(name: &str, index: u32) -> Result<(), RouterError>
     let mut addrs = handle.address().get().execute();
     while let Ok(Some(addr_msg)) = addrs.try_next().await {
         if addr_msg.header.index == index && matches!(addr_msg.header.family, AddressFamily::Inet) {
-            println!(
+            debug!(
                 "[lan-manager] Deleting address on interface {} (prefix_len={}) during cleanup",
                 name, addr_msg.header.prefix_len
             );
             if let Err(e) = handle.address().del(addr_msg).execute().await {
-                println!("[lan-manager] WARNING: Failed to delete address: {}", e);
+                warn!("[lan-manager] Failed to delete address: {}", e);
             }
         }
     }

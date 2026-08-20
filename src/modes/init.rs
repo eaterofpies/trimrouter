@@ -1,13 +1,24 @@
 use crate::config::RouterConfig;
-use crate::managers::CHROOT_JAIL_PATH;
+use crate::interface;
+use crate::kmod;
+use crate::managers::{self, Service, CHROOT_JAIL_PATH};
+use crate::netfilter;
+use crate::network;
 use crate::partition::{
     ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
 };
-use crate::system::{RealSystem, SystemOps, mount_virtual_filesystems, register_panic_handler};
-use crate::{interface, kmod, managers, netfilter, network, reaper, signal, system};
+use crate::reaper;
+use crate::signal;
+use crate::system::{self, mount_virtual_filesystems, register_panic_handler, RealSystem, SystemOps};
+use futures_util::StreamExt;
+use log::{debug, error, info, warn};
 use nix::unistd::Pid;
+use std::fs::{self, metadata, set_permissions, OpenOptions};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use tokio::task::JoinHandle;
 
 pub async fn run_as_init(sys: Arc<RealSystem>) {
     let config = early_boot(sys.clone());
@@ -21,20 +32,15 @@ pub async fn run_as_init(sys: Arc<RealSystem>) {
     // Keep the main thread alive waiting for the signal handler to finish
     let _ = sig_handle.await;
 
-    println!("[init] Stopping services...");
-    use crate::managers::Service;
+    info!("[init] Stopping services...");
     let _ = dns_forwarder.stop().await;
 }
 
 fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
     // For PID 1, redirect standard descriptors (0, 1, 2) to /dev/console
     if sys.getpid() == Pid::from_raw(1)
-        && let Ok(console) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/console")
+        && let Ok(console) = OpenOptions::new().read(true).write(true).open("/dev/console")
     {
-        use std::os::unix::io::AsRawFd;
         let fd = console.as_raw_fd();
         unsafe {
             libc::dup2(fd, 0);
@@ -43,9 +49,9 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
         }
     }
 
-    println!("====================================================");
-    println!("Starting trimrouter (PID 1 Init Daemon)");
-    println!("====================================================");
+    info!("====================================================");
+    info!("Starting trimrouter (PID 1 Init Daemon)");
+    info!("====================================================");
 
     // 1. Register Panic Hook (Emergency Reboot)
     register_panic_handler(sys.clone());
@@ -66,7 +72,7 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
         };
 
         if let Err(e) = ensure_log_partition_in_mbr(&boot_dev, &parent_disk) {
-            println!("[init] Warning: failed to ensure partition 2: {}", e);
+            warn!("[init] Warning: failed to ensure partition 2: {}", e);
         }
 
         if let Err(e) = mount_boot_partition(sys.as_ref(), &boot_dev) {
@@ -77,25 +83,24 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
         kmod::activate_boot_modules();
 
         if let Err(e) = setup_log_partition(sys.as_ref(), &boot_dev, &parent_disk) {
-            println!("[init] WARNING: Failed to setup log partition: {}", e);
+            warn!("[init] Warning: Failed to setup log partition: {}", e);
         }
 
         // Create chroot jail directory if it doesn't exist
-        std::fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
-        if let Ok(metadata) = std::fs::metadata(CHROOT_JAIL_PATH) {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = metadata.permissions();
+        fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
+        if let Ok(meta) = metadata(CHROOT_JAIL_PATH) {
+            let mut perms = meta.permissions();
             perms.set_mode(0o555); // rx-rx-rx
-            std::fs::set_permissions(CHROOT_JAIL_PATH, perms)
+            set_permissions(CHROOT_JAIL_PATH, perms)
                 .expect("Failed to set chroot jail permissions");
         }
     } else {
-        println!(
+        info!(
             "[init] Running in standard user environment (PID {}). Skipping VFS mounts.",
             sys.getpid()
         );
         // Ensure jail directory exists for local tests as well
-        std::fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
+        fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
     }
 
     // 3. Load Configuration
@@ -105,13 +110,13 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
             panic!("FATAL: Failed to parse configuration: {}", e);
         }
     };
-    crate::logging::init_logging(config.logging.max_log_size_mb);
+    crate::logging::init_logging(config.logging.max_log_size_mb, config.logging.level);
     let delay_val = match config.reboot_delay {
         None => -1,
         Some(d) => d as i32,
     };
-    system::REBOOT_DELAY.store(delay_val, std::sync::atomic::Ordering::Relaxed);
-    println!("[init] Configuration loaded: {:?}", config);
+    system::REBOOT_DELAY.store(delay_val, Ordering::Relaxed);
+    info!("[init] Configuration loaded: {:?}", config);
 
     config
 }
@@ -119,7 +124,7 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
 fn start_system_services(
     sys: Arc<RealSystem>,
     shutdown_flag: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
+) -> JoinHandle<()> {
     // Spawn orphan process reaper
     let reaper_sys = sys.clone();
     let reaper_shutdown = shutdown_flag.clone();
@@ -164,10 +169,9 @@ async fn configure_networking_and_services(
     let lease_state = Arc::new(std::sync::Mutex::new(managers::WanLease::default()));
 
     // Start DNS Forwarder as a global service
-    use crate::managers::Service;
     let mut dns_forwarder = managers::DnsForwarder::new(lease_state.clone());
     if let Err(e) = dns_forwarder.start().await {
-        eprintln!("[init] ERROR: Failed to start DNS forwarder: {}", e);
+        error!("[init] Failed to start DNS forwarder: {}", e);
     }
 
     // Create and monitor interfaces via the unified ManagedInterface structure
@@ -200,31 +204,28 @@ async fn configure_networking_and_services(
 
     tokio::spawn(interface::monitor_interfaces(vec![wan_iface, lan_iface]));
 
-    println!("[init] System startup completed successfully. Entering main event loop.");
+    info!("[init] System startup completed successfully. Entering main event loop.");
 
     dns_forwarder
 }
 
 async fn start_power_button_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
-    println!("[init] Starting ACPI power button monitor...");
+    debug!("[init] Starting ACPI power button monitor...");
     for i in 0..5 {
         let path = format!("/dev/input/event{}", i);
         if let Ok(device) = evdev::Device::open(&path) {
-            println!("[init] Monitoring power button input device: {}", path);
+            debug!("[init] Monitoring power button input device: {}", path);
             let sys_clone = sys.clone();
             let shutdown_clone = shutdown_flag.clone();
             tokio::spawn(async move {
                 if let Ok(mut stream) = device.into_event_stream() {
-                    use futures_util::StreamExt;
                     while let Some(Ok(event)) = stream.next().await {
                         if event.event_type() == evdev::EventType::KEY
                             && event.code() == evdev::KeyCode::KEY_POWER.code()
                             && event.value() == 1
                         {
-                            println!(
-                                "\n[acpi] Power button pressed. Triggering system shutdown..."
-                            );
-                            shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                            info!("[acpi] Power button pressed. Triggering system shutdown...");
+                            shutdown_clone.store(true, Ordering::Relaxed);
                             let _ = sys_clone.reboot(nix::sys::reboot::RebootMode::RB_POWER_OFF);
                             break;
                         }

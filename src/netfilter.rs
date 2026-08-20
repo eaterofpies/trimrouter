@@ -1,4 +1,5 @@
 use crate::error::RouterError;
+use log::{debug, info};
 use rustables::expr::{
     Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Immediate, Masquerade, Meta,
     MetaType, VerdictKind,
@@ -16,7 +17,7 @@ fn pad_interface_name(name: &str) -> [u8; 16] {
 }
 
 pub fn configure_firewall(wan_iface: &str, lan_iface: &str) -> Result<(), RouterError> {
-    println!("[netfilter] Configuring NAT and firewall rules...");
+    debug!("[netfilter] Configuring NAT and firewall rules...");
 
     let table = Table::new(ProtocolFamily::Ipv4).with_name("trimrouter");
 
@@ -108,7 +109,7 @@ pub fn configure_firewall(wan_iface: &str, lan_iface: &str) -> Result<(), Router
     batch.add(&ct_rule, MsgType::Add);
 
     batch.send()?;
-    println!("[netfilter] NAT and firewall rules configured successfully.");
+    info!("[netfilter] NAT and firewall rules configured successfully.");
 
     Ok(())
 }

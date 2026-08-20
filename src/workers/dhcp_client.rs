@@ -1,14 +1,17 @@
 use crate::managers::dhcp_client::{configure_wan, deconfigure_wan};
-use crate::managers::ipc::{DhcpClientToParentMsg, send_msg};
+use crate::managers::ipc::{send_msg, DhcpClientToParentMsg};
 use crate::managers::utils::{
-    CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, SharedWanLease, WanLease,
     drop_privileges, get_interface_mac, mask_to_prefix_len as utils_mask_to_prefix_len,
-    parse_dhcp_payload, wait_shutdown,
+    parse_dhcp_payload, wait_shutdown, CleanOption, RawPacketSocket, SharedWanLease, WanLease,
+    DHCP_CLIENT_GID, DHCP_CLIENT_UID,
 };
 use crate::packet::build_raw_packet;
+use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
+use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
 use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
@@ -193,7 +196,7 @@ impl DhcpClientInternal {
         e: DhcpError,
         shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     ) {
-        println!(
+        warn!(
             "[dhcp-client] Phase failed: {}. Retrying in {}s...",
             e, SOCKET_RESTART_DELAY_SECS
         );
@@ -213,7 +216,7 @@ impl DhcpClientInternal {
             let timeout = get_jittered_duration(retry_delay_secs);
 
             if let Some(offer) = self.wait_for_offer(xid, timeout).await? {
-                println!(
+                info!(
                     "[dhcp-client] Received DHCPOFFER for IP: {}, server: {:?}",
                     offer.offered_ip,
                     CleanOption(&offer.server_ip)
@@ -229,11 +232,11 @@ impl DhcpClientInternal {
 fn handle_ack_result(ack_res: ParseAckResult) -> Option<Result<DhcpAck, DhcpError>> {
     match ack_res {
         ParseAckResult::Ack(ack) => {
-            println!("[dhcp-client] Received DHCPACK for IP: {}", ack.ip);
+            info!("[dhcp-client] Received DHCPACK for IP: {}", ack.ip);
             Some(Ok(ack))
         }
         ParseAckResult::Nak => {
-            println!("[dhcp-client] Received DHCPNAK!");
+            warn!("[dhcp-client] Received DHCPNAK!");
             Some(Err(DhcpError::Nak))
         }
         ParseAckResult::None => None,
@@ -275,7 +278,7 @@ impl DhcpClientInternal {
         loop {
             let elapsed = bound_at.elapsed().as_secs() as u32;
             if elapsed >= ack.lease_secs {
-                println!("[dhcp-client] Lease expired!");
+                warn!("[dhcp-client] Lease expired!");
                 self.deconfigure().await;
                 return Err(DhcpError::Protocol("Lease expired".to_string()));
             }
@@ -339,9 +342,9 @@ impl DhcpClientInternal {
 
             if should_send {
                 if in_rebinding {
-                    println!("[dhcp-client] REBINDING: sending broadcast DHCPREQUEST...");
+                    debug!("[dhcp-client] REBINDING: sending broadcast DHCPREQUEST...");
                 } else {
-                    println!("[dhcp-client] RENEWING: sending unicast DHCPREQUEST to server...");
+                    debug!("[dhcp-client] RENEWING: sending unicast DHCPREQUEST to server...");
                 }
                 self.send_request(renew_xid, ip, None, ip, dest_ip).await;
                 renew_sent = Some(std::time::Instant::now());
@@ -351,11 +354,11 @@ impl DhcpClientInternal {
             if let Some(ack_res) = self.wait_for_ack(renew_xid, listen_timeout).await? {
                 match ack_res {
                     ParseAckResult::Ack(new_ack) => {
-                        println!("[dhcp-client] Renewal successful!");
+                        info!("[dhcp-client] Renewal successful!");
                         return Ok(new_ack);
                     }
                     ParseAckResult::Nak => {
-                        println!("[dhcp-client] Renewal NAK'd!");
+                        warn!("[dhcp-client] Renewal NAK'd!");
                         return Err(DhcpError::Nak);
                     }
                     ParseAckResult::None => {}
@@ -452,7 +455,7 @@ impl DhcpClientInternal {
                     lease.mask = Some(mask);
                     lease.gateway = gateway;
                     lease.dns_servers = dns_servers.to_vec();
-                    println!("[dhcp-client] Lease parameters updated: {:?}", *lease);
+                    info!("[dhcp-client] Lease parameters updated: {:?}", *lease);
                 }
                 changed
             };
@@ -482,8 +485,8 @@ impl DhcpClientInternal {
                 && let Some(mask) = mask
                 && let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await
             {
-                println!(
-                    "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
+                error!(
+                    "[dhcp-client] Failed to deconfigure WAN interface via netlink: {}",
                     e
                 );
             }
@@ -491,8 +494,6 @@ impl DhcpClientInternal {
     }
 
     async fn send_discover(&self, xid: u32) {
-        use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
-
         let mut discover = Message::default();
         discover.set_opcode(Opcode::BootRequest);
         discover.set_xid(xid);
@@ -511,9 +512,9 @@ impl DhcpClientInternal {
             ]));
 
         if let Err(e) = self.send_dhcp_message(discover, Ipv4Addr::BROADCAST).await {
-            println!("[dhcp-client] ERROR: Failed to send DHCPDISCOVER: {}", e);
+            error!("[dhcp-client] Failed to send DHCPDISCOVER: {}", e);
         } else {
-            println!("[dhcp-client] Sent DHCPDISCOVER.");
+            debug!("[dhcp-client] Sent DHCPDISCOVER.");
         }
     }
 
@@ -525,8 +526,6 @@ impl DhcpClientInternal {
         ciaddr: Ipv4Addr,
         dest_ip: Ipv4Addr,
     ) {
-        use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode};
-
         let mut request = Message::default();
         request.set_opcode(Opcode::BootRequest);
         request.set_xid(xid);
@@ -548,9 +547,9 @@ impl DhcpClientInternal {
             .insert(DhcpOption::MessageType(MessageType::Request));
 
         if let Err(e) = self.send_dhcp_message(request, dest_ip).await {
-            println!("[dhcp-client] ERROR: Failed to send DHCPREQUEST: {}", e);
+            error!("[dhcp-client] Failed to send DHCPREQUEST: {}", e);
         } else {
-            println!(
+            debug!(
                 "[dhcp-client] Sent DHCPREQUEST (ciaddr: {}, dest_ip: {}).",
                 ciaddr, dest_ip
             );
@@ -568,7 +567,7 @@ async fn monitor_parent_ipc(
             break;
         }
     }
-    println!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
+    info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
     let _ = shutdown_tx.send(true);
 }
 
@@ -577,9 +576,7 @@ pub async fn run_dhcp_client_worker(
     raw_socket_fd: RawFd,
     wan_interface: String,
 ) -> Result<(), std::io::Error> {
-    use std::os::unix::net::UnixStream as StdUnixStream;
-
-    println!(
+    info!(
         "[dhcp-client-worker] Starting unprivileged WAN DHCP client worker on {}...",
         wan_interface
     );
@@ -600,13 +597,13 @@ pub async fn run_dhcp_client_worker(
     let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
 
     if let Err(e) = drop_privileges(DHCP_CLIENT_UID, DHCP_CLIENT_GID) {
-        eprintln!(
+        error!(
             "[dhcp-client-worker] FATAL: Failed to drop privileges: {}",
             e
         );
         std::process::exit(1);
     }
-    println!(
+    info!(
         "[dhcp-client-worker] Privileges dropped successfully (running as dhcp-client inside chroot jail)."
     );
 

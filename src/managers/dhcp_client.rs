@@ -1,13 +1,19 @@
-use super::ipc::{DhcpClientToParentMsg, recv_msg};
+use super::ipc::{recv_msg, DhcpClientToParentMsg};
 use super::utils::{
-    CleanOption, SharedWanLease, WanLease, get_interface_mac, mask_to_prefix_len,
-    prefix_len_to_mask, setup_worker_sockets,
+    mask_to_prefix_len, prefix_len_to_mask, setup_worker_sockets, CleanOption, SharedWanLease,
+    WanLease,
 };
 use super::{ExternalWorker, Service, ServiceError};
 use crate::workers::dhcp_client::DhcpError;
 use futures_util::TryStreamExt;
-use std::net::Ipv4Addr;
-use std::os::unix::io::RawFd;
+use log::{error, info, warn};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
+use tokio::net::UnixStream;
+use tokio::task::JoinHandle;
 
 pub struct DhcpClient {
     pub(super) wan_interface: String,
@@ -49,7 +55,7 @@ async fn apply_parent_lease(
             lease.mask = Some(mask);
             lease.gateway = Some(gateway);
             lease.dns_servers = dns_servers;
-            println!(
+            info!(
                 "[dhcp-client-parent] Applied WAN lease configuration: {:?}",
                 *lease
             );
@@ -58,7 +64,7 @@ async fn apply_parent_lease(
     };
 
     if changed && let Err(e) = configure_wan(wan_interface, ip_address, mask, Some(gateway)).await {
-        eprintln!("[dhcp-client-parent] ERROR: Failed to configure WAN: {}", e);
+        error!("[dhcp-client-parent] Failed to configure WAN: {}", e);
     }
 }
 
@@ -75,8 +81,8 @@ async fn clear_parent_lease(lease_state: &SharedWanLease, wan_interface: &str) {
         && let Some(mask) = mask
         && let Err(e) = deconfigure_wan(wan_interface, ip, mask).await
     {
-        eprintln!(
-            "[dhcp-client-parent] ERROR: Failed to deconfigure WAN: {}",
+        error!(
+            "[dhcp-client-parent] Failed to deconfigure WAN: {}",
             e
         );
     }
@@ -87,17 +93,14 @@ fn start_parent_supervisor_task(
     child_pid: u32,
     wan_interface: String,
     lease_state: SharedWanLease,
-) -> Result<tokio::task::JoinHandle<()>, ServiceError> {
-    use std::os::unix::io::FromRawFd;
-    use std::os::unix::net::UnixStream as StdUnixStream;
-
+) -> Result<JoinHandle<()>, ServiceError> {
     let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
     std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
     let mut parent_ipc_stream =
-        tokio::net::UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+        UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
 
     let handle = tokio::spawn(async move {
-        println!(
+        info!(
             "[dhcp-client-parent] Supervising DHCP client worker (PID {})",
             child_pid
         );
@@ -124,18 +127,18 @@ fn start_parent_supervisor_task(
                     clear_parent_lease(&lease_state, &wan_interface).await;
                 }
                 Ok(None) => {
-                    println!("[dhcp-client-parent] Worker IPC socket closed.");
+                    info!("[dhcp-client-parent] Worker IPC socket closed.");
                     break;
                 }
                 Err(e) => {
-                    eprintln!("[dhcp-client-parent] IPC recv error: {}", e);
+                    error!("[dhcp-client-parent] IPC recv error: {}", e);
                     break;
                 }
             }
         }
 
-        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        let pid = Pid::from_raw(child_pid as i32);
+        let _ = kill(pid, Signal::SIGKILL);
     });
 
     Ok(handle)
@@ -143,27 +146,23 @@ fn start_parent_supervisor_task(
 
 fn setup_dhcp_client_attempt(
     wan_interface: &str,
-) -> Result<(crate::cli::WorkerService, std::os::unix::io::RawFd), ServiceError> {
+) -> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
     let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) = setup_worker_sockets(wan_interface)
         .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
-    Ok((
-        crate::cli::WorkerService::DhcpClient {
-            ipc_fd: child_ipc_fd,
-            raw_socket_fd,
-            wan_interface: wan_interface.to_string(),
-        },
-        parent_ipc_fd,
-    ))
+
+    let worker_service = crate::cli::WorkerService::DhcpClient {
+        ipc_fd: child_ipc_fd,
+        raw_socket_fd,
+        wan_interface: wan_interface.to_string(),
+    };
+
+    Ok((worker_service, parent_ipc_fd))
 }
 
 impl Service for DhcpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        let _ = get_interface_mac(&self.wan_interface)
-            .await
-            .map_err(ServiceError::FailedToStart)?;
-
-        let wan_interface_setup = self.wan_interface.clone();
-        let wan_interface_monitor = self.wan_interface.clone();
+        let wan_interface = self.wan_interface.clone();
+        let wan_interface_setup = wan_interface.clone();
         let lease_state = self.lease_state.clone();
 
         self.state.start_supervised(
@@ -172,7 +171,7 @@ impl Service for DhcpClient {
                 start_parent_supervisor_task(
                     parent_ipc_fd,
                     child_pid,
-                    wan_interface_monitor.clone(),
+                    wan_interface.clone(),
                     lease_state.clone(),
                 )
             },
@@ -190,7 +189,7 @@ pub async fn deconfigure_wan(
     mask: Ipv4Addr,
 ) -> Result<(), DhcpError> {
     let prefix_len = mask_to_prefix_len(mask).map_err(|e| DhcpError::Protocol(e.to_string()))?;
-    println!(
+    info!(
         "[dhcp-client] Deconfiguring WAN interface via netlink: removing IP {}/{}",
         ip, prefix_len
     );
@@ -215,14 +214,14 @@ pub async fn deconfigure_wan(
             let mut matches_ip = false;
             for nla in addr.attributes.iter() {
                 if let rtnetlink::packet_route::address::AddressAttribute::Local(ip_attr) = nla
-                    && ip_attr == &std::net::IpAddr::V4(ip)
+                    && ip_attr == &IpAddr::V4(ip)
                 {
                     matches_ip = true;
                     break;
                 }
             }
             if matches_ip && let Err(e) = handle.address().del(addr).execute().await {
-                println!("[dhcp-client] WARNING: Failed to delete IP address: {}", e);
+                warn!("[dhcp-client] Failed to delete IP address: {}", e);
             }
         }
     }
@@ -236,7 +235,7 @@ pub async fn configure_wan(
     gateway: Option<Ipv4Addr>,
 ) -> Result<(), DhcpError> {
     let prefix_len = mask_to_prefix_len(mask).map_err(|e| DhcpError::Protocol(e.to_string()))?;
-    println!(
+    info!(
         "[dhcp-client] Configuring WAN interface via netlink: IP={}/{}, Gateway={:?}",
         ip,
         prefix_len,
@@ -262,8 +261,8 @@ pub async fn configure_wan(
         if addr.header.index == index
             && let Err(e) = handle.address().del(addr).execute().await
         {
-            println!(
-                "[dhcp-client] WARNING: Failed to delete existing address: {}",
+            warn!(
+                "[dhcp-client] Failed to delete existing address: {}",
                 e
             );
         }
@@ -274,7 +273,7 @@ pub async fn configure_wan(
 
     handle
         .address()
-        .add(index, std::net::IpAddr::V4(ip), prefix_len)
+        .add(index, IpAddr::V4(ip), prefix_len)
         .execute()
         .await?;
 
@@ -285,7 +284,7 @@ pub async fn configure_wan(
             .output_interface(index)
             .build();
         if let Err(e) = handle.route().add(route).execute().await {
-            println!("[dhcp-client] WARNING: Failed to add default route: {}", e);
+            warn!("[dhcp-client] Failed to add default route: {}", e);
         }
     }
 
