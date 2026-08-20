@@ -42,9 +42,9 @@ case "$ARCH" in
 
         echo "[build-image] Building disk image for x86_64 (UEFI)..."
 
-        # 1. Allocate blank raw disk image with EFI System Partition (MBR table, ESP flag)
+        # 1. Allocate blank raw disk image with bootable FAT32 partition (MBR table)
         dd if=/dev/zero of="$IMAGE" bs=1M count=256 2>/dev/null
-        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 240MiB set 1 esp on
+        parted -s "$IMAGE" mklabel msdos mkpart primary fat32 1MiB 240MiB set 1 boot on
 
         # 2. Format partition as FAT32 with label TRIMROUTER
         mformat -v TRIMROUTER -i "${IMAGE}@@1M" -F
