@@ -3,6 +3,7 @@
 use dhcproto::Decodable;
 use pnet::packet::Packet;
 use pnet::util::MacAddr;
+use std::io::{Seek, SeekFrom};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -204,7 +205,9 @@ async fn main() {
     let elapsed = start_time.elapsed();
 
     println!("\n=== Cleaning up QEMU VM... ===");
-    // RAII guard will clean up QEMU process automatically
+    // Clean up QEMU process
+    drop(env);
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     if result.is_err() {
         println!(
@@ -212,6 +215,20 @@ async fn main() {
             test_timeout.as_secs()
         );
         std::process::exit(102);
+    }
+
+    // Verify system.log persists in FAT32 Partition 2 on the host disk image
+    let image_path = PathBuf::from("target/x86_64/trimrouter-test.img");
+    if let Err(e) = verify_host_image_log_partition(&image_path) {
+        println!(
+            "\n[test-host] FAILED to verify system.log on Partition 2: {}\n",
+            e
+        );
+        std::process::exit(103);
+    } else {
+        println!(
+            "[test-host] Successfully verified system.log persistence in Partition 2 of test image!"
+        );
     }
 
     if let Some(true) = suite_status
@@ -228,6 +245,107 @@ async fn main() {
             passed, failed, elapsed
         );
         std::process::exit(101);
+    }
+}
+
+fn verify_host_image_log_partition(image_path: &std::path::Path) -> Result<(), String> {
+    use std::fs::OpenOptions;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image_path)
+        .map_err(|e| e.to_string())?;
+    let mbr = mbrman::MBR::read_from(&mut file, 512).map_err(|e| e.to_string())?;
+    let p2 = &mbr[2];
+    if p2.sectors == 0 || p2.starting_lba == 0 {
+        return Err("Partition 2 not found in MBR of disk image".to_string());
+    }
+    let p2_start_bytes = (p2.starting_lba as u64) * 512;
+    let p2_size_bytes = (p2.sectors as u64) * 512;
+
+    let slice = PartitionSlice::new(file, p2_start_bytes, p2_size_bytes);
+    let fs = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
+        .map_err(|e| format!("Failed to open FAT32 on partition 2: {}", e))?;
+    let root = fs.root_dir();
+    let mut found_system_log = false;
+    for entry in root.iter() {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if name.eq_ignore_ascii_case("system.log") {
+            found_system_log = true;
+            if entry.len() == 0 {
+                return Err("system.log on partition 2 is empty (0 bytes)".to_string());
+            }
+            break;
+        }
+    }
+    if !found_system_log {
+        return Err("system.log was not found on partition 2 of the disk image".to_string());
+    }
+    Ok(())
+}
+
+struct PartitionSlice {
+    file: std::fs::File,
+    offset: u64,
+    size: u64,
+    pos: u64,
+}
+
+impl PartitionSlice {
+    fn new(file: std::fs::File, offset: u64, size: u64) -> Self {
+        Self {
+            file,
+            offset,
+            size,
+            pos: 0,
+        }
+    }
+}
+
+impl std::io::Read for PartitionSlice {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = (self.size.saturating_sub(self.pos)) as usize;
+        let to_read = buf.len().min(remaining);
+        if to_read == 0 {
+            return Ok(0);
+        }
+        self.file.seek(SeekFrom::Start(self.offset + self.pos))?;
+        let bytes = self.file.read(&mut buf[..to_read])?;
+        self.pos += bytes as u64;
+        Ok(bytes)
+    }
+}
+
+impl std::io::Write for PartitionSlice {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.seek(SeekFrom::Start(self.offset + self.pos))?;
+        let bytes = self.file.write(buf)?;
+        self.pos += bytes as u64;
+        Ok(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl std::io::Seek for PartitionSlice {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            std::io::SeekFrom::Start(offset) => offset as i64,
+            std::io::SeekFrom::Current(offset) => (self.pos as i64).saturating_add(offset),
+            std::io::SeekFrom::End(offset) => (self.size as i64).saturating_add(offset),
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "negative seek position",
+            ));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
     }
 }
 

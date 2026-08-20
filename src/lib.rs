@@ -1,16 +1,14 @@
 #[macro_export]
 macro_rules! println {
     ($($arg:tt)*) => {{
-        std::print!("{}", $crate::managers::utils::get_timestamp_prefix());
-        std::println!($($arg)*);
+        $crate::logging::log_raw(&format!($($arg)*));
     }};
 }
 
 #[macro_export]
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
-        std::eprint!("{}", $crate::managers::utils::get_timestamp_prefix());
-        std::eprintln!($($arg)*);
+        $crate::logging::log_raw(&format!($($arg)*));
     }};
 }
 
@@ -19,6 +17,7 @@ pub mod config;
 pub mod error;
 pub mod interface;
 pub mod kmod;
+pub mod logging;
 pub mod managers;
 pub mod modes;
 pub mod netfilter;

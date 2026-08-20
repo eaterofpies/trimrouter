@@ -44,10 +44,15 @@ This skill provides code style and design standards for writing and modifying Ru
 * Parse and convert raw, weakly typed inputs (such as byte slices `&[u8]`, raw binary buffers, or strings) into strongly typed, domain-specific Rust structures (e.g., `pnet::util::MacAddr`, `std::net::Ipv4Addr`, or custom domain enums/structs) as early as possible (e.g., at network, parsing, or file boundaries).
 * Avoid passing raw collections (like `&[u8]`, `Vec<u8>`, or generic `String`) down into core processing logic. Strongly typed symbolic boundaries prevent type-safety bypasses, eliminate redundant parser/formatter loops, and make calling interfaces self-documenting.
 
-## 9. Prefer Import Statements (use) Over Inline Path Qualification
-* Avoid using fully qualified paths (e.g., `crate::error::RouterError`, `std::collections::HashSet`, `std::sync::Mutex`) repeatedly inside function signatures or bodies.
-* Declare imports (`use` statements) at the top of the file. This reduces code clutter, simplifies function signatures, and makes it easier to refactor type namespaces in a single place.
-* Inline qualification should only be used where necessary to resolve name collisions (e.g., distinguishing `std::fmt::Error` from `std::io::Error`), or when using imports/aliases is less readable.
+## 9. Top-of-File Imports Only & No Inline Path Qualification
+* **Strict Rule: Top-of-File Imports Only (No Inner `use` Statements)**:
+  * **Never** place `use` statements inside functions, methods, closures, match arms, or event loops.
+  * **All** imports (`use ...;`) must be placed at the very top of the file, immediately after module-level inner attributes / doc comments and submodule declarations (`pub mod ...;`).
+  * The **only exception** is inside isolated test submodules (e.g., `#[cfg(test)] mod tests { use super::*; }`).
+  * If a function or modification requires a new type, trait, or extension (e.g., `Read`, `Write`, `CommandExt`), add it to the top-level import block first before using it.
+* **Avoid Inline Path Qualification**:
+  * Avoid using fully qualified paths (e.g., `crate::error::RouterError`, `std::collections::HashSet`, `std::sync::Mutex`, `std::os::unix::io::RawFd`) repeatedly inside function signatures or bodies.
+  * Inline qualification should only be used where necessary to resolve name collisions (e.g., distinguishing `std::fmt::Error` from `std::io::Error`), or when using imports/aliases is less readable.
 
 ## 10. Pre-Commit Verification and Autoformatting
 * Run `cargo fmt` to ensure the codebase is formatted according to the standard style before staging changes.

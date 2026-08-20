@@ -2,9 +2,6 @@
 
 This specification describes how `trimrouter` captures, formats, persists, and rotates log output from PID 1 and all worker services.
 
-> [!NOTE]
-> **Status: Not implemented.** This specification is complete but no part of it has been implemented yet. PID 1 currently writes directly to stdout with no formatting, rotation, or log partition involvement.
-
 ---
 
 ## 1. Log File

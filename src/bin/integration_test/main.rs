@@ -14,6 +14,7 @@ mod dhcp_client;
 mod dns_forwarder;
 mod firewall;
 mod lan_manager;
+mod logging;
 mod sntp;
 mod supervisor;
 
@@ -93,6 +94,7 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+        trimrouter::logging::init_logging(config.logging.max_log_size_mb);
 
         // Test 0: Network Device Discovery (Waiting for interfaces to appear via MAC)
         std::println!("[test] Starting Network Device Discovery test...");
@@ -344,6 +346,18 @@ async fn main() {
         }
         Err(e) => {
             std::println!("[test-control] TEST_FAILED lan_wan_conflict {}", e);
+            failed += 1;
+        }
+    }
+
+    // Test 8: Logging Subsystem & Persistence
+    match logging::test_logging_subsystem().await {
+        Ok(_) => {
+            std::println!("[test-control] TEST_PASSED logging_subsystem");
+            passed += 1;
+        }
+        Err(e) => {
+            std::println!("[test-control] TEST_FAILED logging_subsystem {}", e);
             failed += 1;
         }
     }

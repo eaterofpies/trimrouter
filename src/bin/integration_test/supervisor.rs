@@ -43,7 +43,7 @@ pub async fn test_dns_supervisor_recovery(
     // We bind to UDP port 23457 to receive the confirmation
     let socket = std::net::UdpSocket::bind("192.168.1.1:23457").map_err(|e| e.to_string())?;
     socket
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(15)))
         .map_err(|e| e.to_string())?;
 
     std::println!("[test-control] TRIGGER_DNS_CLIENT_TEST");

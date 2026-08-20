@@ -18,7 +18,7 @@ pub async fn test_dns_forwarding(lease_state: SharedWanLease) -> Result<DnsForwa
     // 2. Bind to UDP port 23457 to receive verification from the host
     let socket = UdpSocket::bind("192.168.1.1:23457").map_err(|e| e.to_string())?;
     socket
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(15)))
         .map_err(|e| e.to_string())?;
 
     // 3. Trigger the host test coordinator

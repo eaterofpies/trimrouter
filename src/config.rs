@@ -4,6 +4,19 @@ use pnet::util::MacAddr;
 use serde::Deserialize;
 use std::str::FromStr;
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LoggingConfig {
+    pub max_log_size_mb: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            max_log_size_mb: 100,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct RouterConfig {
     pub lan_ip: String,
@@ -11,6 +24,7 @@ pub struct RouterConfig {
     pub wan_mac: MacAddr,
     pub lan_mac: MacAddr,
     pub reboot_delay: Option<u32>, // Some(N) = N seconds, None = infinite
+    pub logging: LoggingConfig,
 }
 
 impl std::fmt::Debug for RouterConfig {
@@ -24,6 +38,7 @@ impl std::fmt::Debug for RouterConfig {
                 "reboot_delay",
                 &crate::managers::utils::CleanOption(&self.reboot_delay),
             )
+            .field("logging", &self.logging)
             .finish()
     }
 }
@@ -32,6 +47,7 @@ impl std::fmt::Debug for RouterConfig {
 struct ConfigToml {
     network: NetworkSection,
     system: Option<SystemSection>,
+    logging: Option<LoggingSection>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +61,11 @@ struct NetworkSection {
 #[derive(Deserialize)]
 struct SystemSection {
     reboot_delay: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct LoggingSection {
+    max_log_size_mb: Option<u64>,
 }
 
 impl RouterConfig {
@@ -84,12 +105,21 @@ impl RouterConfig {
             .as_ref()
             .and_then(|sys_sec| sys_sec.reboot_delay);
 
+        let logging = LoggingConfig {
+            max_log_size_mb: parsed
+                .logging
+                .as_ref()
+                .and_then(|l| l.max_log_size_mb)
+                .unwrap_or(100),
+        };
+
         Ok(RouterConfig {
             lan_ip,
             backup_lan_ip,
             wan_mac,
             lan_mac,
             reboot_delay,
+            logging,
         })
     }
 }
@@ -206,5 +236,33 @@ mod tests {
         .to_string();
         let cfg = RouterConfig::parse(&sys).unwrap();
         assert_eq!(cfg.reboot_delay, Some(5));
+    }
+
+    #[test]
+    fn test_config_parsing_logging_custom() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            [logging]
+            max_log_size_mb = 50
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg.logging.max_log_size_mb, 50);
+    }
+
+    #[test]
+    fn test_config_parsing_logging_default() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg.logging.max_log_size_mb, 100);
     }
 }

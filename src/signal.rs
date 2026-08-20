@@ -29,6 +29,7 @@ pub async fn start_signal_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<
     sleep(Duration::from_millis(500)).await;
 
     println!("[init] Executing system poweroff...");
+    crate::logging::flush();
     if let Err(e) = sys.reboot(RebootMode::RB_POWER_OFF) {
         eprintln!(
             "[init] Poweroff failed: {}. Falling back to default reboot.",

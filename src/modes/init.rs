@@ -105,6 +105,7 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
             panic!("FATAL: Failed to parse configuration: {}", e);
         }
     };
+    crate::logging::init_logging(config.logging.max_log_size_mb);
     let delay_val = match config.reboot_delay {
         None => -1,
         Some(d) => d as i32,

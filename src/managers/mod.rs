@@ -6,15 +6,20 @@ pub mod lan_manager;
 pub mod sntp_client;
 pub mod utils;
 
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::io::{self, BufRead, BufReader, Read};
+use std::os::unix::io::RawFd;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use tokio::sync::watch::{self, Receiver, Sender};
+use tokio::task::{self, JoinHandle};
+
 pub use crate::network::{LAN_INTERFACE, WAN_INTERFACE};
-
-pub const DHCP_CLIENT_SERVICE_NAME: &str = "dhcp-client";
-pub const DHCP_SERVER_SERVICE_NAME: &str = "dhcp-server";
-pub const DNS_FORWARDER_SERVICE_NAME: &str = "dns-forwarder";
-pub const SNTP_CLIENT_SERVICE_NAME: &str = "sntp-client";
-
-pub use utils::{CHROOT_JAIL_PATH, NOBODY_GID, NOBODY_UID, ROUTER_BINARY_PATH, SELF_EXE_PATH};
-
 pub use dhcp_client::DhcpClient;
 pub use dhcp_server::DhcpServer;
 pub use dns_forwarder::DnsForwarder;
@@ -23,18 +28,25 @@ pub use ipc::{
 };
 pub use lan_manager::LanManager;
 pub use sntp_client::SntpClient;
-pub use utils::WanLease;
+pub use utils::{
+    CHROOT_JAIL_PATH, NOBODY_GID, NOBODY_UID, ROUTER_BINARY_PATH, SELF_EXE_PATH, WanLease,
+};
+
+pub const DHCP_CLIENT_SERVICE_NAME: &str = "dhcp-client";
+pub const DHCP_SERVER_SERVICE_NAME: &str = "dhcp-server";
+pub const DNS_FORWARDER_SERVICE_NAME: &str = "dns-forwarder";
+pub const SNTP_CLIENT_SERVICE_NAME: &str = "sntp-client";
 
 #[derive(Debug)]
 pub enum ServiceError {
     AlreadyRunning,
     NotRunning,
-    Io(std::io::Error),
+    Io(io::Error),
     FailedToStart(String),
 }
 
-impl std::fmt::Display for ServiceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ServiceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ServiceError::AlreadyRunning => write!(f, "Service is already running"),
             ServiceError::NotRunning => write!(f, "Service is not running"),
@@ -44,10 +56,10 @@ impl std::fmt::Display for ServiceError {
     }
 }
 
-impl std::error::Error for ServiceError {}
+impl Error for ServiceError {}
 
-impl From<std::io::Error> for ServiceError {
-    fn from(e: std::io::Error) -> Self {
+impl From<io::Error> for ServiceError {
+    fn from(e: io::Error) -> Self {
         ServiceError::Io(e)
     }
 }
@@ -62,9 +74,9 @@ pub trait Service: Send + Sync {
 // =========================================================================
 pub struct ExternalWorker {
     service_name: &'static str,
-    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-    child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    shutdown_tx: Option<Sender<bool>>,
+    task_handle: Option<JoinHandle<()>>,
+    child_pid: Arc<AtomicU32>,
 }
 
 impl ExternalWorker {
@@ -73,23 +85,19 @@ impl ExternalWorker {
             service_name,
             shutdown_tx: None,
             task_handle: None,
-            child_pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            child_pid: Arc::new(AtomicU32::new(0)),
         }
     }
 
     pub(crate) fn get_worker_pid(&self) -> u32 {
-        self.child_pid.load(std::sync::atomic::Ordering::SeqCst)
+        self.child_pid.load(Ordering::SeqCst)
     }
 
     fn is_running(&self) -> bool {
         self.task_handle.is_some()
     }
 
-    fn start(
-        &mut self,
-        shutdown_tx: tokio::sync::watch::Sender<bool>,
-        handle: tokio::task::JoinHandle<()>,
-    ) {
+    fn start(&mut self, shutdown_tx: Sender<bool>, handle: JoinHandle<()>) {
         self.shutdown_tx = Some(shutdown_tx);
         self.task_handle = Some(handle);
     }
@@ -100,14 +108,8 @@ impl ExternalWorker {
         mut run_monitor: M,
     ) -> Result<(), ServiceError>
     where
-        S: FnMut() -> Result<(crate::cli::WorkerService, std::os::unix::io::RawFd), ServiceError>
-            + Send
-            + 'static,
-        M: FnMut(
-                std::os::unix::io::RawFd,
-                u32,
-                tokio::sync::watch::Receiver<bool>,
-            ) -> Result<tokio::task::JoinHandle<()>, ServiceError>
+        S: FnMut() -> Result<(crate::cli::WorkerService, RawFd), ServiceError> + Send + 'static,
+        M: FnMut(RawFd, u32, Receiver<bool>) -> Result<JoinHandle<()>, ServiceError>
             + Send
             + 'static,
     {
@@ -115,7 +117,7 @@ impl ExternalWorker {
             return Err(ServiceError::AlreadyRunning);
         }
 
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let service_name = self.service_name;
         let child_pid_atomic = self.child_pid.clone();
 
@@ -193,7 +195,7 @@ impl ExternalWorker {
     pub(crate) async fn stop(&mut self) -> Result<(), ServiceError> {
         let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
         let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
-        let child_pid = self.child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
+        let child_pid = self.child_pid.swap(0, Ordering::SeqCst);
 
         let _ = tx.send(true);
         if child_pid != 0 {
@@ -210,10 +212,10 @@ impl ExternalWorker {
 
     fn spawn_and_track_process(
         service_name: &'static str,
-        child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        child_pid: Arc<AtomicU32>,
         args: &[&str],
-        child_fds: &[std::os::unix::io::RawFd],
-    ) -> std::io::Result<std::process::Child> {
+        child_fds: &[RawFd],
+    ) -> io::Result<Child> {
         let res = Self::spawn_process(service_name, args, child_fds);
 
         // Always close worker FDs in parent
@@ -225,22 +227,14 @@ impl ExternalWorker {
 
         match res {
             Ok(child) => {
-                child_pid.store(child.id(), std::sync::atomic::Ordering::SeqCst);
+                child_pid.store(child.id(), Ordering::SeqCst);
                 Ok(child)
             }
             Err(e) => Err(e),
         }
     }
 
-    fn spawn_process(
-        service_name: &str,
-        args: &[&str],
-        child_fds: &[std::os::unix::io::RawFd],
-    ) -> std::io::Result<std::process::Child> {
-        use std::os::unix::process::CommandExt;
-        use std::path::Path;
-        use std::process::Command;
-
+    fn spawn_process(service_name: &str, args: &[&str], child_fds: &[RawFd]) -> io::Result<Child> {
         let binary_path = if Path::new(utils::ROUTER_BINARY_PATH).exists() {
             utils::ROUTER_BINARY_PATH
         } else {
@@ -254,6 +248,8 @@ impl ExternalWorker {
         for arg in args {
             cmd.arg(arg);
         }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
         let fds = child_fds.to_vec();
         unsafe {
@@ -265,6 +261,25 @@ impl ExternalWorker {
             });
         }
 
-        cmd.spawn()
+        let mut child = cmd.spawn()?;
+
+        if let Some(stdout) = child.stdout.take() {
+            stream_to_logger(stdout);
+        }
+
+        if let Some(stderr) = child.stderr.take() {
+            stream_to_logger(stderr);
+        }
+
+        Ok(child)
     }
+}
+
+fn stream_to_logger<R: Read + Send + 'static>(pipe: R) {
+    task::spawn_blocking(move || {
+        let reader = BufReader::new(pipe);
+        for line in reader.lines().map_while(Result::ok) {
+            crate::logging::log_raw(&line);
+        }
+    });
 }

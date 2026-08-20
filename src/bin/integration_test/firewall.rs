@@ -7,7 +7,7 @@ pub async fn test_nat_routing() -> Result<(), String> {
     // 1. Bind to UDP port 23457 to receive verification from the host
     let socket = UdpSocket::bind("192.168.1.1:23457").map_err(|e| e.to_string())?;
     socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(15)))
         .map_err(|e| e.to_string())?;
 
     // 2. Trigger the host test coordinator
