@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 #[derive(Debug)]
 pub struct CliFd(pub OwnedFd);
@@ -35,6 +35,12 @@ impl From<CliFd> for OwnedFd {
 impl AsRawFd for CliFd {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
+    }
+}
+
+impl AsFd for CliFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
     }
 }
 
@@ -159,27 +165,21 @@ pub enum WorkerService {
 }
 
 impl WorkerService {
-    pub fn to_args_and_child_fds(&self) -> (Vec<String>, Vec<RawFd>) {
+    pub fn to_args(&self) -> Vec<String> {
         match self {
             Self::SntpClient { ipc_fd } => {
-                let raw = ipc_fd.as_raw_fd();
-                (vec![raw.to_string()], vec![raw])
+                vec![ipc_fd.as_raw_fd().to_string()]
             }
             Self::DhcpClient {
                 ipc_fd,
                 raw_socket_fd,
                 wan_interface,
             } => {
-                let ipc_raw = ipc_fd.as_raw_fd();
-                let sock_raw = raw_socket_fd.as_raw_fd();
-                (
-                    vec![
-                        ipc_raw.to_string(),
-                        sock_raw.to_string(),
-                        wan_interface.clone(),
-                    ],
-                    vec![ipc_raw, sock_raw],
-                )
+                vec![
+                    ipc_fd.as_raw_fd().to_string(),
+                    raw_socket_fd.as_raw_fd().to_string(),
+                    wan_interface.clone(),
+                ]
             }
             Self::DhcpServer {
                 ipc_fd,
@@ -187,35 +187,49 @@ impl WorkerService {
                 wan_interface,
                 lan_ip,
             } => {
-                let ipc_raw = ipc_fd.as_raw_fd();
-                let sock_raw = raw_socket_fd.as_raw_fd();
-                (
-                    vec![
-                        ipc_raw.to_string(),
-                        sock_raw.to_string(),
-                        wan_interface.clone(),
-                        lan_ip.clone(),
-                    ],
-                    vec![ipc_raw, sock_raw],
-                )
+                vec![
+                    ipc_fd.as_raw_fd().to_string(),
+                    raw_socket_fd.as_raw_fd().to_string(),
+                    wan_interface.clone(),
+                    lan_ip.clone(),
+                ]
             }
             Self::DnsForwarder {
                 ipc_fd,
                 dns_socket_fd,
                 upstream_socket_fd,
             } => {
-                let ipc_raw = ipc_fd.as_raw_fd();
-                let dns_raw = dns_socket_fd.as_raw_fd();
-                let upstream_raw = upstream_socket_fd.as_raw_fd();
-                (
-                    vec![
-                        ipc_raw.to_string(),
-                        dns_raw.to_string(),
-                        upstream_raw.to_string(),
-                    ],
-                    vec![ipc_raw, dns_raw, upstream_raw],
-                )
+                vec![
+                    ipc_fd.as_raw_fd().to_string(),
+                    dns_socket_fd.as_raw_fd().to_string(),
+                    upstream_socket_fd.as_raw_fd().to_string(),
+                ]
             }
+        }
+    }
+
+    pub fn child_fds(&self) -> Vec<BorrowedFd<'_>> {
+        match self {
+            Self::SntpClient { ipc_fd } => vec![ipc_fd.as_fd()],
+            Self::DhcpClient {
+                ipc_fd,
+                raw_socket_fd,
+                ..
+            } => vec![ipc_fd.as_fd(), raw_socket_fd.as_fd()],
+            Self::DhcpServer {
+                ipc_fd,
+                raw_socket_fd,
+                ..
+            } => vec![ipc_fd.as_fd(), raw_socket_fd.as_fd()],
+            Self::DnsForwarder {
+                ipc_fd,
+                dns_socket_fd,
+                upstream_socket_fd,
+            } => vec![
+                ipc_fd.as_fd(),
+                dns_socket_fd.as_fd(),
+                upstream_socket_fd.as_fd(),
+            ],
         }
     }
 }

@@ -3,7 +3,7 @@ use log::{error, info};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{self, BufRead, BufReader, Read};
-use std::os::unix::io::{OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -123,10 +123,11 @@ impl ExternalWorker {
                     }
                 };
 
-                let (args, child_fds) = worker_service.to_args_and_child_fds();
+                let args = worker_service.to_args();
                 let arg_strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                let child_fds = worker_service.child_fds();
 
-                // 2. Spawn and track process (handles storing PID and parent FDs cleanup)
+                // 2. Spawn and track process (handles storing PID)
                 let child = match Self::spawn_and_track_process(
                     service_name,
                     child_pid_atomic.clone(),
@@ -139,6 +140,7 @@ impl ExternalWorker {
                         continue;
                     }
                 };
+                drop(worker_service);
 
                 let child_pid = child.id();
 
@@ -191,27 +193,18 @@ impl ExternalWorker {
         service_name: &'static str,
         child_pid: Arc<AtomicU32>,
         args: &[&str],
-        child_fds: &[RawFd],
+        child_fds: &[BorrowedFd<'_>],
     ) -> io::Result<Child> {
-        let res = Self::spawn_process(service_name, args, child_fds);
-
-        // Always close worker FDs in parent
-        for &fd in child_fds {
-            unsafe {
-                let _ = libc::close(fd);
-            }
-        }
-
-        match res {
-            Ok(child) => {
-                child_pid.store(child.id(), Ordering::SeqCst);
-                Ok(child)
-            }
-            Err(e) => Err(e),
-        }
+        let child = Self::spawn_process(service_name, args, child_fds)?;
+        child_pid.store(child.id(), Ordering::SeqCst);
+        Ok(child)
     }
 
-    fn spawn_process(service_name: &str, args: &[&str], child_fds: &[RawFd]) -> io::Result<Child> {
+    fn spawn_process(
+        service_name: &str,
+        args: &[&str],
+        child_fds: &[BorrowedFd<'_>],
+    ) -> io::Result<Child> {
         let binary_path = if Path::new(utils::ROUTER_BINARY_PATH).exists() {
             utils::ROUTER_BINARY_PATH
         } else {
@@ -228,10 +221,10 @@ impl ExternalWorker {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let fds = child_fds.to_vec();
+        let raw_fds: Vec<RawFd> = child_fds.iter().map(|fd| fd.as_raw_fd()).collect();
         unsafe {
             cmd.pre_exec(move || {
-                for &fd in &fds {
+                for &fd in &raw_fds {
                     libc::fcntl(fd, libc::F_SETFD, 0);
                 }
                 Ok(())
