@@ -184,8 +184,12 @@ impl ExternalWorker {
                         }
                     };
 
-                // 4. Wait for monitor to complete
+                // 4. Wait for monitor to complete and reset attempt counter on sustained uptime
+                let spawn_time = std::time::Instant::now();
                 let _ = monitor_handle.await;
+                if spawn_time.elapsed() >= std::time::Duration::from_secs(60) {
+                    attempt = 0;
+                }
             }
         });
 

@@ -693,4 +693,13 @@ mod tests {
         assert!(mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 10)).is_err());
         assert!(mask_to_prefix_len(Ipv4Addr::new(255, 0, 255, 0)).is_err());
     }
+
+    #[tokio::test]
+    async fn test_supervisor_restart_delay_zero_attempt() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let mut attempt = 0;
+        let proceed = handle_supervisor_restart_delay("test-service", &mut attempt, &mut rx).await;
+        assert!(proceed);
+        assert_eq!(attempt, 1);
+    }
 }
