@@ -28,6 +28,7 @@ const RECV_BUF_SIZE: usize = 4096;
 const FALLBACK_DNS_SERVER: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_PENDING_QUERIES: usize = 4096;
+const MAX_CACHE_ENTRIES: usize = 4096;
 
 // =========================================================================
 // Cache Structure
@@ -334,13 +335,16 @@ async fn handle_dns_query(
         return;
     }
 
-    let upstream_ip = get_upstream_dns(&upstream_dns);
+    let upstream_servers = get_upstream_resolvers(&upstream_dns);
 
-    if let Some(response) =
-        forward_query(&query, upstream_ip, &upstream_socket, &pending_queries).await
-    {
-        insert_cache(cache_key, response.clone(), &cache);
-        let _ = socket.send_to(&response, src).await;
+    for upstream_ip in upstream_servers {
+        if let Some(response) =
+            forward_query(&query, upstream_ip, &upstream_socket, &pending_queries).await
+        {
+            insert_cache(cache_key, response.clone(), &cache);
+            let _ = socket.send_to(&response, src).await;
+            return;
+        }
     }
 }
 
@@ -391,15 +395,27 @@ fn insert_cache(
     let expiry = Instant::now() + Duration::from_secs(cache_ttl as u64);
 
     let mut lock = cache.lock().unwrap();
+    if lock.len() >= MAX_CACHE_ENTRIES && !lock.contains_key(&cache_key) {
+        let now = Instant::now();
+        lock.retain(|_, entry| entry.expiry > now);
+        if lock.len() >= MAX_CACHE_ENTRIES
+            && let Some(oldest_key) = lock
+                .iter()
+                .min_by_key(|(_, entry)| entry.expiry)
+                .map(|(k, _)| k.clone())
+        {
+            lock.remove(&oldest_key);
+        }
+    }
     lock.insert(cache_key, CacheEntry { response, expiry });
 }
 
-fn get_upstream_dns(upstream_dns: &Mutex<Vec<Ipv4Addr>>) -> Ipv4Addr {
+fn get_upstream_resolvers(upstream_dns: &Mutex<Vec<Ipv4Addr>>) -> Vec<Ipv4Addr> {
     let servers = upstream_dns.lock().unwrap();
     if !servers.is_empty() {
-        servers[0]
+        servers.clone()
     } else {
-        FALLBACK_DNS_SERVER
+        vec![FALLBACK_DNS_SERVER]
     }
 }
 
@@ -544,5 +560,21 @@ mod tests {
         let entry = lock.get(&b"key".to_vec()[..]).unwrap();
         let cache_ttl = entry.expiry.duration_since(Instant::now()).as_secs();
         assert!((148..=150).contains(&cache_ttl));
+    }
+
+    #[test]
+    fn test_get_upstream_resolvers_empty_fallback() {
+        let upstream = Mutex::new(Vec::new());
+        let resolvers = get_upstream_resolvers(&upstream);
+        assert_eq!(resolvers, vec![FALLBACK_DNS_SERVER]);
+    }
+
+    #[test]
+    fn test_get_upstream_resolvers_configured() {
+        let primary = Ipv4Addr::new(1, 1, 1, 1);
+        let secondary = Ipv4Addr::new(1, 0, 0, 1);
+        let upstream = Mutex::new(vec![primary, secondary]);
+        let resolvers = get_upstream_resolvers(&upstream);
+        assert_eq!(resolvers, vec![primary, secondary]);
     }
 }
