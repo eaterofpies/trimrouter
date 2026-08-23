@@ -1,4 +1,4 @@
-use crate::system::PowerOps;
+use super::system::PowerOps;
 use log::{debug, info, warn};
 use nix::sys::reboot::RebootMode;
 use std::sync::Arc;

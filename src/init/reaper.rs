@@ -1,4 +1,4 @@
-use crate::system::ProcessOps;
+use super::system::ProcessOps;
 use log::{debug, error, warn};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
@@ -78,7 +78,7 @@ pub fn reap_zombies<S: ProcessOps>(sys: &S) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system::mock::MockSystem;
+    use crate::init::system::mock::MockSystem;
 
     #[test]
     fn test_zombie_reaping() {

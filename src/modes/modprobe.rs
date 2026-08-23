@@ -1,4 +1,4 @@
-use crate::kmod::load_module_with_dependencies;
+use crate::init::kmod::load_module_with_dependencies;
 use log::info;
 use std::io;
 

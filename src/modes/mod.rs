@@ -1,11 +1,10 @@
 use crate::cli::{Cli, Commands, TrimrouterSubcommands};
-use crate::system::RealSystem;
+use crate::init::system::RealSystem;
 use clap::Parser;
 use log::error;
 use std::process::exit;
 use std::sync::Arc;
 
-pub mod init;
 pub mod modprobe;
 pub mod worker;
 
@@ -22,7 +21,7 @@ pub async fn run(args: Vec<String>) {
     match cli.command {
         Some(Commands::Init { .. }) => {
             let sys = Arc::new(RealSystem);
-            init::run_as_init(sys).await;
+            crate::init::run_as_init(sys).await;
         }
         Some(Commands::Worker { service }) => {
             worker::run_worker(service).await;
@@ -51,7 +50,7 @@ pub async fn run(args: Vec<String>) {
         Some(Commands::Trimrouter { sub: None }) | None => {
             // Default: run as init
             let sys = Arc::new(RealSystem);
-            init::run_as_init(sys).await;
+            crate::init::run_as_init(sys).await;
         }
     }
 }

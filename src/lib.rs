@@ -15,16 +15,11 @@ macro_rules! eprintln {
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod init;
 pub mod interface;
-pub mod kmod;
 pub mod logging;
 pub mod managers;
 pub mod modes;
-pub mod netfilter;
 pub mod network;
 pub mod packet;
-pub mod partition;
-pub mod reaper;
-pub mod signal;
-pub mod system;
 pub mod workers;

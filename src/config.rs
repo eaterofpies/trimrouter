@@ -1,5 +1,5 @@
 use crate::error::RouterError;
-use crate::system::ConfigReaderOps;
+use crate::init::system::ConfigReaderOps;
 use pnet::util::MacAddr;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -138,7 +138,7 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system::mock::MockSystem;
+    use crate::init::system::mock::MockSystem;
 
     #[test]
     fn test_config_parsing_missing_wan_mac() {

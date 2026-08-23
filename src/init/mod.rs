@@ -1,17 +1,14 @@
+pub mod firewall;
+pub mod kmod;
+pub mod power;
+pub mod reaper;
+pub mod storage;
+pub mod system;
+
 use crate::config::RouterConfig;
 use crate::interface;
-use crate::kmod;
 use crate::managers::{self, CHROOT_JAIL_PATH, Service};
-use crate::netfilter;
 use crate::network;
-use crate::partition::{
-    ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
-};
-use crate::reaper;
-use crate::signal;
-use crate::system::{
-    self, ProcessOps, RealSystem, mount_virtual_filesystems, register_panic_handler,
-};
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
 use nix::unistd::Pid;
@@ -20,6 +17,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use storage::{
+    ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
+};
+use system::{ProcessOps, RealSystem, mount_virtual_filesystems, register_panic_handler};
 use tokio::task::JoinHandle;
 
 pub async fn run_as_init(sys: Arc<RealSystem>) {
@@ -153,7 +154,7 @@ fn start_system_services(sys: Arc<RealSystem>, shutdown_flag: Arc<AtomicBool>) -
     let sig_sys = sys.clone();
     let sig_shutdown = shutdown_flag;
     tokio::spawn(async move {
-        signal::start_signal_monitor(sig_sys, sig_shutdown).await;
+        power::start_signal_monitor(sig_sys, sig_shutdown).await;
     })
 }
 
@@ -185,8 +186,7 @@ async fn setup_loopback_and_firewall(sys: &RealSystem) {
             panic!("FATAL: Failed to initialize network: {}", e);
         }
 
-        if let Err(e) =
-            netfilter::configure_firewall(network::WAN_INTERFACE, network::LAN_INTERFACE)
+        if let Err(e) = firewall::configure_firewall(network::WAN_INTERFACE, network::LAN_INTERFACE)
         {
             panic!("FATAL: Failed to configure firewall: {}", e);
         }

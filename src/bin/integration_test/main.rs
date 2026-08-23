@@ -4,14 +4,14 @@ use rtnetlink::packet_route::AddressFamily;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
-use trimrouter::kmod;
-use trimrouter::managers::{Service, WanLease};
-use trimrouter::netfilter;
-use trimrouter::network;
-use trimrouter::partition::{
+use trimrouter::init::firewall as netfilter;
+use trimrouter::init::kmod;
+use trimrouter::init::storage::{
     ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
 };
-use trimrouter::system::{PowerOps, ProcessOps, RealSystem, mount_virtual_filesystems};
+use trimrouter::init::system::{PowerOps, ProcessOps, RealSystem, mount_virtual_filesystems};
+use trimrouter::managers::{Service, WanLease};
+use trimrouter::network;
 
 mod dhcp_client;
 mod dns_forwarder;
@@ -83,7 +83,7 @@ async fn main() {
         }
 
         // Activate EROFS module tree and trigger delayed coldplug discovery
-        trimrouter::kmod::activate_boot_modules();
+        kmod::activate_boot_modules();
 
         if let Err(e) = setup_log_partition(sys.as_ref(), &boot_dev, &parent_disk) {
             std::eprintln!("[test] FATAL: Failed to setup log partition: {}", e);
