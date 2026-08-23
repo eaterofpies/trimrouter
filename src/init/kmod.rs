@@ -88,7 +88,7 @@ const MODULE_INIT_COMPRESSED_FILE: u32 = 0x0004;
 fn load_module(path: &Path) -> Result<(), io::Error> {
     debug!("[init] Loading kernel module: {:?}", path);
     let file = fs::File::open(path)?;
-    let param = CString::new("").unwrap();
+    let param = CString::default();
 
     let mut flags = nix::kmod::ModuleInitFlags::empty();
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
