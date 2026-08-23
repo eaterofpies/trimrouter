@@ -1,5 +1,5 @@
 use std::time::Duration;
-use trimrouter::managers::DnsForwarder;
+use trimrouter::services::DnsForwarder;
 
 pub async fn test_dns_supervisor_recovery(
     dns_forwarder: DnsForwarder,

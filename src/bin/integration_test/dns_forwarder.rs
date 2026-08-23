@@ -1,7 +1,7 @@
 use std::net::UdpSocket;
 use std::time::Duration;
-use trimrouter::managers::utils::SharedWanLease;
-use trimrouter::managers::{DnsForwarder, Service};
+use trimrouter::services::utils::SharedWanLease;
+use trimrouter::services::{DnsForwarder, Service};
 
 pub async fn test_dns_forwarding(lease_state: SharedWanLease) -> Result<DnsForwarder, String> {
     std::println!("[test] Starting DNS Forwarder test...");

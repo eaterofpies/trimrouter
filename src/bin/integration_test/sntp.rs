@@ -1,7 +1,7 @@
 use chrono::Datelike;
 use std::time::Duration;
-use trimrouter::managers::utils::SharedWanLease;
-use trimrouter::managers::{Service, SntpClient};
+use trimrouter::services::utils::SharedWanLease;
+use trimrouter::services::{Service, SntpClient};
 
 pub async fn test_sntp_sync(lease_state: SharedWanLease) -> Result<SntpClient, String> {
     std::println!("[test] Starting SNTP Client test...");

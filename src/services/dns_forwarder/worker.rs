@@ -1,5 +1,5 @@
-use crate::managers::ipc::{DnsParentToWorkerMsg, recv_msg};
-use crate::managers::utils::{
+use crate::services::ipc::{DnsParentToWorkerMsg, recv_msg};
+use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, async_udp_socket, run_sandboxed_worker, wait_shutdown,
 };
 use log::{error, info, warn};

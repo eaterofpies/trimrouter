@@ -1,5 +1,5 @@
 use crate::cli::WorkerService;
-use crate::workers::{dhcp_client, dhcp_server, dns_forwarder, sntp_client};
+use crate::services::{dhcp_client, dhcp_server, dns_forwarder, sntp_client};
 use log::error;
 use std::process::exit;
 

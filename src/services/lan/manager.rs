@@ -1,5 +1,5 @@
-use crate::managers::utils::{SharedWanLease, mask_to_prefix_len};
-use crate::managers::{DhcpServer, Service, ServiceError};
+use crate::services::utils::{SharedWanLease, mask_to_prefix_len};
+use crate::services::{DhcpServer, Service, ServiceError};
 use crate::network;
 use futures_util::StreamExt;
 use ipnet::Ipv4Net;

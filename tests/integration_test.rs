@@ -17,10 +17,10 @@ mod error;
 #[path = "../src/packet.rs"]
 mod packet;
 
-#[path = "../src/managers/ipc.rs"]
+#[path = "../src/services/ipc.rs"]
 mod ipc;
 
-#[path = "../src/managers/utils.rs"]
+#[path = "../src/services/utils.rs"]
 mod utils;
 
 macro_rules! println {

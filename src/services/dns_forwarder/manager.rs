@@ -1,6 +1,6 @@
-use super::ipc::{DnsParentToWorkerMsg, async_unix_stream, send_msg};
-use super::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
-use super::{ExternalWorker, Service, ServiceError};
+use crate::services::ipc::{DnsParentToWorkerMsg, async_unix_stream, send_msg};
+use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
+use crate::services::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
 use log::info;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, UdpSocket};

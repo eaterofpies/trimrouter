@@ -10,7 +10,7 @@ use trimrouter::init::storage::{
     ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
 };
 use trimrouter::init::system::{PowerOps, ProcessOps, RealSystem, mount_virtual_filesystems};
-use trimrouter::managers::{Service, WanLease};
+use trimrouter::services::{Service, WanLease};
 use trimrouter::network;
 
 mod dhcp_client;

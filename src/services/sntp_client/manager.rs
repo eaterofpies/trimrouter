@@ -1,8 +1,8 @@
-use super::ipc::{
+use crate::services::ipc::{
     SntpClientToParentMsg, SntpParentToWorkerMsg, async_unix_stream, recv_msg, send_msg,
 };
-use super::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
-use super::{ExternalWorker, Service, ServiceError};
+use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
+use crate::services::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
 use log::{error, info};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};

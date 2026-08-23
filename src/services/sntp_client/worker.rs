@@ -1,5 +1,5 @@
-use crate::managers::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
-use crate::managers::utils::{
+use crate::services::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
+use crate::services::utils::{
     SNTP_GID, SNTP_UID, resolve_dns_a_record, run_sandboxed_worker, wait_shutdown,
 };
 use log::{error, info, warn};
