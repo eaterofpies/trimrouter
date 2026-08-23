@@ -236,23 +236,32 @@ async fn start_power_button_monitor<S: system::PowerOps>(
         let path = format!("/dev/input/event{}", i);
         if let Ok(device) = evdev::Device::open(&path) {
             debug!("[init] Monitoring power button input device: {}", path);
-            let sys_clone = sys.clone();
-            let shutdown_clone = shutdown_flag.clone();
-            tokio::spawn(async move {
-                if let Ok(mut stream) = device.into_event_stream() {
-                    while let Some(Ok(event)) = stream.next().await {
-                        if event.event_type() == evdev::EventType::KEY
-                            && event.code() == evdev::KeyCode::KEY_POWER.code()
-                            && event.value() == 1
-                        {
-                            info!("[acpi] Power button pressed. Triggering system shutdown...");
-                            shutdown_clone.store(true, Ordering::Relaxed);
-                            let _ = sys_clone.reboot(nix::sys::reboot::RebootMode::RB_POWER_OFF);
-                            break;
-                        }
-                    }
-                }
-            });
+            tokio::spawn(monitor_single_power_device(
+                device,
+                sys.clone(),
+                shutdown_flag.clone(),
+            ));
+        }
+    }
+}
+
+async fn monitor_single_power_device<S: system::PowerOps>(
+    device: evdev::Device,
+    sys: Arc<S>,
+    shutdown_flag: Arc<AtomicBool>,
+) {
+    let Ok(mut stream) = device.into_event_stream() else {
+        return;
+    };
+    while let Some(Ok(event)) = stream.next().await {
+        if event.event_type() == evdev::EventType::KEY
+            && event.code() == evdev::KeyCode::KEY_POWER.code()
+            && event.value() == 1
+        {
+            info!("[acpi] Power button pressed. Triggering system shutdown...");
+            shutdown_flag.store(true, Ordering::Relaxed);
+            let _ = sys.reboot(nix::sys::reboot::RebootMode::RB_POWER_OFF);
+            break;
         }
     }
 }
