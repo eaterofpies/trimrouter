@@ -86,19 +86,29 @@ target/$(RUST_TARGET_$(1))/release/integration_test: Cargo.toml Cargo.lock $(SRC
 target/$(1)/test_boot/.kernel_extracted: scripts/extract_kernel.sh
 	@./scripts/extract_kernel.sh $(1)
 
+# Rule for pre-staging and decompressing kernel modules for the initramfs
+target/$(1)/.modules_staged: target/$(1)/test_boot/.kernel_extracted scripts/stage_kernel_modules.sh
+	@./scripts/stage_kernel_modules.sh $(1)
+
+# Rule for building the EROFS full module filesystem
+target/$(1)/modules.erofs: target/$(1)/test_boot/.kernel_extracted
+	@echo "[build] Building EROFS kernel module image for $(1)..."
+	@mkfs.erofs -zlz4hc $$@ target/$(1)/test_boot/lib/modules
+	@ls -lh $$@ | awk '{print "  EROFS image:", $$$$5, $$$$9}'
+
 # Rule for building the target initramfs cpio archive
-target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/test_boot/.kernel_extracted scripts/build_initramfs.sh
+target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/.modules_staged scripts/build_initramfs.sh
 	@./scripts/build_initramfs.sh $(1) prod
 
-target/$(1)/initramfs-test.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(RUST_TARGET_$(1))/release/integration_test target/$(1)/test_boot/.kernel_extracted scripts/build_initramfs.sh
+target/$(1)/initramfs-test.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(RUST_TARGET_$(1))/release/integration_test target/$(1)/.modules_staged scripts/build_initramfs.sh
 	@./scripts/build_initramfs.sh $(1) test
 
 # Rule for building the raw disk/SD image
-target/$(1)/trimrouter.img: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/initramfs.cpio.gz scripts/build_image.sh $(TRIMROUTER_CONFIG) $(CONFIG_PATH_TRACKER)
+target/$(1)/trimrouter.img: target/$(1)/initramfs.cpio.gz target/$(1)/modules.erofs scripts/build_image.sh $(TRIMROUTER_CONFIG) $(CONFIG_PATH_TRACKER)
 	@./scripts/build_image.sh $(1) $(TRIMROUTER_CONFIG) trimrouter.img
 
 # Rule for building the test raw disk image (always uses repository-default config/trimrouter.toml)
-target/$(1)/trimrouter-test.img: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/initramfs-test.cpio.gz scripts/build_image.sh config/trimrouter.toml
+target/$(1)/trimrouter-test.img: target/$(1)/initramfs-test.cpio.gz target/$(1)/modules.erofs scripts/build_image.sh config/trimrouter.toml
 	@./scripts/build_image.sh $(1) config/trimrouter.toml trimrouter-test.img
 endef
 

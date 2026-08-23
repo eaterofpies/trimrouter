@@ -16,15 +16,11 @@ CURDIR=$(pwd)
 IMAGE="target/${ARCH}/${IMAGE_NAME}"
 mkdir -p "target/${ARCH}"
 
-# Build a read-only EROFS image from the kernel module tree.
-# EROFS is case-sensitive, compressed, and mounted file-backed at boot.
-build_modules_erofs() {
-    local src="$1"
-    local out="$2"
-    echo "[build-image] Building EROFS module image from $src..."
-    mkfs.erofs -zlz4hc "$out" "$src"
-    ls -lh "$out" | awk '{print "  EROFS image:", $5, $9}'
-}
+# Validate configuration file
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "[build-image] ERROR: Configuration file '$CONFIG_FILE' not found."
+    exit 1
+fi
 
 case "$ARCH" in
     x86_64)
@@ -40,6 +36,35 @@ case "$ARCH" in
         fi
         CMDLINE="${TRIMROUTER_CMDLINE:-$DEFAULT_CMDLINE}"
 
+        # Validate prerequisite build artifacts
+        if [ ! -f "$KERNEL" ]; then
+            echo "[build-image] ERROR: Kernel '$KERNEL' not found. Run './scripts/extract_kernel.sh x86_64' or 'make'."
+            exit 1
+        fi
+        if [ ! -f "$INITRAMFS" ]; then
+            echo "[build-image] ERROR: Initramfs '$INITRAMFS' not found. Run './scripts/build_initramfs.sh x86_64' or 'make'."
+            exit 1
+        fi
+        if [ ! -f "target/x86_64/modules.erofs" ]; then
+            echo "[build-image] ERROR: EROFS module image 'target/x86_64/modules.erofs' not found. Run 'make target/x86_64/modules.erofs'."
+            exit 1
+        fi
+
+        # Check required host utilities
+        for tool in dd parted mformat mcopy objcopy; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+                echo "[build-image] ERROR: Required tool '$tool' is not installed."
+                exit 1
+            fi
+        done
+
+        STUB="/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+        if [ ! -f "$STUB" ]; then
+            echo "[build-image] ERROR: systemd-boot EFI stub not found at $STUB"
+            echo "[build-image] Install it with: sudo apt-get install -y systemd-boot-efi"
+            exit 1
+        fi
+
         echo "[build-image] Building disk image for x86_64 (UEFI)..."
 
         # 1. Allocate blank raw disk image with bootable FAT32 partition (MBR table)
@@ -50,16 +75,9 @@ case "$ARCH" in
         mformat -v TRIMROUTER -i "${IMAGE}@@1M" -F
 
         # 3. Build Unified Kernel Image (UKI) for UEFI firmware
-        STUB="/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
         UKI_OUT="target/x86_64/BOOTX64.EFI"
         CMDLINE_FILE="target/x86_64/cmdline.txt"
         printf "%s" "$CMDLINE" > "$CMDLINE_FILE"
-
-        if [ ! -f "$STUB" ]; then
-            echo "[build-image] ERROR: systemd-boot EFI stub not found at $STUB"
-            echo "[build-image] Install it with: sudo apt-get install -y systemd-boot-efi"
-            exit 1
-        fi
 
         objcopy \
             --add-section .cmdline="$CMDLINE_FILE" --change-section-vma .cmdline=0x14dfb0000 \
@@ -78,10 +96,7 @@ case "$ARCH" in
         mcopy -i "${IMAGE}@@1M" "${CONFIG_FILE}" ::/config/trimrouter.toml
 
         # 6. Bundle full module tree into EROFS image
-        if [ -d "target/${ARCH}/test_boot/lib/modules" ]; then
-            build_modules_erofs "target/${ARCH}/test_boot/lib/modules" "target/${ARCH}/modules.erofs"
-            mcopy -i "${IMAGE}@@1M" "target/${ARCH}/modules.erofs" ::/modules.erofs
-        fi
+        mcopy -i "${IMAGE}@@1M" "target/x86_64/modules.erofs" ::/modules.erofs
         ;;
 
     arm64|armhf)
