@@ -118,11 +118,6 @@ pub async fn configure_interface_ip(name: &str, ip_cidr: &str) -> Result<bool, R
         }
     }
 
-    if already_configured {
-        return Ok(true); // Already fully configured
-    }
-
-    // Assign the address if not already present
     if !already_configured {
         match handle
             .address()
@@ -171,4 +166,23 @@ pub async fn get_interface_index(name: &str) -> Option<u32> {
     let mut links = handle.link().get().match_name(name.to_string()).execute();
     let link = links.try_next().await.ok()??;
     Some(link.header.index)
+}
+
+pub async fn flush_ipv4_addresses(name: &str, index: u32) -> Result<(), RouterError> {
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
+
+    let mut addrs = handle.address().get().execute();
+    while let Some(addr_msg) = addrs.try_next().await? {
+        if addr_msg.header.index == index && matches!(addr_msg.header.family, AddressFamily::Inet) {
+            debug!(
+                "[network] Deleting address on interface {} (prefix_len={}) during cleanup",
+                name, addr_msg.header.prefix_len
+            );
+            if let Err(e) = handle.address().del(addr_msg).execute().await {
+                warn!("[network] Failed to delete address on {}: {}", name, e);
+            }
+        }
+    }
+    Ok(())
 }

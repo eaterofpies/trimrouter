@@ -2,11 +2,12 @@ use super::ipc::{DnsParentToWorkerMsg, async_unix_stream, send_msg};
 use super::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
 use super::{ExternalWorker, Service, ServiceError};
 use log::info;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::Error as IoError;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
@@ -34,7 +35,7 @@ impl DnsForwarder {
 }
 
 async fn run_parent_dns_monitor(
-    ipc_reader: OwnedReadHalf,
+    mut ipc_reader: OwnedReadHalf,
     shared_ipc_writer: Arc<Mutex<OwnedWriteHalf>>,
     child_pid: u32,
     lease_state: SharedWanLease,
@@ -52,21 +53,13 @@ async fn run_parent_dns_monitor(
     while !*shutdown_rx.borrow() {
         tokio::select! {
             _ = shutdown_rx.changed() => {}
-            read_res = ipc_reader.readable() => {
-                if read_res.is_err() {
-                    break;
-                }
-                match ipc_reader.try_read(&mut eof_buf) {
-                    Ok(0) => {
+            res = ipc_reader.read(&mut eof_buf) => {
+                match res {
+                    Ok(0) | Err(_) => {
                         info!("[dns-forwarder-parent] Worker closed IPC. Shutting down monitor.");
                         break;
                     }
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                        // Not EOF, just woke up
-                    }
-                    _ => {
-                        break;
-                    }
+                    Ok(_) => {}
                 }
             }
             _ = interval_timer.tick() => {

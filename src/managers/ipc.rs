@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -26,11 +26,6 @@ impl IpcEndpoint {
             reader,
             writer: Arc::new(Mutex::new(writer)),
         })
-    }
-
-    pub fn from_raw_fd(fd: RawFd) -> Result<Self, std::io::Error> {
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Self::from_owned_fd(owned_fd)
     }
 }
 

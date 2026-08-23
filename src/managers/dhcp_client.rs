@@ -5,7 +5,6 @@ use super::utils::{
 };
 use super::{ExternalWorker, Service, ServiceError};
 use crate::workers::dhcp_client::DhcpError;
-use futures_util::TryStreamExt;
 use log::{error, info, warn};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::io::OwnedFd;
@@ -196,37 +195,14 @@ pub async fn deconfigure_wan(
         ip, prefix_len
     );
 
-    let (connection, handle, _) = rtnetlink::new_connection()?;
-    tokio::spawn(connection);
-
-    let mut links = handle
-        .link()
-        .get()
-        .match_name(wan_interface.to_string())
-        .execute();
-    let link = match links.try_next().await? {
-        Some(l) => l,
+    let index = match crate::network::get_interface_index(wan_interface).await {
+        Some(idx) => idx,
         None => return Err(DhcpError::InterfaceNotFound(wan_interface.to_string())),
     };
-    let index = link.header.index;
 
-    let mut addresses = handle.address().get().execute();
-    while let Some(addr) = addresses.try_next().await? {
-        if addr.header.index == index {
-            let mut matches_ip = false;
-            for nla in addr.attributes.iter() {
-                if let rtnetlink::packet_route::address::AddressAttribute::Local(ip_attr) = nla
-                    && ip_attr == &IpAddr::V4(ip)
-                {
-                    matches_ip = true;
-                    break;
-                }
-            }
-            if matches_ip && let Err(e) = handle.address().del(addr).execute().await {
-                warn!("[dhcp-client] Failed to delete IP address: {}", e);
-            }
-        }
-    }
+    crate::network::flush_ipv4_addresses(wan_interface, index)
+        .await
+        .map_err(|e| DhcpError::Protocol(e.to_string()))?;
     Ok(())
 }
 
@@ -244,28 +220,17 @@ pub async fn configure_wan(
         CleanOption(&gateway)
     );
 
-    let (connection, handle, _) = rtnetlink::new_connection()?;
-    tokio::spawn(connection);
-
-    let mut links = handle
-        .link()
-        .get()
-        .match_name(wan_interface.to_string())
-        .execute();
-    let link = match links.try_next().await? {
-        Some(l) => l,
+    let index = match crate::network::get_interface_index(wan_interface).await {
+        Some(idx) => idx,
         None => return Err(DhcpError::InterfaceNotFound(wan_interface.to_string())),
     };
-    let index = link.header.index;
 
-    let mut addresses = handle.address().get().execute();
-    while let Some(addr) = addresses.try_next().await? {
-        if addr.header.index == index
-            && let Err(e) = handle.address().del(addr).execute().await
-        {
-            warn!("[dhcp-client] Failed to delete existing address: {}", e);
-        }
-    }
+    crate::network::flush_ipv4_addresses(wan_interface, index)
+        .await
+        .map_err(|e| DhcpError::Protocol(e.to_string()))?;
+
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
 
     let message = rtnetlink::LinkUnspec::new_with_index(index).up().build();
     handle.link().change(message).execute().await?;

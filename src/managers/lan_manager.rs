@@ -1,13 +1,12 @@
-use crate::error::RouterError;
 use crate::managers::utils::{SharedWanLease, mask_to_prefix_len};
 use crate::managers::{DhcpServer, Service, ServiceError};
 use crate::network;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use ipnet::Ipv4Net;
 use log::{debug, error, info, warn};
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
-use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
+use rtnetlink::packet_route::RouteNetlinkMessage;
 use tokio::sync::watch::Sender;
 use tokio::task::JoinHandle;
 
@@ -157,11 +156,7 @@ async fn check_and_resolve(
 ) -> bool {
     let wan_opt = {
         let lease = lease_state.lock().unwrap();
-        if let (Some(ip), Some(mask)) = (lease.ip, lease.mask) {
-            Some((ip, mask))
-        } else {
-            None
-        }
+        lease.ip.zip(lease.mask)
     };
 
     let Some((wan_ip, wan_mask)) = wan_opt else {
@@ -200,7 +195,7 @@ async fn check_and_resolve(
                 "[lan-manager] Cleaning up IP addresses on interface {}...",
                 lan_interface
             );
-            if let Err(e) = flush_ipv4_addresses(lan_interface, index).await {
+            if let Err(e) = network::flush_ipv4_addresses(lan_interface, index).await {
                 error!("[lan-manager] Failed to flush LAN interface IPs: {}", e);
             }
         } else {
@@ -228,25 +223,4 @@ async fn check_and_resolve(
         return true;
     }
     false
-}
-
-/// Helper to delete all configured IPv4 addresses on the interface.
-async fn flush_ipv4_addresses(name: &str, index: u32) -> Result<(), RouterError> {
-    let (connection, handle, _) = rtnetlink::new_connection()?;
-    tokio::spawn(connection);
-
-    // Delete all IPv4 addresses on this interface
-    let mut addrs = handle.address().get().execute();
-    while let Ok(Some(addr_msg)) = addrs.try_next().await {
-        if addr_msg.header.index == index && matches!(addr_msg.header.family, AddressFamily::Inet) {
-            debug!(
-                "[lan-manager] Deleting address on interface {} (prefix_len={}) during cleanup",
-                name, addr_msg.header.prefix_len
-            );
-            if let Err(e) = handle.address().del(addr_msg).execute().await {
-                warn!("[lan-manager] Failed to delete address: {}", e);
-            }
-        }
-    }
-    Ok(())
 }

@@ -18,7 +18,7 @@ use std::convert::TryInto;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -290,40 +290,23 @@ pub async fn send_raw_packet(async_sock: &tokio::io::unix::AsyncFd<OwnedFd>, fra
 /// A generic asynchronous wrapper around an AF_PACKET raw socket for sending
 /// and receiving raw Ethernet frames on a specific network interface.
 pub struct RawPacketSocket {
-    socket: Option<tokio::io::unix::AsyncFd<OwnedFd>>,
+    socket: tokio::io::unix::AsyncFd<OwnedFd>,
 }
 
 impl RawPacketSocket {
-    pub fn new(interface_name: &str) -> Result<Self, std::io::Error> {
-        let raw_fd = open_raw_socket(interface_name).map_err(std::io::Error::other)?;
-        let socket = tokio::io::unix::AsyncFd::new(raw_fd)?;
-        Ok(Self {
-            socket: Some(socket),
-        })
-    }
-
     pub fn from_owned_fd(owned_fd: OwnedFd) -> Result<Self, std::io::Error> {
         let socket = tokio::io::unix::AsyncFd::new(owned_fd)?;
-        Ok(Self {
-            socket: Some(socket),
-        })
-    }
-
-    pub fn from_raw_fd(raw_fd: RawFd) -> Result<Self, std::io::Error> {
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        Self::from_owned_fd(owned_fd)
+        Ok(Self { socket })
     }
 
     pub async fn send(&self, frame: &[u8]) -> Result<(), std::io::Error> {
-        let socket = self.socket.as_ref().expect("socket is active");
-        send_raw_packet(socket, frame).await;
+        send_raw_packet(&self.socket, frame).await;
         Ok(())
     }
 
     #[allow(dead_code)]
     pub async fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        let socket = self.socket.as_ref().expect("socket is active");
-        read_raw_packet(socket, buf).await
+        read_raw_packet(&self.socket, buf).await
     }
 
     pub async fn recv_timeout(
@@ -331,7 +314,6 @@ impl RawPacketSocket {
         buf: &mut [u8],
         timeout: std::time::Duration,
     ) -> Result<Option<usize>, std::io::Error> {
-        let socket = self.socket.as_ref().expect("socket is active");
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
             let remaining = timeout.saturating_sub(start.elapsed());
@@ -339,7 +321,8 @@ impl RawPacketSocket {
                 break;
             }
 
-            let Ok(Ok(mut guard)) = tokio::time::timeout(remaining, socket.readable()).await else {
+            let Ok(Ok(mut guard)) = tokio::time::timeout(remaining, self.socket.readable()).await
+            else {
                 return Ok(None);
             };
 
