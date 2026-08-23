@@ -2,7 +2,7 @@ use crate::services::ipc::{DhcpServerParentToWorkerMsg, async_unix_stream, send_
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{setup_worker_sockets, terminate_worker};
 use futures_util::{Stream, StreamExt};
-use log::info;
+use log::{error, info};
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
 use rtnetlink::packet_route::RouteNetlinkMessage;
@@ -109,7 +109,7 @@ async fn run_parent_dhcp_server_monitor<S, A>(
                         };
                         let mut writer = shared_ipc_writer.lock().await;
                         if let Err(e) = send_msg(&mut *writer, &ipc_msg).await {
-                            log::error!(
+                            error!(
                                 "[dhcp-server-parent] Failed to send neighbor update over IPC: {}",
                                 e
                             );
