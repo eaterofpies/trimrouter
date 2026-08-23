@@ -1,10 +1,8 @@
 use super::ipc::{DhcpServerParentToWorkerMsg, send_msg};
-use super::utils::setup_worker_sockets;
+use super::utils::{setup_worker_sockets, terminate_worker};
 use super::{ExternalWorker, Service, ServiceError};
 use futures_util::{Stream, StreamExt};
 use log::info;
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
 use rtnetlink::packet_route::RouteNetlinkMessage;
@@ -120,8 +118,7 @@ async fn run_parent_dhcp_server_monitor<S, A>(
         }
     }
 
-    let pid = Pid::from_raw(child_pid as i32);
-    let _ = kill(pid, Signal::SIGKILL);
+    terminate_worker(child_pid).await;
 }
 
 fn setup_dhcp_server_attempt(

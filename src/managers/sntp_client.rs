@@ -1,11 +1,9 @@
 use super::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
-use super::utils::{SharedWanLease, create_ipc_fds};
+use super::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
 use super::{ExternalWorker, Service, ServiceError};
 use log::{error, info};
-use nix::sys::signal::{Signal, kill};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};
-use nix::unistd::Pid;
 use std::io::Error as IoError;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -90,8 +88,7 @@ async fn run_parent_ipc_receiver(
         }
     }
 
-    let pid = Pid::from_raw(child_pid as i32);
-    let _ = kill(pid, Signal::SIGKILL);
+    terminate_worker(child_pid).await;
 }
 
 async fn handle_parent_ipc_message(res: Result<Option<SntpClientToParentMsg>, IoError>) -> bool {

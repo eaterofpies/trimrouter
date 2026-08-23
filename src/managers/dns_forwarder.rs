@@ -1,9 +1,7 @@
 use super::ipc::{DnsParentToWorkerMsg, send_msg};
-use super::utils::{SharedWanLease, create_ipc_fds};
+use super::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
 use super::{ExternalWorker, Service, ServiceError};
 use log::info;
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use std::io::{Error as IoError, ErrorKind};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
@@ -89,8 +87,7 @@ async fn run_parent_dns_monitor(
         }
     }
 
-    let pid = Pid::from_raw(child_pid as i32);
-    let _ = kill(pid, Signal::SIGKILL);
+    terminate_worker(child_pid).await;
 }
 
 async fn update_upstream_resolvers(

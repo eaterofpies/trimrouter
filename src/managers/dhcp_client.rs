@@ -1,14 +1,12 @@
 use super::ipc::{DhcpClientToParentMsg, recv_msg};
 use super::utils::{
     CleanOption, SharedWanLease, WanLease, mask_to_prefix_len, prefix_len_to_mask,
-    setup_worker_sockets,
+    setup_worker_sockets, terminate_worker,
 };
 use super::{ExternalWorker, Service, ServiceError};
 use crate::workers::dhcp_client::DhcpError;
 use futures_util::TryStreamExt;
 use log::{error, info, warn};
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -148,8 +146,7 @@ async fn run_parent_dhcp_monitor(
         }
     }
 
-    let pid = Pid::from_raw(child_pid as i32);
-    let _ = kill(pid, Signal::SIGKILL);
+    terminate_worker(child_pid).await;
 }
 
 fn setup_dhcp_client_attempt(

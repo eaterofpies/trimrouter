@@ -175,8 +175,7 @@ impl ExternalWorker {
                                 "[{}-parent] Failed to start monitor task: {:?}",
                                 service_name, e
                             );
-                            let pid = nix::unistd::Pid::from_raw(child_pid as i32);
-                            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                            utils::terminate_worker(child_pid).await;
                             unsafe {
                                 let _ = libc::close(parent_ipc_fd);
                             }
