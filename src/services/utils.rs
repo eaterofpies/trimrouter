@@ -610,24 +610,38 @@ pub async fn handle_supervisor_restart_delay(
 pub async fn terminate_worker(pid: u32) {
     let pid = nix::unistd::Pid::from_raw(pid as i32);
     if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
-        warn!(
-            "[utils] Failed to send SIGTERM to worker process {}: {}",
-            pid, e
-        );
-    }
-
-    let start = std::time::Instant::now();
-    while let Ok(nix::sys::wait::WaitStatus::StillAlive) =
-        nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
-    {
-        if start.elapsed() > std::time::Duration::from_secs(1)
-            && let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL)
-        {
+        if e != nix::errno::Errno::ESRCH {
             warn!(
-                "[utils] Failed to send SIGKILL to worker process {}: {}",
+                "[utils] Failed to send SIGTERM to worker process {}: {}",
                 pid, e
             );
         }
+        return;
+    }
+
+    let start = std::time::Instant::now();
+    let mut sigkill_sent = false;
+
+    while let Ok(nix::sys::wait::WaitStatus::StillAlive) =
+        nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
+    {
+        if !sigkill_sent && start.elapsed() > std::time::Duration::from_secs(1) {
+            sigkill_sent = true;
+            if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL)
+                && e != nix::errno::Errno::ESRCH
+            {
+                warn!(
+                    "[utils] Failed to send SIGKILL to worker process {}: {}",
+                    pid, e
+                );
+            }
+        }
+
+        if start.elapsed() > std::time::Duration::from_secs(2) {
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
