@@ -1,20 +1,20 @@
-use super::ipc::{recv_msg, send_msg, SntpClientToParentMsg, SntpParentToWorkerMsg};
-use super::utils::{create_ipc_fds, SharedWanLease};
+use super::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
+use super::utils::{SharedWanLease, create_ipc_fds};
 use super::{ExternalWorker, Service, ServiceError};
 use log::{error, info};
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{Signal, kill};
 use nix::sys::time::TimeSpec;
-use nix::time::{clock_settime, ClockId};
+use nix::time::{ClockId, clock_settime};
 use nix::unistd::Pid;
 use std::io::Error as IoError;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::watch::Receiver;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
+use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
@@ -94,9 +94,7 @@ async fn run_parent_ipc_receiver(
     let _ = kill(pid, Signal::SIGKILL);
 }
 
-async fn handle_parent_ipc_message(
-    res: Result<Option<SntpClientToParentMsg>, IoError>,
-) -> bool {
+async fn handle_parent_ipc_message(res: Result<Option<SntpClientToParentMsg>, IoError>) -> bool {
     match res {
         Ok(Some(SntpClientToParentMsg::SetSystemTime {
             seconds,
@@ -119,10 +117,7 @@ async fn handle_parent_ipc_message(
 fn set_system_clock(seconds: i64, nanoseconds: i64) {
     let timespec = TimeSpec::new(seconds, nanoseconds);
     if let Err(e) = clock_settime(ClockId::CLOCK_REALTIME, timespec) {
-        error!(
-            "[sntp-client-parent] Failed to set system clock: {}",
-            e
-        );
+        error!("[sntp-client-parent] Failed to set system clock: {}", e);
     } else {
         info!("[sntp-client-parent] Successfully set system clock.");
     }

@@ -4,8 +4,8 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::time::{sleep, Duration};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::{Duration, sleep};
 
 async fn fallback_polling_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     while !shutdown_flag.load(Ordering::Relaxed) {

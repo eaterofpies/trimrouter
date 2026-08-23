@@ -3,8 +3,8 @@ use std::net::Ipv4Addr;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 
 pub struct IpcEndpoint {

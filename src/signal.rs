@@ -3,8 +3,8 @@ use log::{debug, info, warn};
 use nix::sys::reboot::RebootMode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::time::{sleep, Duration};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::{Duration, sleep};
 
 pub async fn start_signal_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     debug!("[init] Starting system signal monitor...");

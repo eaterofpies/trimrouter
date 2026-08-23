@@ -11,8 +11,8 @@ use futures_util::{StreamExt, TryStreamExt};
 use log::{error, info, warn};
 use pnet::util::MacAddr;
 use rtnetlink::packet_core::NetlinkPayload;
-use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
 use rtnetlink::packet_route::RouteNetlinkMessage;
+use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
 use rtnetlink::{LinkUnspec, MulticastGroup};
 use std::collections::{HashMap, HashSet};
 
@@ -144,10 +144,7 @@ pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
             // Bring it UP administratively so carrier detection/negotiation can occur
             let _ = network::ensure_interface_up(&n).await;
 
-            let has_link = link_msg
-                .header
-                .flags
-                .contains(LinkFlags::LowerUp);
+            let has_link = link_msg.header.flags.contains(LinkFlags::LowerUp);
             link_states.insert(index, (n.clone(), addr, has_link));
 
             if has_link {
@@ -270,10 +267,7 @@ async fn handle_new_link_event(
         return Ok(());
     }
 
-    let has_link = link_msg
-        .header
-        .flags
-        .contains(LinkFlags::LowerUp);
+    let has_link = link_msg.header.flags.contains(LinkFlags::LowerUp);
     let prev_link = link_states.get(&index).map(|s| s.2);
     if prev_link != Some(has_link) {
         if has_link {

@@ -731,9 +731,7 @@ async fn process_wan_dns_query(
         println!("[isp-test] Simulated upstream DNS outage: dropping query.");
         return;
     }
-    if pkt.src_ip == MOCK_CLIENT_IP
-        && pkt.payload.len() >= 2
-        && pkt.payload[2..] == DNS_QUERY[2..]
+    if pkt.src_ip == MOCK_CLIENT_IP && pkt.payload.len() >= 2 && pkt.payload[2..] == DNS_QUERY[2..]
     {
         println!("[isp-test] Verified DNS Forwarder query on WAN!");
         let _ = verification_tx.send("DNS_VERIFIED".to_string()).await;

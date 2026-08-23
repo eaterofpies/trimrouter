@@ -1,13 +1,13 @@
 use crate::error::RouterError;
-use crate::managers::utils::{mask_to_prefix_len, SharedWanLease};
+use crate::managers::utils::{SharedWanLease, mask_to_prefix_len};
 use crate::managers::{DhcpServer, Service, ServiceError};
 use crate::network;
 use futures_util::{StreamExt, TryStreamExt};
 use ipnet::Ipv4Net;
 use log::{debug, error, info, warn};
+use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
-use rtnetlink::MulticastGroup;
 use tokio::sync::watch::Sender;
 use tokio::task::JoinHandle;
 

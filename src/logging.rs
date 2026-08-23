@@ -448,12 +448,12 @@ fn list_rotated_log_files(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn test_format_log_line() {
-        use chrono::TimeZone;
         let ts = Utc.with_ymd_and_hms(2026, 8, 14, 14, 30, 0).unwrap();
         let line = format_log_line(ts, Level::Info, "init", "Mounted /boot successfully.");
         assert_eq!(
@@ -464,7 +464,6 @@ mod tests {
 
     #[test]
     fn test_format_raw_line() {
-        use chrono::TimeZone;
         let ts = Utc.with_ymd_and_hms(2026, 8, 14, 14, 30, 0).unwrap();
         let info_line = format_raw_line(ts, "[dhcp-client] Lease acquired");
         assert_eq!(

@@ -11,7 +11,7 @@ use trimrouter::network;
 use trimrouter::partition::{
     ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
 };
-use trimrouter::system::{mount_virtual_filesystems, RealSystem, SystemOps};
+use trimrouter::system::{RealSystem, SystemOps, mount_virtual_filesystems};
 
 mod dhcp_client;
 mod dns_forwarder;

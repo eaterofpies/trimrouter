@@ -1,8 +1,8 @@
-use super::ipc::{send_msg, DnsParentToWorkerMsg};
-use super::utils::{create_ipc_fds, SharedWanLease};
+use super::ipc::{DnsParentToWorkerMsg, send_msg};
+use super::utils::{SharedWanLease, create_ipc_fds};
 use super::{ExternalWorker, Service, ServiceError};
 use log::info;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::io::{Error as IoError, ErrorKind};
 use std::net::{Ipv4Addr, UdpSocket};
@@ -10,10 +10,10 @@ use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::watch::Receiver;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
+use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
@@ -131,8 +131,7 @@ fn start_parent_dns_monitor(
     Ok(handle)
 }
 
-fn setup_dns_forwarder_attempt()
--> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
+fn setup_dns_forwarder_attempt() -> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
     let (parent_ipc_fd, child_ipc_fd) = create_ipc_fds()?;
     let dns_socket = UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT))?;
     let dns_socket_fd = dns_socket.into_raw_fd();

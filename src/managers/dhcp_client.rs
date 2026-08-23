@@ -1,13 +1,13 @@
-use super::ipc::{recv_msg, DhcpClientToParentMsg};
+use super::ipc::{DhcpClientToParentMsg, recv_msg};
 use super::utils::{
-    mask_to_prefix_len, prefix_len_to_mask, setup_worker_sockets, CleanOption, SharedWanLease,
-    WanLease,
+    CleanOption, SharedWanLease, WanLease, mask_to_prefix_len, prefix_len_to_mask,
+    setup_worker_sockets,
 };
 use super::{ExternalWorker, Service, ServiceError};
 use crate::workers::dhcp_client::DhcpError;
 use futures_util::TryStreamExt;
 use log::{error, info, warn};
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::io::{FromRawFd, RawFd};
@@ -81,10 +81,7 @@ async fn clear_parent_lease(lease_state: &SharedWanLease, wan_interface: &str) {
         && let Some(mask) = mask
         && let Err(e) = deconfigure_wan(wan_interface, ip, mask).await
     {
-        error!(
-            "[dhcp-client-parent] Failed to deconfigure WAN: {}",
-            e
-        );
+        error!("[dhcp-client-parent] Failed to deconfigure WAN: {}", e);
     }
 }
 
@@ -96,52 +93,63 @@ fn start_parent_supervisor_task(
 ) -> Result<JoinHandle<()>, ServiceError> {
     let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
     std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
-    let mut parent_ipc_stream =
-        UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let parent_ipc_stream = UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
 
-    let handle = tokio::spawn(async move {
-        info!(
-            "[dhcp-client-parent] Supervising DHCP client worker (PID {})",
-            child_pid
-        );
-        loop {
-            match recv_msg::<DhcpClientToParentMsg, _>(&mut parent_ipc_stream).await {
-                Ok(Some(DhcpClientToParentMsg::ApplyWanLease {
-                    ip_address,
-                    prefix_len,
-                    gateway,
-                    dns_servers,
-                })) => {
-                    let mask = prefix_len_to_mask(prefix_len);
-                    apply_parent_lease(
-                        &lease_state,
-                        &wan_interface,
-                        ip_address,
-                        mask,
-                        gateway,
-                        dns_servers,
-                    )
-                    .await;
-                }
-                Ok(Some(DhcpClientToParentMsg::ClearWanLease)) => {
-                    clear_parent_lease(&lease_state, &wan_interface).await;
-                }
-                Ok(None) => {
-                    info!("[dhcp-client-parent] Worker IPC socket closed.");
-                    break;
-                }
-                Err(e) => {
-                    error!("[dhcp-client-parent] IPC recv error: {}", e);
-                    break;
-                }
-            }
-        }
-
-        let pid = Pid::from_raw(child_pid as i32);
-        let _ = kill(pid, Signal::SIGKILL);
-    });
+    let handle = tokio::spawn(run_parent_dhcp_monitor(
+        parent_ipc_stream,
+        child_pid,
+        wan_interface,
+        lease_state,
+    ));
 
     Ok(handle)
+}
+
+async fn run_parent_dhcp_monitor(
+    mut parent_ipc_stream: UnixStream,
+    child_pid: u32,
+    wan_interface: String,
+    lease_state: SharedWanLease,
+) {
+    info!(
+        "[dhcp-client-parent] Supervising DHCP client worker (PID {})",
+        child_pid
+    );
+    loop {
+        match recv_msg::<DhcpClientToParentMsg, _>(&mut parent_ipc_stream).await {
+            Ok(Some(DhcpClientToParentMsg::ApplyWanLease {
+                ip_address,
+                prefix_len,
+                gateway,
+                dns_servers,
+            })) => {
+                let mask = prefix_len_to_mask(prefix_len);
+                apply_parent_lease(
+                    &lease_state,
+                    &wan_interface,
+                    ip_address,
+                    mask,
+                    gateway,
+                    dns_servers,
+                )
+                .await;
+            }
+            Ok(Some(DhcpClientToParentMsg::ClearWanLease)) => {
+                clear_parent_lease(&lease_state, &wan_interface).await;
+            }
+            Ok(None) => {
+                info!("[dhcp-client-parent] Worker IPC socket closed.");
+                break;
+            }
+            Err(e) => {
+                error!("[dhcp-client-parent] IPC recv error: {}", e);
+                break;
+            }
+        }
+    }
+
+    let pid = Pid::from_raw(child_pid as i32);
+    let _ = kill(pid, Signal::SIGKILL);
 }
 
 fn setup_dhcp_client_attempt(
@@ -261,10 +269,7 @@ pub async fn configure_wan(
         if addr.header.index == index
             && let Err(e) = handle.address().del(addr).execute().await
         {
-            warn!(
-                "[dhcp-client] Failed to delete existing address: {}",
-                e
-            );
+            warn!("[dhcp-client] Failed to delete existing address: {}", e);
         }
     }
 

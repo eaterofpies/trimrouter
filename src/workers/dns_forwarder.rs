@@ -1,6 +1,6 @@
-use crate::managers::ipc::{recv_msg, DnsParentToWorkerMsg};
+use crate::managers::ipc::{DnsParentToWorkerMsg, recv_msg};
 use crate::managers::utils::{
-    run_sandboxed_worker, wait_shutdown, DNS_FORWARDER_GID, DNS_FORWARDER_UID,
+    DNS_FORWARDER_GID, DNS_FORWARDER_UID, run_sandboxed_worker, wait_shutdown,
 };
 use log::{error, info, warn};
 use std::collections::HashMap;
@@ -9,9 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UdpSocket;
-use tokio::sync::watch::{channel, Receiver, Sender};
+use tokio::net::unix::OwnedReadHalf;
+use tokio::sync::watch::{Receiver, Sender, channel};
 
 // =========================================================================
 // DNS Constants & Config
@@ -203,10 +203,7 @@ async fn run_upstream_receiver(
     }
 }
 
-async fn handle_upstream_error(
-    e: IoError,
-    shutdown_rx: &mut Receiver<bool>,
-) {
+async fn handle_upstream_error(e: IoError, shutdown_rx: &mut Receiver<bool>) {
     error!("[dns-forwarder] Upstream socket read error: {}", e);
     tokio::select! {
         _ = wait_shutdown(shutdown_rx) => {}
@@ -214,10 +211,7 @@ async fn handle_upstream_error(
     }
 }
 
-async fn run_cache_cleanup(
-    cache: SharedCache,
-    mut shutdown_rx: Receiver<bool>,
-) {
+async fn run_cache_cleanup(cache: SharedCache, mut shutdown_rx: Receiver<bool>) {
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -311,10 +305,7 @@ async fn run_query_loop(
     }
 }
 
-async fn handle_query_loop_error(
-    e: IoError,
-    shutdown_rx: &mut Receiver<bool>,
-) {
+async fn handle_query_loop_error(e: IoError, shutdown_rx: &mut Receiver<bool>) {
     warn!(
         "[dns-forwarder] Socket receive error: {}. Retrying in 1s...",
         e

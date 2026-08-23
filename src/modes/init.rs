@@ -1,7 +1,7 @@
 use crate::config::RouterConfig;
 use crate::interface;
 use crate::kmod;
-use crate::managers::{self, Service, CHROOT_JAIL_PATH};
+use crate::managers::{self, CHROOT_JAIL_PATH, Service};
 use crate::netfilter;
 use crate::network;
 use crate::partition::{
@@ -9,15 +9,17 @@ use crate::partition::{
 };
 use crate::reaper;
 use crate::signal;
-use crate::system::{self, mount_virtual_filesystems, register_panic_handler, RealSystem, SystemOps};
+use crate::system::{
+    self, RealSystem, SystemOps, mount_virtual_filesystems, register_panic_handler,
+};
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
 use nix::unistd::Pid;
-use std::fs::{self, metadata, set_permissions, OpenOptions};
+use std::fs::{self, OpenOptions, metadata, set_permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
 
 pub async fn run_as_init(sys: Arc<RealSystem>) {
@@ -39,7 +41,10 @@ pub async fn run_as_init(sys: Arc<RealSystem>) {
 fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
     // For PID 1, redirect standard descriptors (0, 1, 2) to /dev/console
     if sys.getpid() == Pid::from_raw(1)
-        && let Ok(console) = OpenOptions::new().read(true).write(true).open("/dev/console")
+        && let Ok(console) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/console")
     {
         let fd = console.as_raw_fd();
         unsafe {
@@ -121,10 +126,7 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
     config
 }
 
-fn start_system_services(
-    sys: Arc<RealSystem>,
-    shutdown_flag: Arc<AtomicBool>,
-) -> JoinHandle<()> {
+fn start_system_services(sys: Arc<RealSystem>, shutdown_flag: Arc<AtomicBool>) -> JoinHandle<()> {
     // Spawn orphan process reaper
     let reaper_sys = sys.clone();
     let reaper_shutdown = shutdown_flag.clone();

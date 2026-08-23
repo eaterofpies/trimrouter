@@ -1,6 +1,6 @@
-use crate::managers::ipc::{recv_msg, send_msg, SntpClientToParentMsg, SntpParentToWorkerMsg};
+use crate::managers::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
 use crate::managers::utils::{
-    resolve_dns_a_record, run_sandboxed_worker, wait_shutdown, SNTP_GID, SNTP_UID,
+    SNTP_GID, SNTP_UID, resolve_dns_a_record, run_sandboxed_worker, wait_shutdown,
 };
 use log::{error, info, warn};
 use std::io::Error as IoError;
@@ -8,9 +8,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::watch::{channel, Receiver};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::watch::{Receiver, Sender, channel};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
 const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
@@ -20,57 +20,71 @@ const NTP_PORT: u16 = 123;
 const WAN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn run_sntp_client_worker(ipc_fd: RawFd) -> Result<(), IoError> {
-    run_sandboxed_worker("sntp-client", SNTP_UID, SNTP_GID, ipc_fd, |ipc| async move {
-        let (mut ipc_reader, shared_ipc_writer) = (ipc.reader, ipc.writer);
-        let (shutdown_tx, mut shutdown_rx) = channel(false);
-        let wan_active = Arc::new(Mutex::new(false));
+    run_sandboxed_worker(
+        "sntp-client",
+        SNTP_UID,
+        SNTP_GID,
+        ipc_fd,
+        |ipc| async move {
+            let (ipc_reader, shared_ipc_writer) = (ipc.reader, ipc.writer);
+            let (shutdown_tx, mut shutdown_rx) = channel(false);
+            let wan_active = Arc::new(Mutex::new(false));
 
-    // Monitor parent messages
-    let wan_active_clone = wan_active.clone();
-    let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            match recv_msg::<SntpParentToWorkerMsg, _>(&mut ipc_reader).await {
-                Ok(Some(SntpParentToWorkerMsg::SetWanStatus { active })) => {
-                    let mut lock = wan_active_clone.lock().unwrap();
-                    *lock = active;
-                }
-                Ok(None) => {
-                    info!("[sntp-client-worker] Parent closed IPC. Shutting down.");
-                    let _ = shutdown_tx_clone.send(true);
+            // Monitor parent messages
+            tokio::spawn(run_sntp_worker_ipc_monitor(
+                ipc_reader,
+                wan_active.clone(),
+                shutdown_tx.clone(),
+            ));
+
+            let mut current_retry_delay = RETRY_INTERVAL;
+
+            loop {
+                if *shutdown_rx.borrow() {
                     break;
                 }
-                Err(e) => {
-                    error!("[sntp-client-worker] IPC read error: {}. Shutting down.", e);
-                    let _ = shutdown_tx_clone.send(true);
+
+                if !handle_sntp_iteration(
+                    &wan_active,
+                    &shared_ipc_writer,
+                    &mut shutdown_rx,
+                    &mut current_retry_delay,
+                )
+                .await
+                {
                     break;
                 }
             }
-        }
-    });
 
-    let mut current_retry_delay = RETRY_INTERVAL;
+            Ok(())
+        },
+    )
+    .await
+}
 
+async fn run_sntp_worker_ipc_monitor(
+    mut ipc_reader: OwnedReadHalf,
+    wan_active: Arc<Mutex<bool>>,
+    shutdown_tx: Sender<bool>,
+) {
     loop {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-
-        if !handle_sntp_iteration(
-            &wan_active,
-            &shared_ipc_writer,
-            &mut shutdown_rx,
-            &mut current_retry_delay,
-        )
-        .await
-        {
-            break;
+        match recv_msg::<SntpParentToWorkerMsg, _>(&mut ipc_reader).await {
+            Ok(Some(SntpParentToWorkerMsg::SetWanStatus { active })) => {
+                let mut lock = wan_active.lock().unwrap();
+                *lock = active;
+            }
+            Ok(None) => {
+                info!("[sntp-client-worker] Parent closed IPC. Shutting down.");
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+            Err(e) => {
+                error!("[sntp-client-worker] IPC read error: {}. Shutting down.", e);
+                let _ = shutdown_tx.send(true);
+                break;
+            }
         }
     }
-
-    Ok(())
-    })
-    .await
 }
 
 async fn handle_sntp_iteration(
@@ -126,10 +140,7 @@ async fn handle_sntp_iteration(
     }
 }
 
-async fn wait_for_wan(
-    wan_active: &Arc<Mutex<bool>>,
-    shutdown_rx: &mut Receiver<bool>,
-) -> bool {
+async fn wait_for_wan(wan_active: &Arc<Mutex<bool>>, shutdown_rx: &mut Receiver<bool>) -> bool {
     loop {
         let has_wan = {
             let active = wan_active.lock().unwrap();
@@ -147,10 +158,7 @@ async fn wait_for_wan(
     }
 }
 
-async fn sleep_or_shutdown(
-    duration: Duration,
-    shutdown_rx: &mut Receiver<bool>,
-) -> bool {
+async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut Receiver<bool>) -> bool {
     tokio::select! {
         _ = wait_shutdown(shutdown_rx) => false,
         _ = tokio::time::sleep(duration) => true,

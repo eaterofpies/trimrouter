@@ -1,6 +1,6 @@
 use kobject_uevent::{ActionType, UEvent};
 use log::{debug, error, info, warn};
-use netlink_sys::{protocols::NETLINK_KOBJECT_UEVENT, Socket, SocketAddr};
+use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_KOBJECT_UEVENT};
 use nix::mount::MsFlags;
 use nix::sys::socket::{setsockopt, sockopt};
 use std::collections::{HashMap, HashSet};

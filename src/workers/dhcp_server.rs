@@ -1,7 +1,7 @@
-use crate::managers::ipc::{recv_msg, DhcpServerParentToWorkerMsg};
+use crate::managers::ipc::{DhcpServerParentToWorkerMsg, recv_msg};
 use crate::managers::utils::{
-    get_interface_mac, parse_dhcp_payload, read_raw_packet, run_sandboxed_worker, send_raw_packet,
-    wait_shutdown, DHCP_SERVER_GID, DHCP_SERVER_UID,
+    DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload, read_raw_packet,
+    run_sandboxed_worker, send_raw_packet, wait_shutdown,
 };
 use crate::packet::build_raw_packet;
 use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode, OptionCode};
@@ -15,6 +15,9 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::Mutex;
+use tokio::sync::watch::Sender;
 
 const LAN_LEASE_SECS: u32 = 3600;
 
@@ -212,31 +215,15 @@ pub async fn run_dhcp_server_worker(
         DHCP_SERVER_GID,
         ipc_fd,
         |ipc| async move {
-            let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
-            let leases_clone = Arc::clone(&leases);
+            let leases = Arc::new(Mutex::new(LeaseTable::new()));
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-            let mut reader = ipc.reader;
-            let _keep_writer = ipc.writer;
-            tokio::spawn(async move {
-                let _writer_ref = _keep_writer;
-                loop {
-                    match recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut reader).await {
-                        Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
-                            ip_address,
-                            mac_address,
-                        })) => {
-                            let mac = MacAddr::from(mac_address);
-                            update_lease_from_neighbor(mac, ip_address, &leases_clone).await;
-                        }
-                        Ok(None) | Err(_) => {
-                            info!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
-                            let _ = shutdown_tx.send(true);
-                            break;
-                        }
-                    }
-                }
-            });
+            tokio::spawn(run_dhcp_server_ipc_monitor(
+                ipc.reader,
+                ipc.writer,
+                leases.clone(),
+                shutdown_tx,
+            ));
 
             let config = Arc::new(ServerConfig {
                 server_ip,
@@ -253,6 +240,31 @@ pub async fn run_dhcp_server_worker(
         },
     )
     .await
+}
+
+async fn run_dhcp_server_ipc_monitor(
+    mut reader: OwnedReadHalf,
+    _writer: Arc<Mutex<OwnedWriteHalf>>,
+    leases: Arc<Mutex<LeaseTable>>,
+    shutdown_tx: Sender<bool>,
+) {
+    let _keep_writer = _writer;
+    loop {
+        match recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut reader).await {
+            Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
+                ip_address,
+                mac_address,
+            })) => {
+                let mac = MacAddr::from(mac_address);
+                update_lease_from_neighbor(mac, ip_address, &leases).await;
+            }
+            Ok(None) | Err(_) => {
+                info!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+        }
+    }
 }
 
 async fn receive_next_packet(
@@ -610,14 +622,13 @@ async fn handle_dhcp_discover(
         );
     }
 
-    let payload =
-        match build_dhcp_reply_payload(MessageType::Offer, dhcp, leased_ip, config) {
-            Ok(p) => p,
-            Err(e) => {
-                error!("[dhcp-server] ERROR: {}", e);
-                return;
-            }
-        };
+    let payload = match build_dhcp_reply_payload(MessageType::Offer, dhcp, leased_ip, config) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[dhcp-server] ERROR: {}", e);
+            return;
+        }
+    };
 
     let (dest_mac, dest_ip) = get_dest_mac_ip(dhcp.flags().broadcast(), client_mac, leased_ip);
     let frame = build_raw_packet(
@@ -718,14 +729,13 @@ async fn send_dhcp_ack(
     leased_ip: Ipv4Addr,
     config: &ServerConfig,
 ) {
-    let payload =
-        match build_dhcp_reply_payload(MessageType::Ack, dhcp, leased_ip, config) {
-            Ok(p) => p,
-            Err(e) => {
-                error!("[dhcp-server] ERROR: {}", e);
-                return;
-            }
-        };
+    let payload = match build_dhcp_reply_payload(MessageType::Ack, dhcp, leased_ip, config) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[dhcp-server] ERROR: {}", e);
+            return;
+        }
+    };
 
     let (dest_mac, dest_ip) = get_dest_mac_ip(dhcp.flags().broadcast(), client_mac, leased_ip);
     let frame = build_raw_packet(
@@ -807,6 +817,7 @@ fn get_dest_mac_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtnetlink::packet_route::neighbour::NeighbourMessage;
 
     fn make_config(cidr: &str) -> ServerConfig {
         let net: ipnet::Ipv4Net = cidr.parse().unwrap();
@@ -1063,7 +1074,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_neigh_message() {
-        use rtnetlink::packet_route::neighbour::NeighbourMessage;
         let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
         let mut msg = NeighbourMessage::default();
         msg.attributes = vec![

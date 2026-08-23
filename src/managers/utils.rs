@@ -1,11 +1,29 @@
 use super::ipc::IpcEndpoint;
 use crate::error::RouterError;
+use dhcproto::v4::Message;
+use dhcproto::{Decodable, Decoder};
+use futures_util::TryStreamExt;
 use log::{info, warn};
+use nix::unistd::{Gid, Uid, setgid, setuid};
+use pnet::packet::Packet;
+use pnet::packet::ethernet::EthernetPacket;
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::udp::UdpPacket;
 use pnet::util::MacAddr;
 use rtnetlink::packet_route::link::LinkAttribute;
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::collections::BTreeMap;
+use std::convert::TryInto;
+use std::fs;
 use std::net::Ipv4Addr;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::sync::watch::Receiver;
+use tokio::time::timeout;
 
 pub const CHROOT_JAIL_PATH: &str = "/run/empty";
 pub const NOBODY_UID: u32 = 65534;
@@ -115,7 +133,6 @@ pub async fn get_interface_mac(ifname: &str) -> Result<MacAddr, String> {
         .map_err(|e| format!("Failed to open netlink connection: {}", e))?;
     tokio::spawn(connection);
 
-    use futures_util::TryStreamExt;
     let mut links = handle.link().get().match_name(ifname.to_string()).execute();
     let link = match links.try_next().await {
         Ok(Some(l)) => l,
@@ -132,9 +149,6 @@ pub async fn get_interface_mac(ifname: &str) -> Result<MacAddr, String> {
 }
 
 pub fn open_raw_socket(ifname: &str) -> Result<RawFd, String> {
-    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-    use std::os::unix::io::IntoRawFd;
-
     // Create the packet raw socket
     let socket = Socket::new(
         Domain::from(libc::AF_PACKET),
@@ -183,14 +197,7 @@ pub fn open_raw_socket(ifname: &str) -> Result<RawFd, String> {
     Ok(socket.into_raw_fd())
 }
 
-pub fn parse_dhcp_payload(buf: &[u8], expected_port: u16) -> Option<dhcproto::v4::Message> {
-    use dhcproto::v4::Message;
-    use dhcproto::{Decodable, Decoder};
-    use pnet::packet::Packet;
-    use pnet::packet::ethernet::EthernetPacket;
-    use pnet::packet::ipv4::Ipv4Packet;
-    use pnet::packet::udp::UdpPacket;
-
+pub fn parse_dhcp_payload(buf: &[u8], expected_port: u16) -> Option<Message> {
     let eth_pkt = EthernetPacket::new(buf)?;
     if eth_pkt.get_ethertype() != pnet::packet::ethernet::EtherTypes::Ipv4 {
         return None;
@@ -374,9 +381,6 @@ fn find_first_a_record(answers: Vec<dns_parser::ResourceRecord<'_>>) -> Option<s
 }
 
 pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, String> {
-    use tokio::net::UdpSocket;
-    use tokio::time::timeout;
-
     let socket = UdpSocket::bind(LOCAL_DNS_BIND)
         .await
         .map_err(|e| format!("Failed to bind DNS query socket: {}", e))?;
@@ -404,11 +408,7 @@ pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, Stri
         .map_err(|e| format!("Failed to send DNS query: {}", e))?;
 
     let mut buf = [0u8; 512];
-    let recv_res = timeout(
-        std::time::Duration::from_secs(3),
-        socket.recv_from(&mut buf),
-    )
-    .await;
+    let recv_res = timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await;
     let (len, _) = match recv_res {
         Ok(Ok((l, addr))) => {
             if addr == dns_server {
@@ -431,7 +431,7 @@ pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, Stri
     find_first_a_record(packet.answers).ok_or_else(|| format!("No A record resolved for {}", host))
 }
 
-pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+pub async fn wait_shutdown(shutdown_rx: &mut Receiver<bool>) {
     if *shutdown_rx.borrow() {
         return;
     }
@@ -443,10 +443,6 @@ pub async fn wait_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>)
 }
 
 pub fn apply_seccomp() -> Result<(), std::io::Error> {
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
-    use std::collections::BTreeMap;
-    use std::convert::TryInto;
-
     let allowed_syscalls = [
         libc::SYS_read,
         libc::SYS_write,
@@ -537,14 +533,11 @@ pub fn apply_seccomp() -> Result<(), std::io::Error> {
 }
 
 pub fn drop_privileges(uid: u32, gid: u32) -> Result<(), std::io::Error> {
-    use nix::unistd::{Gid, Uid, setgid, setuid};
-
-    std::fs::create_dir_all(CHROOT_JAIL_PATH)?;
-    let metadata = std::fs::metadata(CHROOT_JAIL_PATH)?;
-    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(CHROOT_JAIL_PATH)?;
+    let metadata = fs::metadata(CHROOT_JAIL_PATH)?;
     let mut perms = metadata.permissions();
     perms.set_mode(0o555);
-    std::fs::set_permissions(CHROOT_JAIL_PATH, perms)?;
+    fs::set_permissions(CHROOT_JAIL_PATH, perms)?;
 
     let chroot_path = std::ffi::CString::new(CHROOT_JAIL_PATH).map_err(std::io::Error::other)?;
     let res = unsafe { libc::chroot(chroot_path.as_ptr()) };
@@ -612,7 +605,6 @@ pub fn setup_worker_sockets(interface: &str) -> std::io::Result<(RawFd, RawFd, R
 }
 
 pub fn create_ipc_fds() -> Result<(RawFd, RawFd), std::io::Error> {
-    use std::os::unix::io::IntoRawFd;
     let (parent_stream, child_stream) = tokio::net::UnixStream::pair()?;
     let parent_std = parent_stream.into_std()?;
     let parent_fd = parent_std.into_raw_fd();

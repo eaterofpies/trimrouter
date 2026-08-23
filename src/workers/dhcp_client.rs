@@ -1,9 +1,9 @@
 use crate::managers::dhcp_client::{configure_wan, deconfigure_wan};
-use crate::managers::ipc::{send_msg, DhcpClientToParentMsg};
+use crate::managers::ipc::{DhcpClientToParentMsg, send_msg};
 use crate::managers::utils::{
+    CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, SharedWanLease, WanLease,
     get_interface_mac, mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload,
-    run_sandboxed_worker, wait_shutdown, CleanOption, RawPacketSocket, SharedWanLease, WanLease,
-    DHCP_CLIENT_GID, DHCP_CLIENT_UID,
+    run_sandboxed_worker, wait_shutdown,
 };
 use crate::packet::build_raw_packet;
 use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
