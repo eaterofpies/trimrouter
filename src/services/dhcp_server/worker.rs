@@ -1,8 +1,8 @@
 use crate::packet::build_raw_packet;
 use crate::services::ipc::{DhcpServerParentToWorkerMsg, recv_msg};
 use crate::services::utils::{
-    DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload, read_raw_packet,
-    run_sandboxed_worker, send_raw_packet, wait_shutdown,
+    DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, mac_from_slice, parse_dhcp_payload,
+    read_raw_packet, run_sandboxed_worker, send_raw_packet, wait_shutdown,
 };
 use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode, OptionCode};
 use dhcproto::{Encodable, Encoder};
@@ -387,8 +387,7 @@ async fn handle_neigh_message(msg: NeighbourMessage, leases: &Arc<tokio::sync::M
                 ip_opt = Some(ip);
             }
             NeighbourAttribute::LinkLayerAddress(mac_bytes) if mac_bytes.len() == 6 => {
-                let bytes: [u8; 6] = mac_bytes.try_into().unwrap();
-                mac_opt = Some(MacAddr::from(bytes));
+                mac_opt = mac_from_slice(&mac_bytes).ok();
             }
             _ => {}
         }
