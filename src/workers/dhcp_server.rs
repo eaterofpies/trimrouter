@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use tokio::sync::watch::Sender;
 
 const LAN_LEASE_SECS: u32 = 3600;
+const LEASE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 // =========================================================================
 // Lease Table
@@ -224,6 +225,21 @@ pub async fn run_dhcp_server_worker(
                 leases.clone(),
                 shutdown_tx,
             ));
+
+            let leases_cleanup = leases.clone();
+            let mut shutdown_rx_cleanup = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(LEASE_CLEANUP_INTERVAL);
+                loop {
+                    tokio::select! {
+                        _ = wait_shutdown(&mut shutdown_rx_cleanup) => break,
+                        _ = interval.tick() => {
+                            let mut guard = leases_cleanup.lock().await;
+                            guard.evict_expired();
+                        }
+                    }
+                }
+            });
 
             let config = Arc::new(ServerConfig {
                 server_ip,
