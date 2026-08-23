@@ -31,17 +31,23 @@ esac
 CURDIR=$(pwd)
 STAGING="target/${ARCH}/staging"
 STAGED_MODULES="target/${ARCH}/staged_modules"
-BINARY="target/${RUST_TARGET}/release/trimrouter"
-TEST_BINARY="target/${RUST_TARGET}/release/integration_test"
+
+if [ "$MODE" = "test" ]; then
+    BINARY="target/${RUST_TARGET}/test-fast/trimrouter"
+    TEST_BINARY="target/${RUST_TARGET}/test-fast/integration_test"
+else
+    BINARY="target/${RUST_TARGET}/release/trimrouter"
+    TEST_BINARY="target/${RUST_TARGET}/release/integration_test"
+fi
 
 # Validate required input binaries and staged modules
 if [ ! -f "$BINARY" ]; then
-    echo "[build] ERROR: Target binary '$BINARY' not found. Run 'cargo build --release --target $RUST_TARGET' or 'make'."
+    echo "[build] ERROR: Target binary '$BINARY' not found."
     exit 1
 fi
 
 if [ "$MODE" = "test" ] && [ ! -f "$TEST_BINARY" ]; then
-    echo "[build] ERROR: Test binary '$TEST_BINARY' not found. Run 'cargo build --release --bin integration_test --target $RUST_TARGET' or 'make'."
+    echo "[build] ERROR: Test binary '$TEST_BINARY' not found."
     exit 1
 fi
 

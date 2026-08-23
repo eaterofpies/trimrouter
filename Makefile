@@ -82,6 +82,18 @@ target/$(RUST_TARGET_$(1))/release/integration_test: Cargo.toml Cargo.lock $(SRC
 	@echo "[build] Compiling integration_test (Static $(1) Release)..."
 	@RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld" cargo build --release --bin integration_test --target $(RUST_TARGET_$(1))
 
+target/$(RUST_TARGET_$(1))/test-fast/trimrouter: Cargo.toml Cargo.lock $(SRCS)
+	@echo "[build] Ensuring $(RUST_TARGET_$(1)) target is installed..."
+	@rustup target add $(RUST_TARGET_$(1))
+	@echo "[build] Compiling trimrouter (Static $(1) Fast Test)..."
+	@RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld" cargo build --profile test-fast --target $(RUST_TARGET_$(1))
+
+target/$(RUST_TARGET_$(1))/test-fast/integration_test: Cargo.toml Cargo.lock $(SRCS)
+	@echo "[build] Ensuring $(RUST_TARGET_$(1)) target is installed..."
+	@rustup target add $(RUST_TARGET_$(1))
+	@echo "[build] Compiling integration_test (Static $(1) Fast Test)..."
+	@RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld" cargo build --profile test-fast --bin integration_test --target $(RUST_TARGET_$(1))
+
 # Rule for downloading and extracting Debian generic kernel for tests
 target/$(1)/test_boot/.kernel_extracted: scripts/extract_kernel.sh
 	@./scripts/extract_kernel.sh $(1)
@@ -100,7 +112,7 @@ target/$(1)/modules.erofs: target/$(1)/test_boot/.kernel_extracted
 target/$(1)/initramfs.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(1)/.modules_staged scripts/build_initramfs.sh
 	@./scripts/build_initramfs.sh $(1) prod
 
-target/$(1)/initramfs-test.cpio.gz: target/$(RUST_TARGET_$(1))/release/trimrouter target/$(RUST_TARGET_$(1))/release/integration_test target/$(1)/.modules_staged scripts/build_initramfs.sh
+target/$(1)/initramfs-test.cpio.gz: target/$(RUST_TARGET_$(1))/test-fast/trimrouter target/$(RUST_TARGET_$(1))/test-fast/integration_test target/$(1)/.modules_staged scripts/build_initramfs.sh
 	@./scripts/build_initramfs.sh $(1) test
 
 # Rule for building the raw disk/SD image

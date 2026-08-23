@@ -47,3 +47,11 @@ lto = true           # Link-Time Optimization
 codegen-units = 1    # Reduce parallel code generation units to optimize size
 panic = "abort"      # Abort on panic (reduces binary size, though we can still catch/hook panic)
 strip = true         # Strip symbols
+
+[profile.test-fast]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16
+strip = false
+
