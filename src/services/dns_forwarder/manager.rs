@@ -1,6 +1,6 @@
 use crate::services::ipc::{DnsParentToWorkerMsg, async_unix_stream, send_msg};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
-use crate::services::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
+use crate::services::utils::{DNS_PORT, SharedWanLease, create_ipc_fds, terminate_worker};
 use log::info;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -13,8 +13,6 @@ use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-
-const DNS_PORT: u16 = 53;
 
 pub struct DnsForwarder {
     lease_state: SharedWanLease,
