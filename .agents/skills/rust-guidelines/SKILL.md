@@ -67,5 +67,7 @@ This skill provides code style and design standards for writing and modifying Ru
 * **Service layer** (e.g. `LanManager`, `DhcpClient`): Solely responsible for IP address assignment and management. Services must not transition link administrative states.
 * **Generic Interfaces**: Keep the interface management structures (`ManagedInterface`) generic by injecting active services directly instead of branching on interface types.
 
-
-
+## 13. Don't Make Unrelated Changes When Reorganising Code
+* **Strict Separation of Structural Reorganisation and Logic Changes**: When reorganising directory layouts, renaming files, moving modules, or co-locating code (e.g., moving managers and workers into unified service folders), limit changes strictly to moving files, updating module paths, adjusting imports, and re-exporting symbols.
+* **No Unrelated Refactors During Moves**: Do NOT modify algorithms, alter function signatures, change error handling behaviors, swap crates, or refactor unrelated logic as part of a reorganization.
+* **One Change at a Time**: Perform architectural and structural reorganizations first in a dedicated, isolated commit. Any bug fixes, optimizations, or code cleanup must be performed in separate, focused follow-up commits.
