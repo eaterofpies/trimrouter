@@ -35,62 +35,30 @@ impl std::error::Error for RouterError {
     }
 }
 
-impl From<rtnetlink::Error> for RouterError {
-    fn from(err: rtnetlink::Error) -> Self {
-        Self::Netlink(err)
-    }
+macro_rules! impl_from {
+    ($from:ty => @string) => {
+        impl From<$from> for RouterError {
+            fn from(err: $from) -> Self {
+                Self::Generic(err.to_string())
+            }
+        }
+    };
+    ($from:ty => $variant:ident) => {
+        impl From<$from> for RouterError {
+            fn from(err: $from) -> Self {
+                Self::$variant(err)
+            }
+        }
+    };
 }
 
-impl From<std::io::Error> for RouterError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<std::net::AddrParseError> for RouterError {
-    fn from(err: std::net::AddrParseError) -> Self {
-        Self::AddrParse(err)
-    }
-}
-
-impl From<String> for RouterError {
-    fn from(err: String) -> Self {
-        Self::Generic(err)
-    }
-}
-
-impl From<&str> for RouterError {
-    fn from(err: &str) -> Self {
-        Self::Generic(err.to_string())
-    }
-}
-
-impl From<rustables::error::BuilderError> for RouterError {
-    fn from(err: rustables::error::BuilderError) -> Self {
-        Self::Generic(err.to_string())
-    }
-}
-
-impl From<rustables::error::QueryError> for RouterError {
-    fn from(err: rustables::error::QueryError) -> Self {
-        Self::Generic(err.to_string())
-    }
-}
-
-impl From<Box<dyn std::error::Error>> for RouterError {
-    fn from(err: Box<dyn std::error::Error>) -> Self {
-        Self::Generic(err.to_string())
-    }
-}
-
-impl From<std::num::ParseIntError> for RouterError {
-    fn from(err: std::num::ParseIntError) -> Self {
-        Self::ParseInt(err)
-    }
-}
-
-impl From<ipnet::AddrParseError> for RouterError {
-    fn from(err: ipnet::AddrParseError) -> Self {
-        Self::Generic(err.to_string())
-    }
-}
+impl_from!(rtnetlink::Error => Netlink);
+impl_from!(std::io::Error => Io);
+impl_from!(std::net::AddrParseError => AddrParse);
+impl_from!(std::num::ParseIntError => ParseInt);
+impl_from!(String => Generic);
+impl_from!(&str => @string);
+impl_from!(rustables::error::BuilderError => @string);
+impl_from!(rustables::error::QueryError => @string);
+impl_from!(Box<dyn std::error::Error> => @string);
+impl_from!(ipnet::AddrParseError => @string);

@@ -364,30 +364,26 @@ async fn process_incoming_packet(
         }
         MessageType::Decline => {
             let mut leases_guard = leases.lock().await;
-            handle_dhcp_decline(client_mac, &mut leases_guard);
+            remove_client_lease(client_mac, &mut leases_guard, "DHCPDECLINE", "Removed");
         }
         MessageType::Release => {
             let mut leases_guard = leases.lock().await;
-            handle_dhcp_release(client_mac, &mut leases_guard);
+            remove_client_lease(client_mac, &mut leases_guard, "DHCPRELEASE", "Released");
         }
         _ => {}
     }
 }
 
-fn handle_dhcp_decline(client_mac: MacAddr, leases: &mut LeaseTable) {
+fn remove_client_lease(
+    client_mac: MacAddr,
+    leases: &mut LeaseTable,
+    msg_type_name: &str,
+    action_verb: &str,
+) {
     if let Some(lease) = leases.remove(&client_mac) {
         info!(
-            "[dhcp-server] Received DHCPDECLINE from client MAC: {}. Removed lease for IP: {}.",
-            client_mac, lease.ip
-        );
-    }
-}
-
-fn handle_dhcp_release(client_mac: MacAddr, leases: &mut LeaseTable) {
-    if let Some(lease) = leases.remove(&client_mac) {
-        info!(
-            "[dhcp-server] Received DHCPRELEASE from client MAC: {}. Released lease for IP: {}.",
-            client_mac, lease.ip
+            "[dhcp-server] Received {} from client MAC: {}. {} lease for IP: {}.",
+            msg_type_name, client_mac, action_verb, lease.ip
         );
     }
 }
@@ -908,7 +904,7 @@ mod tests {
         assert!(!leases.is_ip_available(ip));
 
         // Decline removes the lease and frees the IP atomically
-        handle_dhcp_decline(client, &mut leases);
+        remove_client_lease(client, &mut leases, "DHCPDECLINE", "Removed");
         assert_eq!(leases.len(), 0);
         assert!(leases.is_ip_available(ip));
 
@@ -918,7 +914,7 @@ mod tests {
         assert_eq!(leases.len(), 1);
 
         // Release also frees the IP atomically
-        handle_dhcp_release(client, &mut leases);
+        remove_client_lease(client, &mut leases, "DHCPRELEASE", "Released");
         assert_eq!(leases.len(), 0);
         assert!(leases.is_ip_available(ip));
     }

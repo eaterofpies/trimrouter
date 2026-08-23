@@ -6,7 +6,6 @@ use futures_util::{StreamExt, TryStreamExt};
 use ipnet::Ipv4Net;
 use log::{debug, error, info, warn};
 use rtnetlink::packet_core::NetlinkPayload;
-use rtnetlink::packet_route::link::LinkAttribute;
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
 use rtnetlink::MulticastGroup;
 use tokio::sync::watch::Sender;
@@ -196,7 +195,7 @@ async fn check_and_resolve(
             error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
         }
 
-        if let Some(index) = get_interface_index(lan_interface).await {
+        if let Some(index) = network::get_interface_index(lan_interface).await {
             debug!(
                 "[lan-manager] Cleaning up IP addresses on interface {}...",
                 lan_interface
@@ -229,27 +228,6 @@ async fn check_and_resolve(
         return true;
     }
     false
-}
-
-/// Helper to get the interface index by name
-async fn get_interface_index(name: &str) -> Option<u32> {
-    let Ok((connection, handle, _)) = rtnetlink::new_connection() else {
-        return None;
-    };
-    tokio::spawn(connection);
-
-    let mut links = handle.link().get().execute();
-    while let Ok(Some(link)) = links.try_next().await {
-        let index = link.header.index;
-        for nla in link.attributes {
-            if let LinkAttribute::IfName(n) = nla
-                && n == name
-            {
-                return Some(index);
-            }
-        }
-    }
-    None
 }
 
 /// Helper to delete all configured IPv4 addresses on the interface.

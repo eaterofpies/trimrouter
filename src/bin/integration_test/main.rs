@@ -330,7 +330,7 @@ async fn main() {
     }
 
     // Clean WAN IP configuration
-    if let Some(index) = get_interface_index("wan").await
+    if let Some(index) = network::get_interface_index("wan").await
         && let Err(e) = flush_ipv4_addresses("wan", index).await
     {
         std::eprintln!(
@@ -383,26 +383,6 @@ async fn main() {
             std::eprintln!("[test] Warning: Failed to power off guest VM: {}", e);
         }
     }
-}
-
-async fn get_interface_index(name: &str) -> Option<u32> {
-    let Ok((connection, handle, _)) = rtnetlink::new_connection() else {
-        return None;
-    };
-    tokio::spawn(connection);
-
-    let mut links = handle.link().get().execute();
-    while let Ok(Some(link)) = links.try_next().await {
-        let index = link.header.index;
-        for nla in link.attributes {
-            if let rtnetlink::packet_route::link::LinkAttribute::IfName(n) = nla
-                && n == name
-            {
-                return Some(index);
-            }
-        }
-    }
-    None
 }
 
 async fn flush_ipv4_addresses(name: &str, index: u32) -> Result<(), String> {

@@ -37,10 +37,7 @@ pub struct CleanOption<'a, T>(pub &'a Option<T>);
 
 impl<'a, T: std::fmt::Display> std::fmt::Debug for CleanOption<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            Some(val) => write!(f, "\"{}\"", val),
-            None => write!(f, "None"),
-        }
+        std::fmt::Display::fmt(self, f)
     }
 }
 

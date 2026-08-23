@@ -163,3 +163,12 @@ pub async fn ensure_interface_up(name: &str) -> Result<bool, RouterError> {
     );
     Ok(true)
 }
+
+pub async fn get_interface_index(name: &str) -> Option<u32> {
+    let (connection, handle, _) = rtnetlink::new_connection().ok()?;
+    tokio::spawn(connection);
+
+    let mut links = handle.link().get().match_name(name.to_string()).execute();
+    let link = links.try_next().await.ok()??;
+    Some(link.header.index)
+}
