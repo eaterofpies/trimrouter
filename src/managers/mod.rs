@@ -66,8 +66,8 @@ impl From<io::Error> for ServiceError {
 }
 
 pub trait Service: Send + Sync {
-    async fn start(&mut self) -> Result<(), ServiceError>;
-    async fn stop(&mut self) -> Result<(), ServiceError>;
+    fn start(&mut self) -> impl std::future::Future<Output = Result<(), ServiceError>> + Send;
+    fn stop(&mut self) -> impl std::future::Future<Output = Result<(), ServiceError>> + Send;
 }
 
 // =========================================================================

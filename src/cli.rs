@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::os::unix::io::RawFd;
 
 #[derive(Parser, Debug)]
 #[command(name = "trimrouter-multicall", multicall = true)]
@@ -106,7 +107,7 @@ pub enum WorkerService {
 }
 
 impl WorkerService {
-    pub fn to_args_and_child_fds(&self) -> (Vec<String>, Vec<std::os::unix::io::RawFd>) {
+    pub fn to_args_and_child_fds(&self) -> (Vec<String>, Vec<RawFd>) {
         match self {
             Self::SntpClient { ipc_fd } => (vec![ipc_fd.to_string()], vec![*ipc_fd]),
             Self::DhcpClient {

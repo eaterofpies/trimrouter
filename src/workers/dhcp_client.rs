@@ -7,6 +7,7 @@ use crate::managers::utils::{
 };
 use crate::packet::build_raw_packet;
 use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
+use dhcproto::{Encodable, Encoder};
 use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
@@ -100,7 +101,6 @@ impl DhcpClientSocket {
         message: &dhcproto::v4::Message,
         dest_ip: Ipv4Addr,
     ) -> Result<(), DhcpError> {
-        use dhcproto::{Encodable, Encoder};
         let mut payload = Vec::new();
         message
             .encode(&mut Encoder::new(&mut payload))
@@ -661,8 +661,6 @@ fn calculate_renewal_params(
 }
 
 fn parse_offer(dhcp: &dhcproto::v4::Message, xid: u32) -> Option<DhcpOffer> {
-    use dhcproto::v4::{DhcpOption, MessageType, OptionCode};
-
     if dhcp.xid() != xid {
         return None;
     }
@@ -680,8 +678,6 @@ fn parse_offer(dhcp: &dhcproto::v4::Message, xid: u32) -> Option<DhcpOffer> {
 }
 
 fn parse_ack_nak(dhcp: &dhcproto::v4::Message, xid: u32) -> ParseAckResult {
-    use dhcproto::v4::{DhcpOption, MessageType, OptionCode};
-
     if dhcp.xid() != xid {
         return ParseAckResult::None;
     }
@@ -710,9 +706,6 @@ fn get_server_identifier(dhcp: &dhcproto::v4::Message) -> Option<Ipv4Addr> {
 }
 
 fn parse_lease_options(dhcp: &dhcproto::v4::Message) -> LeaseOptions {
-    use dhcproto::v4::DhcpOption;
-    use dhcproto::v4::OptionCode;
-
     let mask = match dhcp.opts().get(OptionCode::SubnetMask) {
         Some(DhcpOption::SubnetMask(m)) => *m,
         _ => DEFAULT_SUBNET_MASK,

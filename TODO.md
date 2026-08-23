@@ -6,7 +6,6 @@
 - Support TCP, DNSSEC, etc. in the DNS forwarder
 - Add some basic observability and metrics
 - Clean up logging (maybe add a structured logging library like `tracing`)
-- Add logging to file + file rotation
 - Deduplicate dependencies
 - Add service stopping notifications
 - Panic doesn't stop routing / other services. Should it?

@@ -1,4 +1,7 @@
+use futures_util::TryStreamExt;
 use nix::unistd::Pid;
+use rtnetlink::packet_route::AddressFamily;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 use trimrouter::kmod;
@@ -8,7 +11,7 @@ use trimrouter::network;
 use trimrouter::partition::{
     ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
 };
-use trimrouter::system::{RealSystem, SystemOps, mount_virtual_filesystems};
+use trimrouter::system::{mount_virtual_filesystems, RealSystem, SystemOps};
 
 mod dhcp_client;
 mod dns_forwarder;
@@ -37,7 +40,6 @@ async fn main() {
             .write(true)
             .open("/dev/console")
     {
-        use std::os::unix::io::AsRawFd;
         let fd = console.as_raw_fd();
         unsafe {
             libc::dup2(fd, 0);
@@ -384,7 +386,6 @@ async fn main() {
 }
 
 async fn get_interface_index(name: &str) -> Option<u32> {
-    use futures_util::TryStreamExt;
     let Ok((connection, handle, _)) = rtnetlink::new_connection() else {
         return None;
     };
@@ -405,8 +406,6 @@ async fn get_interface_index(name: &str) -> Option<u32> {
 }
 
 async fn flush_ipv4_addresses(name: &str, index: u32) -> Result<(), String> {
-    use futures_util::TryStreamExt;
-    use rtnetlink::packet_route::AddressFamily;
     let (connection, handle, _) = rtnetlink::new_connection().map_err(|e| e.to_string())?;
     tokio::spawn(connection);
 

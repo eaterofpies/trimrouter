@@ -709,43 +709,50 @@ async fn handle_unsolicited_wan_traffic(
     }
 }
 
-async fn process_wan_dns_query(
-    mock: &mut UnixStreamMock,
-    verification_tx: &tokio::sync::mpsc::Sender<String>,
+struct WanUdpPacket<'a> {
     client_mac: MacAddr,
     src_ip: Ipv4Addr,
     dest_ip: Ipv4Addr,
     src_port: u16,
     dest_port: u16,
-    payload: &[u8],
+    payload: &'a [u8],
+}
+
+async fn process_wan_dns_query(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    pkt: &WanUdpPacket<'_>,
     dns_outage_active: bool,
 ) {
     if dns_outage_active {
         println!("[isp-test] Simulated upstream DNS outage: dropping query.");
         return;
     }
-    if src_ip == MOCK_CLIENT_IP && payload.len() >= 2 && payload[2..] == DNS_QUERY[2..] {
+    if pkt.src_ip == MOCK_CLIENT_IP
+        && pkt.payload.len() >= 2
+        && pkt.payload[2..] == DNS_QUERY[2..]
+    {
         println!("[isp-test] Verified DNS Forwarder query on WAN!");
         let _ = verification_tx.send("DNS_VERIFIED".to_string()).await;
     }
 
     let mut response_payload = DNS_RESPONSE.to_vec();
-    if payload.len() >= 2 {
-        response_payload[0] = payload[0];
-        response_payload[1] = payload[1];
+    if pkt.payload.len() >= 2 {
+        response_payload[0] = pkt.payload[0];
+        response_payload[1] = pkt.payload[1];
     }
 
     println!(
         "[isp-test] Sending DNS Reply to {}:{} from {}:{} with client MAC: {}",
-        src_ip, src_port, dest_ip, dest_port, client_mac
+        pkt.src_ip, pkt.src_port, pkt.dest_ip, pkt.dest_port, pkt.client_mac
     );
     let dns_reply = build_udp_packet(
         MOCK_SERVER_MAC,
-        client_mac,
-        dest_ip,
-        src_ip,
-        dest_port,
-        src_port,
+        pkt.client_mac,
+        pkt.dest_ip,
+        pkt.src_ip,
+        pkt.dest_port,
+        pkt.src_port,
         &response_payload,
     );
     let _ = mock.send_frame(&dns_reply).await;
@@ -754,12 +761,7 @@ async fn process_wan_dns_query(
 async fn process_wan_ntp_request(
     mock: &mut UnixStreamMock,
     verification_tx: &tokio::sync::mpsc::Sender<String>,
-    client_mac: MacAddr,
-    src_ip: Ipv4Addr,
-    dest_ip: Ipv4Addr,
-    src_port: u16,
-    dest_port: u16,
-    payload: &[u8],
+    pkt: &WanUdpPacket<'_>,
 ) {
     println!("[isp-test] Verified NTP request on WAN!");
     let _ = verification_tx.send("NTP_VERIFIED".to_string()).await;
@@ -768,8 +770,8 @@ async fn process_wan_ntp_request(
     ntp_resp[0] = 0x24; // LI=0, VN=4, Mode=4 (Server)
     ntp_resp[1] = 0x01; // Stratum = 1 (primary reference)
 
-    if payload.len() >= 48 {
-        ntp_resp[24..32].copy_from_slice(&payload[40..48]);
+    if pkt.payload.len() >= 48 {
+        ntp_resp[24..32].copy_from_slice(&pkt.payload[40..48]);
     }
 
     // Set system time to year 2031 (seconds since 1900)
@@ -782,16 +784,16 @@ async fn process_wan_ntp_request(
 
     println!(
         "[isp-test] Sending NTP Reply to {}:{} from {}:{} with client MAC: {}",
-        src_ip, src_port, dest_ip, dest_port, client_mac
+        pkt.src_ip, pkt.src_port, pkt.dest_ip, pkt.dest_port, pkt.client_mac
     );
 
     let ntp_reply = build_udp_packet(
         MOCK_SERVER_MAC,
-        client_mac,
-        dest_ip,
-        src_ip,
-        dest_port,
-        src_port,
+        pkt.client_mac,
+        pkt.dest_ip,
+        pkt.src_ip,
+        pkt.dest_port,
+        pkt.src_port,
         &ntp_resp,
     );
     let _ = mock.send_frame(&ntp_reply).await;
@@ -972,16 +974,20 @@ async fn run_mock_wan_isp(
                         continue;
                     }
 
+                    let wan_pkt = WanUdpPacket {
+                        client_mac,
+                        src_ip,
+                        dest_ip,
+                        src_port,
+                        dest_port,
+                        payload: &payload,
+                    };
+
                     if dest_ip == MOCK_DNS_SERVER && dest_port == 53 {
                         process_wan_dns_query(
                             &mut mock,
                             &verification_tx,
-                            client_mac,
-                            src_ip,
-                            dest_ip,
-                            src_port,
-                            dest_port,
-                            &payload,
+                            &wan_pkt,
                             dns_outage_active,
                         ).await;
                         continue;
@@ -991,12 +997,7 @@ async fn run_mock_wan_isp(
                         process_wan_ntp_request(
                             &mut mock,
                             &verification_tx,
-                            client_mac,
-                            src_ip,
-                            dest_ip,
-                            src_port,
-                            dest_port,
-                            &payload,
+                            &wan_pkt,
                         ).await;
                         continue;
                     }
@@ -1553,21 +1554,25 @@ async fn process_lan_udp_nat(
     }
 }
 
-async fn process_lan_udp_dns(
-    mock: &mut UnixStreamMock,
-    verification_tx: &tokio::sync::mpsc::Sender<String>,
+struct LanUdpPacket<'a> {
     client_mac: MacAddr,
     src_ip: Ipv4Addr,
     src_port: u16,
     dest_port: u16,
-    payload: &[u8],
+    payload: &'a [u8],
+}
+
+async fn process_lan_udp_dns(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    pkt: &LanUdpPacket<'_>,
     dns_test_phase: &mut i32,
 ) {
-    if src_ip == Ipv4Addr::new(192, 168, 1, 1)
-        && src_port == 53
-        && dest_port == 12345
-        && payload.len() >= 2
-        && payload[2..] == DNS_RESPONSE[2..]
+    if pkt.src_ip == Ipv4Addr::new(192, 168, 1, 1)
+        && pkt.src_port == 53
+        && pkt.dest_port == 12345
+        && pkt.payload.len() >= 2
+        && pkt.payload[2..] == DNS_RESPONSE[2..]
     {
         if *dns_test_phase == 1 {
             println!(
@@ -1578,8 +1583,8 @@ async fn process_lan_udp_dns(
                 .send("SIMULATE_DNS_OUTAGE".to_string())
                 .await;
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let pkt = packet::build_raw_packet(
-                client_mac,
+            let req_pkt = packet::build_raw_packet(
+                pkt.client_mac,
                 MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
                 Ipv4Addr::new(192, 168, 1, 2),
                 Ipv4Addr::new(192, 168, 1, 1),
@@ -1587,7 +1592,7 @@ async fn process_lan_udp_dns(
                 53,    // DNS port
                 DNS_QUERY,
             );
-            let _ = mock.send_frame(&pkt).await;
+            let _ = mock.send_frame(&req_pkt).await;
             println!(
                 "[lan-client] Sent DNS Query 2 (which must be served from cache) to 192.168.1.1:53"
             );
@@ -1596,7 +1601,7 @@ async fn process_lan_udp_dns(
             *dns_test_phase = 0;
             let _ = verification_tx.send("END_DNS_OUTAGE".to_string()).await;
             let confirm_pkt = packet::build_raw_packet(
-                client_mac,
+                pkt.client_mac,
                 MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
                 Ipv4Addr::new(192, 168, 1, 2),
                 Ipv4Addr::new(192, 168, 1, 1),
@@ -1678,7 +1683,14 @@ async fn run_mock_lan_client(
 
                 if let Some((src_ip, src_port, dest_port, payload)) = parse_udp_payload(&frame) {
                     process_lan_udp_nat(&mut mock, client_mac, src_ip, src_port, dest_port, &payload).await;
-                    process_lan_udp_dns(&mut mock, &verification_tx, client_mac, src_ip, src_port, dest_port, &payload, &mut dns_test_phase).await;
+                    let lan_pkt = LanUdpPacket {
+                        client_mac,
+                        src_ip,
+                        src_port,
+                        dest_port,
+                        payload: &payload,
+                    };
+                    process_lan_udp_dns(&mut mock, &verification_tx, &lan_pkt, &mut dns_test_phase).await;
                 }
 
                 process_lan_dhcp(&mut mock, &verification_tx, client_mac, &frame, &mut assigned_ip).await;

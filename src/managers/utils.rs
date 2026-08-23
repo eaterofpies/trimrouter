@@ -3,7 +3,7 @@ use log::warn;
 use pnet::util::MacAddr;
 use rtnetlink::packet_route::link::LinkAttribute;
 use std::net::Ipv4Addr;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
 pub const CHROOT_JAIL_PATH: &str = "/run/empty";
@@ -212,7 +212,6 @@ pub fn try_read_raw(
     guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, std::os::unix::io::RawFd>,
     buf: &mut [u8],
 ) -> Result<Option<usize>, std::io::Error> {
-    use std::os::unix::io::AsRawFd;
     match guard.try_io(|inner| {
         let res = unsafe {
             libc::recv(
@@ -249,7 +248,6 @@ pub fn try_write_raw(
     guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, std::os::unix::io::RawFd>,
     frame: &[u8],
 ) -> Result<Option<isize>, std::io::Error> {
-    use std::os::unix::io::AsRawFd;
     match guard.try_io(|inner| {
         let res = unsafe {
             libc::send(
