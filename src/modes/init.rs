@@ -162,7 +162,24 @@ async fn configure_networking_and_services(
     config: RouterConfig,
     _shutdown_flag: Arc<AtomicBool>,
 ) -> managers::DnsForwarder {
-    // 4. Configure Network (Loopback only)
+    setup_loopback_and_firewall(sys.as_ref()).await;
+
+    let lease_state = Arc::new(std::sync::Mutex::new(managers::WanLease::default()));
+
+    let mut dns_forwarder = managers::DnsForwarder::new(lease_state.clone());
+    if let Err(e) = dns_forwarder.start().await {
+        error!("[init] Failed to start DNS forwarder: {}", e);
+    }
+
+    let managed_ifaces = build_managed_interfaces(&config, &lease_state);
+    tokio::spawn(interface::monitor_interfaces(managed_ifaces));
+
+    info!("[init] System startup completed successfully. Entering main event loop.");
+
+    dns_forwarder
+}
+
+async fn setup_loopback_and_firewall(sys: &RealSystem) {
     if sys.getpid() == Pid::from_raw(1) {
         if let Err(e) = network::configure_network_init().await {
             panic!("FATAL: Failed to initialize network: {}", e);
@@ -174,17 +191,12 @@ async fn configure_networking_and_services(
             panic!("FATAL: Failed to configure firewall: {}", e);
         }
     }
+}
 
-    // Shared state for the DHCP lease obtained on WAN
-    let lease_state = Arc::new(std::sync::Mutex::new(managers::WanLease::default()));
-
-    // Start DNS Forwarder as a global service
-    let mut dns_forwarder = managers::DnsForwarder::new(lease_state.clone());
-    if let Err(e) = dns_forwarder.start().await {
-        error!("[init] Failed to start DNS forwarder: {}", e);
-    }
-
-    // Create and monitor interfaces via the unified ManagedInterface structure
+fn build_managed_interfaces(
+    config: &RouterConfig,
+    lease_state: &Arc<std::sync::Mutex<managers::WanLease>>,
+) -> Vec<interface::ManagedInterface> {
     let wan_services = vec![
         interface::RouterService::DhcpClient(managers::DhcpClient::new(
             network::WAN_INTERFACE.to_string(),
@@ -212,11 +224,7 @@ async fn configure_networking_and_services(
         lan_services,
     );
 
-    tokio::spawn(interface::monitor_interfaces(vec![wan_iface, lan_iface]));
-
-    info!("[init] System startup completed successfully. Entering main event loop.");
-
-    dns_forwarder
+    vec![wan_iface, lan_iface]
 }
 
 async fn start_power_button_monitor<S: system::PowerOps>(
