@@ -5,7 +5,7 @@
 Crucially, **no other files** will be present on the target filesystem other than the Linux kernel and this binary (statically linked). It requires zero external helper utilities (no `iptables`, `nft`, `ip`, `dnsmasq`, `udev`, etc.) and configures itself via kernel command line parameters or automatic interface detection.
 
 > [!NOTE]
-> **Status: Partial.** Core routing, DHCP, DNS, SNTP, NAT, privilege separation, interface lifecycle, and boot partition label scanning are all implemented. The only remaining gap is structured logging (§2.5 / [`logging_spec.md`](logging_spec.md) — currently raw stdout/stderr).
+> **Status: Implemented.** Core routing, DHCP, DNS, SNTP, NAT, privilege separation, interface lifecycle, partition layout, and structured logging with rotation and reclamation are all implemented.
 
 ---
 
@@ -91,7 +91,7 @@ Network-facing services run as unprivileged child processes isolated via chroot,
 
 ### 2.5 Logging
 
-See [`logging_spec.md`](logging_spec.md). Currently unimplemented — PID 1 writes raw lines to stdout.
+Unified logging to `/var/log/system.log` on the dedicated log partition, with log rotation and oldest-first space reclamation. See [`logging_spec.md`](logging_spec.md).
 
 ---
 

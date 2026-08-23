@@ -29,6 +29,7 @@ To ensure reliability, the DHCP server maintains an in-memory database of active
     *   Every insertion, replacement, or removal operation modifies both the mapping and the set index inside a single atomic operation within the `LeaseTable` module boundaries.
 *   **Eviction**:
     *   Expired leases are automatically evicted from the database during new lease allocation queries to reclaim expired addresses.
+    *   A periodic background cleanup timer running every 60 seconds (`LEASE_CLEANUP_INTERVAL`) proactively purges expired leases and stale holds.
 
 ---
 
