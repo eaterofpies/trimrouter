@@ -39,7 +39,20 @@ pub async fn run_as_init(sys: Arc<RealSystem>) {
 }
 
 fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
-    // For PID 1, redirect standard descriptors (0, 1, 2) to /dev/console
+    setup_console_io(sys.as_ref());
+
+    info!("====================================================");
+    info!("Starting trimrouter (PID 1 Init Daemon)");
+    info!("====================================================");
+
+    register_panic_handler(sys.clone());
+    kmod::start_uevent_listener();
+
+    mount_storage_and_modules(sys.as_ref());
+    load_and_apply_config(sys.as_ref())
+}
+
+fn setup_console_io(sys: &RealSystem) {
     if sys.getpid() == Pid::from_raw(1)
         && let Ok(console) = OpenOptions::new()
             .read(true)
@@ -53,63 +66,58 @@ fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
             libc::dup2(fd, 2);
         }
     }
+}
 
-    info!("====================================================");
-    info!("Starting trimrouter (PID 1 Init Daemon)");
-    info!("====================================================");
+fn setup_chroot_jail() {
+    fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
+    if let Ok(meta) = metadata(CHROOT_JAIL_PATH) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o555); // rx-rx-rx
+        set_permissions(CHROOT_JAIL_PATH, perms).expect("Failed to set chroot jail permissions");
+    }
+}
 
-    // 1. Register Panic Hook (Emergency Reboot)
-    register_panic_handler(sys.clone());
-
-    // Spawn netlink uevent listener to handle module autoloading for hardware discovery
-    kmod::start_uevent_listener();
-
-    // 2. Mount Filesystems if running as PID 1
-    if sys.getpid() == Pid::from_raw(1) {
-        if let Err(e) = mount_virtual_filesystems(sys.as_ref()) {
-            panic!("FATAL: Failed to mount virtual filesystems: {}", e);
-        }
-        kmod::trigger_uevents();
-        kmod::load_required_modules();
-        let (boot_dev, parent_disk) = match wait_for_boot_partition() {
-            Ok(res) => res,
-            Err(e) => panic!("FATAL: Failed to find boot partition: {}", e),
-        };
-
-        if let Err(e) = ensure_log_partition_in_mbr(&boot_dev, &parent_disk) {
-            warn!("[init] Warning: failed to ensure partition 2: {}", e);
-        }
-
-        if let Err(e) = mount_boot_partition(sys.as_ref(), &boot_dev) {
-            panic!("FATAL: Failed to mount boot partition: {}", e);
-        }
-
-        // Make full module tree available via EROFS mount
-        kmod::activate_boot_modules();
-
-        if let Err(e) = setup_log_partition(sys.as_ref(), &boot_dev, &parent_disk) {
-            warn!("[init] Warning: Failed to setup log partition: {}", e);
-        }
-
-        // Create chroot jail directory if it doesn't exist
-        fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
-        if let Ok(meta) = metadata(CHROOT_JAIL_PATH) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o555); // rx-rx-rx
-            set_permissions(CHROOT_JAIL_PATH, perms)
-                .expect("Failed to set chroot jail permissions");
-        }
-    } else {
+fn mount_storage_and_modules(sys: &RealSystem) {
+    if sys.getpid() != Pid::from_raw(1) {
         info!(
             "[init] Running in standard user environment (PID {}). Skipping VFS mounts.",
             sys.getpid()
         );
-        // Ensure jail directory exists for local tests as well
-        fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
+        setup_chroot_jail();
+        return;
     }
 
-    // 3. Load Configuration
-    let config = match RouterConfig::parse(sys.as_ref()) {
+    if let Err(e) = mount_virtual_filesystems(sys) {
+        panic!("FATAL: Failed to mount virtual filesystems: {}", e);
+    }
+    kmod::trigger_uevents();
+    kmod::load_required_modules();
+
+    let (boot_dev, parent_disk) = match wait_for_boot_partition() {
+        Ok(res) => res,
+        Err(e) => panic!("FATAL: Failed to find boot partition: {}", e),
+    };
+
+    if let Err(e) = ensure_log_partition_in_mbr(&boot_dev, &parent_disk) {
+        warn!("[init] Warning: failed to ensure partition 2: {}", e);
+    }
+
+    if let Err(e) = mount_boot_partition(sys, &boot_dev) {
+        panic!("FATAL: Failed to mount boot partition: {}", e);
+    }
+
+    // Make full module tree available via EROFS mount
+    kmod::activate_boot_modules();
+
+    if let Err(e) = setup_log_partition(sys, &boot_dev, &parent_disk) {
+        warn!("[init] Warning: Failed to setup log partition: {}", e);
+    }
+
+    setup_chroot_jail();
+}
+
+fn load_and_apply_config(sys: &RealSystem) -> RouterConfig {
+    let config = match RouterConfig::parse(sys) {
         Ok(c) => c,
         Err(e) => {
             panic!("FATAL: Failed to parse configuration: {}", e);
