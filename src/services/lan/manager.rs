@@ -39,7 +39,7 @@ impl LanManager {
 
 impl Service for LanManager {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
         let lan_interface = self.lan_interface.clone();
@@ -48,90 +48,14 @@ impl Service for LanManager {
         let lease_state = self.lease_state.clone();
 
         let handle = tokio::spawn(async move {
-            info!(
-                "[lan-manager] Starting LAN manager service on {}...",
-                lan_interface
-            );
-
-            // 1. Initial IP configuration
-            let current_ip = initial_ip.clone();
-            if let Err(e) = network::configure_interface_ip(&lan_interface, &current_ip).await {
-                error!("[lan-manager] Failed to configure initial LAN IP: {}", e);
-                return;
-            }
-
-            // 2. Start child DHCP server
-            let mut dhcp_server = DhcpServer::new(lan_interface.clone(), current_ip.clone());
-            if let Err(e) = dhcp_server.start().await {
-                error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
-                return;
-            }
-
-            // 3. Setup netlink connection to listen for links and addresses
-            let (connection, _handle, mut messages) = match rtnetlink::new_multicast_connection(&[
-                MulticastGroup::Link,
-                MulticastGroup::Ipv4Ifaddr,
-            ]) {
-                Ok(res) => res,
-                Err(e) => {
-                    error!("[lan-manager] Failed to create multicast netlink: {}", e);
-                    let _ = dhcp_server.stop().await;
-                    return;
-                }
-            };
-            tokio::spawn(connection);
-
-            debug!("[lan-manager] Conflict monitoring started.");
-
-            // Run initial check
-            let mut active_ip = current_ip.clone();
-            let _ = check_and_resolve(
-                &lan_interface,
-                &mut active_ip,
-                &backup_ip,
-                &lease_state,
-                &mut dhcp_server,
+            run_lan_manager_loop(
+                lan_interface,
+                initial_ip,
+                backup_ip,
+                lease_state,
+                shutdown_rx,
             )
             .await;
-
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                    Some((message, _addr)) = messages.next() => {
-                        let should_check = if let NetlinkPayload::InnerMessage(rtnl_msg) = message.payload {
-                            matches!(
-                                rtnl_msg,
-                                RouteNetlinkMessage::NewLink(_)
-                                | RouteNetlinkMessage::NewAddress(_)
-                                | RouteNetlinkMessage::DelAddress(_)
-                            )
-                        } else {
-                            false
-                        };
-
-                        if should_check {
-                            let _ = check_and_resolve(
-                                &lan_interface,
-                                &mut active_ip,
-                                &backup_ip,
-                                &lease_state,
-                                &mut dhcp_server,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-
-            info!("[lan-manager] Stopping LAN DHCP server...");
-            if let Err(e) = dhcp_server.stop().await {
-                error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
-            }
-            info!("[lan-manager] LAN manager service stopped.");
         });
 
         self.task_handle = Some(handle);
@@ -145,6 +69,163 @@ impl Service for LanManager {
         let _ = handle.await;
         Ok(())
     }
+}
+
+async fn run_lan_manager_loop(
+    lan_interface: String,
+    initial_ip: String,
+    backup_ip: String,
+    lease_state: SharedWanLease,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    info!(
+        "[lan-manager] Starting LAN manager service on {}...",
+        lan_interface
+    );
+
+    let current_ip = initial_ip.clone();
+    if let Err(e) = network::configure_interface_ip(&lan_interface, &current_ip).await {
+        error!("[lan-manager] Failed to configure initial LAN IP: {}", e);
+        return;
+    }
+
+    let mut dhcp_server = DhcpServer::new(lan_interface.clone(), current_ip.clone());
+    if let Err(e) = dhcp_server.start().await {
+        error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
+        return;
+    }
+
+    let (connection, _handle, messages) = match rtnetlink::new_multicast_connection(&[
+        MulticastGroup::Link,
+        MulticastGroup::Ipv4Ifaddr,
+    ]) {
+        Ok(res) => res,
+        Err(e) => {
+            error!("[lan-manager] Failed to create multicast netlink: {}", e);
+            let _ = dhcp_server.stop().await;
+            return;
+        }
+    };
+    tokio::spawn(connection);
+
+    debug!("[lan-manager] Conflict monitoring started.");
+    listen_for_conflicts(
+        &lan_interface,
+        current_ip,
+        &backup_ip,
+        &lease_state,
+        &mut dhcp_server,
+        messages,
+        shutdown_rx,
+    )
+    .await;
+
+    info!("[lan-manager] Stopping LAN DHCP server...");
+    if let Err(e) = dhcp_server.stop().await {
+        error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
+    }
+    info!("[lan-manager] LAN manager service stopped.");
+}
+
+async fn listen_for_conflicts(
+    lan_interface: &str,
+    mut active_ip: String,
+    backup_ip: &str,
+    lease_state: &SharedWanLease,
+    dhcp_server: &mut DhcpServer,
+    mut messages: impl futures_util::Stream<
+        Item = (
+            rtnetlink::packet_core::NetlinkMessage<rtnetlink::packet_route::RouteNetlinkMessage>,
+            rtnetlink::sys::SocketAddr,
+        ),
+    > + Unpin,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let _ = check_and_resolve(
+        lan_interface,
+        &mut active_ip,
+        backup_ip,
+        lease_state,
+        dhcp_server,
+    )
+    .await;
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            Some((message, _addr)) = messages.next() => {
+                let should_check = if let NetlinkPayload::InnerMessage(rtnl_msg) = message.payload {
+                    matches!(
+                        rtnl_msg,
+                        RouteNetlinkMessage::NewLink(_)
+                        | RouteNetlinkMessage::NewAddress(_)
+                        | RouteNetlinkMessage::DelAddress(_)
+                    )
+                } else {
+                    false
+                };
+
+                if should_check {
+                    let _ = check_and_resolve(
+                        lan_interface,
+                        &mut active_ip,
+                        backup_ip,
+                        lease_state,
+                        dhcp_server,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+async fn shift_lan_subnet(
+    lan_interface: &str,
+    current_ip: &mut String,
+    new_ip: String,
+    dhcp_server: &mut DhcpServer,
+) -> bool {
+    info!("[lan-manager] Stopping LAN DHCP server...");
+    if let Err(e) = dhcp_server.stop().await {
+        error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
+    }
+
+    if let Some(index) = network::get_interface_index(lan_interface).await {
+        debug!(
+            "[lan-manager] Cleaning up IP addresses on interface {}...",
+            lan_interface
+        );
+        if let Err(e) = network::flush_ipv4_addresses(lan_interface, index).await {
+            error!("[lan-manager] Failed to flush LAN interface IPs: {}", e);
+        }
+    } else {
+        error!("[lan-manager] Failed to get index for {}", lan_interface);
+    }
+
+    info!(
+        "[lan-manager] Reconfiguring interface {} with new subnet {}...",
+        lan_interface, new_ip
+    );
+    if let Err(e) = network::configure_interface_ip(lan_interface, &new_ip).await {
+        error!("[lan-manager] Failed to reconfigure LAN IP: {}", e);
+        return false;
+    }
+
+    *current_ip = new_ip.clone();
+
+    info!("[lan-manager] Restarting LAN DHCP server on new subnet...");
+    *dhcp_server = DhcpServer::new(lan_interface.to_string(), current_ip.clone());
+    if let Err(e) = dhcp_server.start().await {
+        error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
+    }
+
+    info!("[lan-manager] LAN subnet shifted successfully.");
+    true
 }
 
 async fn check_and_resolve(
@@ -185,42 +266,7 @@ async fn check_and_resolve(
             return false;
         }
 
-        info!("[lan-manager] Stopping LAN DHCP server...");
-        if let Err(e) = dhcp_server.stop().await {
-            error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
-        }
-
-        if let Some(index) = network::get_interface_index(lan_interface).await {
-            debug!(
-                "[lan-manager] Cleaning up IP addresses on interface {}...",
-                lan_interface
-            );
-            if let Err(e) = network::flush_ipv4_addresses(lan_interface, index).await {
-                error!("[lan-manager] Failed to flush LAN interface IPs: {}", e);
-            }
-        } else {
-            error!("[lan-manager] Failed to get index for {}", lan_interface);
-        }
-
-        info!(
-            "[lan-manager] Reconfiguring interface {} with new subnet {}...",
-            lan_interface, new_ip
-        );
-        if let Err(e) = network::configure_interface_ip(lan_interface, &new_ip).await {
-            error!("[lan-manager] Failed to reconfigure LAN IP: {}", e);
-            return false;
-        }
-
-        *current_ip = new_ip.clone();
-
-        info!("[lan-manager] Restarting LAN DHCP server on new subnet...");
-        *dhcp_server = DhcpServer::new(lan_interface.to_string(), current_ip.clone());
-        if let Err(e) = dhcp_server.start().await {
-            error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
-        }
-
-        info!("[lan-manager] LAN subnet shifted successfully.");
-        return true;
+        return shift_lan_subnet(lan_interface, current_ip, new_ip, dhcp_server).await;
     }
     false
 }

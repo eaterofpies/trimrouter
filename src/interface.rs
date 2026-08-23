@@ -117,31 +117,16 @@ fn if_indextoname(index: u32) -> Option<String> {
 ///
 /// Deduplicates dynamic hardware detection logs, handles interface renaming on match,
 /// and manages dynamic service transitions.
-pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
-    let (connection, handle, mut messages) =
-        match rtnetlink::new_multicast_connection(&[MulticastGroup::Link]) {
-            Ok(res) => res,
-            Err(e) => {
-                panic!(
-                    "[interface] Failed to create Netlink multicast socket: {}",
-                    e
-                );
-            }
-        };
-    tokio::spawn(connection);
-
-    // Map of interface index -> (name, MAC, has_link)
+async fn initial_link_scan(handle: &rtnetlink::Handle) -> HashMap<u32, (String, MacAddr, bool)> {
     let mut link_states = HashMap::new();
-
-    // Initial scan to populate current link states
     let mut links = handle.link().get().execute();
+
     while let Some(link_msg) = links.try_next().await.unwrap_or(None) {
         let index = link_msg.header.index;
         let (name, address) = parse_link_attributes(link_msg.attributes);
         if let (Some(n), Some(addr)) = (name, address)
             && n != "lo"
         {
-            // Bring it UP administratively so carrier detection/negotiation can occur
             if let Err(e) = network::ensure_interface_up(&n).await {
                 debug!("[interface] Failed to bring interface {} up: {}", n, e);
             }
@@ -158,12 +143,14 @@ pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
             }
         }
     }
+    link_states
+}
 
-    // Local set tracking discovered interfaces to deduplicate logs (no static globals needed)
-    let mut detected_indices = HashSet::new();
-
-    // Initial check (catch up on startup for all interfaces)
-    for iface in &mut interfaces {
+async fn activate_startup_interfaces(
+    interfaces: &mut [ManagedInterface],
+    detected_indices: &mut HashSet<u32>,
+) {
+    for iface in interfaces {
         if let Some((index, name)) = find_interface_by_mac(iface.mac).await {
             info!(
                 "[interface] Interface {} (MAC: {}) detected at startup. Renaming and starting services...",
@@ -178,6 +165,25 @@ pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
             }
         }
     }
+}
+
+pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
+    let (connection, handle, mut messages) =
+        match rtnetlink::new_multicast_connection(&[MulticastGroup::Link]) {
+            Ok(res) => res,
+            Err(e) => {
+                panic!(
+                    "[interface] Failed to create Netlink multicast socket: {}",
+                    e
+                );
+            }
+        };
+    tokio::spawn(connection);
+
+    let mut link_states = initial_link_scan(&handle).await;
+    let mut detected_indices = HashSet::new();
+
+    activate_startup_interfaces(&mut interfaces, &mut detected_indices).await;
 
     while let Some((message, _addr)) = messages.next().await {
         if let NetlinkPayload::InnerMessage(rtnl_msg) = message.payload {

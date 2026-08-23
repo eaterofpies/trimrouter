@@ -16,14 +16,9 @@ fn pad_interface_name(name: &str) -> [u8; 16] {
     bytes
 }
 
-pub fn configure_firewall(wan_iface: &str, lan_iface: &str) -> Result<(), RouterError> {
-    debug!("[netfilter] Configuring NAT and firewall rules...");
-
-    let table = Table::new(ProtocolFamily::Ipv4).with_name("trimrouter");
-
-    // 1. Delete pre-existing table to flush old state (ignore error if it doesn't exist)
+fn flush_existing_table(table: &Table) -> Result<(), RouterError> {
     let mut del_batch = Batch::new();
-    del_batch.add(&table, MsgType::Del);
+    del_batch.add(table, MsgType::Del);
     if let Err(e) = del_batch.send() {
         let is_enoent = match e {
             rustables::error::QueryError::NetlinkError(ref err) => err.error.abs() == libc::ENOENT,
@@ -33,48 +28,40 @@ pub fn configure_firewall(wan_iface: &str, lan_iface: &str) -> Result<(), Router
             return Err(e.into());
         }
     }
+    Ok(())
+}
 
-    // 2. Build Table and Chains
-    let nat_chain = Chain::new(&table)
-        .with_name("nat_postrouting")
-        .with_hook(Hook::new(HookClass::PostRouting, 100))
-        .with_type(ChainType::Nat)
-        .with_policy(ChainPolicy::Accept);
-
-    let filter_chain = Chain::new(&table)
-        .with_name("filter_input")
-        .with_hook(Hook::new(HookClass::In, 0))
-        .with_type(ChainType::Filter)
-        .with_policy(ChainPolicy::Drop);
-
-    // 3. Rule: Masquerade outgoing traffic on WAN interface
-    let mut masq_rule = Rule::new(&nat_chain)?;
+fn build_nat_rule(nat_chain: &Chain, wan_iface: &str) -> Result<Rule, RouterError> {
+    let mut masq_rule = Rule::new(nat_chain)?;
     masq_rule.add_expr(Meta::new(MetaType::OifName));
     masq_rule.add_expr(Cmp::new(CmpOp::Eq, pad_interface_name(wan_iface)));
     masq_rule.add_expr(Masquerade::default());
+    Ok(masq_rule)
+}
 
-    // 4. Rule: Accept input on loopback ('lo')
-    let mut lo_rule = Rule::new(&filter_chain)?;
+fn build_filter_rules(
+    filter_chain: &Chain,
+    wan_iface: &str,
+    lan_iface: &str,
+) -> Result<Vec<Rule>, RouterError> {
+    let mut lo_rule = Rule::new(filter_chain)?;
     lo_rule.add_expr(Meta::new(MetaType::IifName));
     lo_rule.add_expr(Cmp::new(CmpOp::Eq, pad_interface_name("lo")));
     lo_rule.add_expr(Immediate::new_verdict(VerdictKind::Accept));
 
-    // 5. Rule: Accept established and related connection tracking states
-    let mut ct_rule = Rule::new(&filter_chain)?;
+    let mut ct_rule = Rule::new(filter_chain)?;
     ct_rule.add_expr(Conntrack::new(ConntrackKey::State));
     let state_mask = ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits();
     ct_rule.add_expr(Bitwise::new(state_mask.to_le_bytes(), 0u32.to_be_bytes())?);
     ct_rule.add_expr(Cmp::new(CmpOp::Neq, 0u32.to_be_bytes()));
     ct_rule.add_expr(Immediate::new_verdict(VerdictKind::Accept));
 
-    // 6. Rule: Accept input on LAN interface (needed for local services like DNS/DHCP)
-    let mut lan_rule = Rule::new(&filter_chain)?;
+    let mut lan_rule = Rule::new(filter_chain)?;
     lan_rule.add_expr(Meta::new(MetaType::IifName));
     lan_rule.add_expr(Cmp::new(CmpOp::Eq, pad_interface_name(lan_iface)));
     lan_rule.add_expr(Immediate::new_verdict(VerdictKind::Accept));
 
-    // 6.2. Rule: Accept DHCP client traffic on WAN interface (UDP destination port 68)
-    let mut wan_dhcp_rule = Rule::new(&filter_chain)?;
+    let mut wan_dhcp_rule = Rule::new(filter_chain)?;
     wan_dhcp_rule.add_expr(Meta::new(MetaType::IifName));
     wan_dhcp_rule.add_expr(Cmp::new(CmpOp::Eq, pad_interface_name(wan_iface)));
     wan_dhcp_rule.add_expr(
@@ -93,20 +80,40 @@ pub fn configure_firewall(wan_iface: &str, lan_iface: &str) -> Result<(), Router
     wan_dhcp_rule.add_expr(Cmp::new(CmpOp::Eq, dhcproto::v4::CLIENT_PORT.to_be_bytes()));
     wan_dhcp_rule.add_expr(Immediate::new_verdict(VerdictKind::Accept));
 
-    // 6.5. Rule: Accept ICMP on all interfaces (allows external/internal pings)
-    let icmp_rule = Rule::new(&filter_chain)?.icmp().accept();
+    let icmp_rule = Rule::new(filter_chain)?.icmp().accept();
 
-    // 7. Send configuration batch to the kernel
+    Ok(vec![lo_rule, ct_rule, lan_rule, wan_dhcp_rule, icmp_rule])
+}
+
+pub fn configure_firewall(wan_iface: &str, lan_iface: &str) -> Result<(), RouterError> {
+    debug!("[netfilter] Configuring NAT and firewall rules...");
+
+    let table = Table::new(ProtocolFamily::Ipv4).with_name("trimrouter");
+    flush_existing_table(&table)?;
+
+    let nat_chain = Chain::new(&table)
+        .with_name("nat_postrouting")
+        .with_hook(Hook::new(HookClass::PostRouting, 100))
+        .with_type(ChainType::Nat)
+        .with_policy(ChainPolicy::Accept);
+
+    let filter_chain = Chain::new(&table)
+        .with_name("filter_input")
+        .with_hook(Hook::new(HookClass::In, 0))
+        .with_type(ChainType::Filter)
+        .with_policy(ChainPolicy::Drop);
+
+    let masq_rule = build_nat_rule(&nat_chain, wan_iface)?;
+    let filter_rules = build_filter_rules(&filter_chain, wan_iface, lan_iface)?;
+
     let mut batch = Batch::new();
     batch.add(&table, MsgType::Add);
     batch.add(&nat_chain, MsgType::Add);
     batch.add(&filter_chain, MsgType::Add);
     batch.add(&masq_rule, MsgType::Add);
-    batch.add(&lo_rule, MsgType::Add);
-    batch.add(&lan_rule, MsgType::Add);
-    batch.add(&wan_dhcp_rule, MsgType::Add);
-    batch.add(&icmp_rule, MsgType::Add);
-    batch.add(&ct_rule, MsgType::Add);
+    for rule in &filter_rules {
+        batch.add(rule, MsgType::Add);
+    }
 
     batch.send()?;
     info!("[netfilter] NAT and firewall rules configured successfully.");

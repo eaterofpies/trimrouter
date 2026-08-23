@@ -189,6 +189,36 @@ fn resolve_deps_recursive(
     }
 }
 
+fn load_resolved_module_paths(resolved: &[PathBuf]) -> bool {
+    let mut all_loaded = true;
+    for path in resolved {
+        let stem = match path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(|f| f.split('.').next().unwrap_or(f).replace('_', "-"))
+        {
+            Some(s) => s,
+            None => {
+                all_loaded = false;
+                continue;
+            }
+        };
+
+        let loaded = get_loaded_modules().lock().unwrap();
+        if !loaded.contains(&stem) {
+            drop(loaded);
+            if let Err(e) = load_module(path) {
+                error!("[init] Failed to load module {} ({:?}): {}", stem, path, e);
+                all_loaded = false;
+            } else {
+                info!("[init] Successfully loaded module {}", stem);
+                get_loaded_modules().lock().unwrap().insert(stem.clone());
+            }
+        }
+    }
+    all_loaded
+}
+
 fn load_module_with_dep_map(
     mod_name: &str,
     dep_map: &HashMap<String, (PathBuf, Vec<String>)>,
@@ -217,34 +247,7 @@ fn load_module_with_dep_map(
             continue;
         }
 
-        let mut all_resolved_loaded = true;
-        for path in resolved {
-            let stem = match path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .map(|f| f.split('.').next().unwrap_or(f).replace('_', "-"))
-            {
-                Some(s) => s,
-                None => {
-                    all_resolved_loaded = false;
-                    continue;
-                }
-            };
-
-            let loaded = get_loaded_modules().lock().unwrap();
-            if !loaded.contains(&stem) {
-                drop(loaded);
-                if let Err(e) = load_module(&path) {
-                    error!("[init] Failed to load module {} ({:?}): {}", stem, path, e);
-                    all_resolved_loaded = false;
-                } else {
-                    info!("[init] Successfully loaded module {}", stem);
-                    get_loaded_modules().lock().unwrap().insert(stem.clone());
-                }
-            }
-        }
-
-        if all_resolved_loaded {
+        if load_resolved_module_paths(&resolved) {
             any_success = true;
             break; // Successfully loaded this candidate module, stop trying other candidates!
         }

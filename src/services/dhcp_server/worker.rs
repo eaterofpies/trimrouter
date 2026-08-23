@@ -69,6 +69,24 @@ async fn update_lease_from_neighbor(
     }
 }
 
+fn spawn_lease_cleanup_task(
+    leases: Arc<Mutex<LeaseTable>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(LEASE_CLEANUP_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = wait_shutdown(&mut shutdown_rx) => break,
+                _ = interval.tick() => {
+                    let mut guard = leases.lock().await;
+                    guard.evict_expired();
+                }
+            }
+        }
+    });
+}
+
 pub async fn run_dhcp_server_worker(
     ipc_fd: OwnedFd,
     raw_socket_fd: OwnedFd,
@@ -83,16 +101,6 @@ pub async fn run_dhcp_server_worker(
     })?;
     let server_ip = net.addr();
     let subnet_mask = net.netmask();
-
-    let mut hosts = net.hosts();
-    let start_ip = hosts.next();
-    let end_ip = hosts.next_back();
-    if let (Some(start), Some(end)) = (start_ip, end_ip) {
-        debug!(
-            "[dhcp-server-worker] Dynamic lease pool: {} to {}",
-            start, end
-        );
-    }
 
     let mac = get_interface_mac(&lan_interface)
         .await
@@ -115,20 +123,7 @@ pub async fn run_dhcp_server_worker(
                 shutdown_tx,
             ));
 
-            let leases_cleanup = leases.clone();
-            let mut shutdown_rx_cleanup = shutdown_rx.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(LEASE_CLEANUP_INTERVAL);
-                loop {
-                    tokio::select! {
-                        _ = wait_shutdown(&mut shutdown_rx_cleanup) => break,
-                        _ = interval.tick() => {
-                            let mut guard = leases_cleanup.lock().await;
-                            guard.evict_expired();
-                        }
-                    }
-                }
-            });
+            spawn_lease_cleanup_task(leases.clone(), shutdown_rx.clone());
 
             let config = Arc::new(ServerConfig {
                 server_ip,
@@ -487,46 +482,30 @@ async fn probe_and_allocate_ip(
     }
 }
 
-async fn handle_dhcp_discover(
-    async_sock: Arc<AsyncFd<OwnedFd>>,
+async fn find_or_allocate_discover_ip(
+    config: &ServerConfig,
+    client_mac: MacAddr,
+    leases: &Arc<tokio::sync::Mutex<LeaseTable>>,
+) -> Option<Ipv4Addr> {
+    let existing_ip = {
+        let leases_guard = leases.lock().await;
+        leases_guard.get(&client_mac).map(|l| l.ip)
+    };
+
+    if let Some(ip) = existing_ip {
+        Some(ip)
+    } else {
+        probe_and_allocate_ip(config, client_mac, leases).await
+    }
+}
+
+async fn send_dhcp_offer_reply(
+    async_sock: &AsyncFd<OwnedFd>,
     config: &ServerConfig,
     dhcp: &Message,
     client_mac: MacAddr,
-    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
+    leased_ip: Ipv4Addr,
 ) {
-    debug!(
-        "[dhcp-server] Received DHCPDISCOVER from client MAC: {}",
-        client_mac
-    );
-
-    let mut leased_ip = None;
-    {
-        let leases_guard = leases.lock().await;
-        if let Some(existing) = leases_guard.get(&client_mac) {
-            leased_ip = Some(existing.ip);
-        }
-    }
-
-    if leased_ip.is_none() {
-        leased_ip = probe_and_allocate_ip(config, client_mac, &leases).await;
-    }
-
-    let Some(leased_ip) = leased_ip else {
-        error!("[dhcp-server] DHCP IP pool exhausted!");
-        return;
-    };
-
-    {
-        let mut leases_guard = leases.lock().await;
-        leases_guard.insert(
-            client_mac,
-            ClientLease {
-                ip: leased_ip,
-                expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
-            },
-        );
-    }
-
     let payload = match build_dhcp_reply_payload(MessageType::Offer, dhcp, leased_ip, config) {
         Ok(p) => p,
         Err(e) => {
@@ -546,11 +525,42 @@ async fn handle_dhcp_discover(
         &payload,
     );
 
-    send_raw_packet(&async_sock, &frame).await;
+    send_raw_packet(async_sock, &frame).await;
     info!(
         "[dhcp-server] Sent DHCPOFFER of IP: {} to client.",
         leased_ip
     );
+}
+
+async fn handle_dhcp_discover(
+    async_sock: Arc<AsyncFd<OwnedFd>>,
+    config: &ServerConfig,
+    dhcp: &Message,
+    client_mac: MacAddr,
+    leases: Arc<tokio::sync::Mutex<LeaseTable>>,
+) {
+    debug!(
+        "[dhcp-server] Received DHCPDISCOVER from client MAC: {}",
+        client_mac
+    );
+
+    let Some(leased_ip) = find_or_allocate_discover_ip(config, client_mac, &leases).await else {
+        error!("[dhcp-server] DHCP IP pool exhausted!");
+        return;
+    };
+
+    {
+        let mut leases_guard = leases.lock().await;
+        leases_guard.insert(
+            client_mac,
+            ClientLease {
+                ip: leased_ip,
+                expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
+            },
+        );
+    }
+
+    send_dhcp_offer_reply(&async_sock, config, dhcp, client_mac, leased_ip).await;
 }
 
 async fn get_requested_or_existing_ip(

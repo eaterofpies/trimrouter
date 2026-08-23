@@ -82,6 +82,63 @@ impl ExternalWorker {
         self.task_handle = Some(handle);
     }
 
+    async fn attempt_supervised_run<S, M>(
+        service_name: &'static str,
+        child_pid_atomic: Arc<AtomicU32>,
+        setup_attempt: &mut S,
+        run_monitor: &mut M,
+        shutdown_rx: &Receiver<bool>,
+        attempt: &mut u32,
+    ) where
+        S: FnMut() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError>,
+        M: FnMut(OwnedFd, u32, Receiver<bool>) -> Result<JoinHandle<()>, ServiceError>,
+    {
+        let (worker_service, parent_ipc_fd) = match setup_attempt() {
+            Ok(res) => res,
+            Err(e) => {
+                error!("[{}-parent] Setup attempt failed: {:?}", service_name, e);
+                return;
+            }
+        };
+
+        let args = worker_service.to_args();
+        let arg_strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let child_fds = worker_service.child_fds();
+
+        let child = match Self::spawn_and_track_process(
+            service_name,
+            child_pid_atomic,
+            &arg_strs,
+            &child_fds,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("[{}-parent] Spawn failed: {:?}", service_name, e);
+                return;
+            }
+        };
+        drop(worker_service);
+
+        let child_pid = child.id();
+        let monitor_handle = match run_monitor(parent_ipc_fd, child_pid, shutdown_rx.clone()) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(
+                    "[{}-parent] Failed to start monitor task: {:?}",
+                    service_name, e
+                );
+                utils::terminate_worker(child_pid).await;
+                return;
+            }
+        };
+
+        let spawn_time = std::time::Instant::now();
+        let _ = monitor_handle.await;
+        if spawn_time.elapsed() >= std::time::Duration::from_secs(60) {
+            *attempt = 0;
+        }
+    }
+
     pub(crate) fn start_supervised<S, M>(
         &mut self,
         mut setup_attempt: S,
@@ -114,56 +171,15 @@ impl ExternalWorker {
                     break;
                 }
 
-                // 1. Setup sockets and configuration
-                let (worker_service, parent_ipc_fd) = match setup_attempt() {
-                    Ok(res) => res,
-                    Err(e) => {
-                        error!("[{}-parent] Setup attempt failed: {:?}", service_name, e);
-                        continue;
-                    }
-                };
-
-                let args = worker_service.to_args();
-                let arg_strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                let child_fds = worker_service.child_fds();
-
-                // 2. Spawn and track process (handles storing PID)
-                let child = match Self::spawn_and_track_process(
+                Self::attempt_supervised_run(
                     service_name,
                     child_pid_atomic.clone(),
-                    &arg_strs,
-                    &child_fds,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("[{}-parent] Spawn failed: {:?}", service_name, e);
-                        continue;
-                    }
-                };
-                drop(worker_service);
-
-                let child_pid = child.id();
-
-                // 3. Start supervisor monitor
-                let monitor_handle =
-                    match run_monitor(parent_ipc_fd, child_pid, shutdown_rx.clone()) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            error!(
-                                "[{}-parent] Failed to start monitor task: {:?}",
-                                service_name, e
-                            );
-                            utils::terminate_worker(child_pid).await;
-                            continue;
-                        }
-                    };
-
-                // 4. Wait for monitor to complete and reset attempt counter on sustained uptime
-                let spawn_time = std::time::Instant::now();
-                let _ = monitor_handle.await;
-                if spawn_time.elapsed() >= std::time::Duration::from_secs(60) {
-                    attempt = 0;
-                }
+                    &mut setup_attempt,
+                    &mut run_monitor,
+                    &shutdown_rx,
+                    &mut attempt,
+                )
+                .await;
             }
         });
 

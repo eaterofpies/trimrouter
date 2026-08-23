@@ -240,7 +240,7 @@ mod tests {
     use std::os::unix::io::IntoRawFd;
 
     #[test]
-    fn test_multicall_parsing() {
+    fn test_worker_multicall_parsing() {
         let (s1, s2) = std::os::unix::net::UnixStream::pair().unwrap();
         let fd1 = s1.into_raw_fd();
         let fd2 = s2.into_raw_fd();
@@ -271,8 +271,10 @@ mod tests {
 
         let args3 = vec!["modprobe".to_string(), "net-pf-10".to_string()];
         assert!(Cli::try_parse_from(&args3).is_ok());
+    }
 
-        // Test PID 1 init invocation (e.g. /init from kernel)
+    #[test]
+    fn test_init_multicall_parsing() {
         let init_args1 = vec!["init".to_string()];
         let cli_init1 = Cli::try_parse_from(&init_args1).expect("Failed to parse init");
         assert!(matches!(cli_init1.command, Some(Commands::Init { .. })));
@@ -280,8 +282,10 @@ mod tests {
         let init_args2 = vec!["/init".to_string(), "--flag".to_string()];
         let cli_init2 = Cli::try_parse_from(&init_args2).expect("Failed to parse /init with flags");
         assert!(matches!(cli_init2.command, Some(Commands::Init { .. })));
+    }
 
-        // Test worker spawned via /proc/self/exe
+    #[test]
+    fn test_proc_self_exe_worker_parsing() {
         let (s5, _s6) = std::os::unix::net::UnixStream::pair().unwrap();
         let fd5 = s5.into_raw_fd();
         let exe_worker_args = vec![

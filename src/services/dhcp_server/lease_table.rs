@@ -15,6 +15,7 @@ pub struct ClientLease {
 /// `by_mac` and `allocated_ips` are private to this module. An IP is
 /// always in `allocated_ips` **if and only if** there is a live
 /// corresponding entry in `by_mac`. Use the public methods to mutate.
+#[derive(Default)]
 pub struct LeaseTable {
     by_mac: HashMap<MacAddr, ClientLease>,
     /// O(1) index of currently allocated IPs. Always kept in sync with `by_mac`.
@@ -23,10 +24,7 @@ pub struct LeaseTable {
 
 impl LeaseTable {
     pub fn new() -> Self {
-        Self {
-            by_mac: HashMap::new(),
-            allocated_ips: HashSet::new(),
-        }
+        Self::default()
     }
 
     /// Returns the active lease for this MAC address, if one exists.
@@ -97,5 +95,11 @@ impl LeaseTable {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.by_mac.len()
+    }
+
+    /// Whether the lease table has no active leases. Used in tests.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.by_mac.is_empty()
     }
 }

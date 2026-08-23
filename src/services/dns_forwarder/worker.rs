@@ -437,6 +437,29 @@ fn get_upstream_resolvers(upstream_dns: &Mutex<Vec<Ipv4Addr>>) -> Vec<Ipv4Addr> 
 // 4. Send the modified query upstream.
 // 5. Wait for the background loop to receive and dispatch the response payload, then restore
 //    the client's original transaction ID before returning.
+fn register_pending_query(
+    pending_queries: &PendingQueries,
+    upstream_dns: Ipv4Addr,
+) -> Option<(u16, tokio::sync::oneshot::Receiver<Vec<u8>>)> {
+    let mut lock = pending_queries.lock().unwrap();
+    if lock.len() >= MAX_PENDING_QUERIES {
+        return None;
+    }
+    let mut rng_xid = rand::random::<u16>();
+    while lock.contains_key(&rng_xid) {
+        rng_xid = rand::random::<u16>();
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    lock.insert(
+        rng_xid,
+        PendingQuery {
+            tx,
+            upstream_ip: upstream_dns,
+        },
+    );
+    Some((rng_xid, rx))
+}
+
 async fn forward_query(
     query: &[u8],
     upstream_dns: Ipv4Addr,
@@ -448,26 +471,7 @@ async fn forward_query(
     }
     let client_xid = u16::from_be_bytes([query[0], query[1]]);
 
-    // Generate a unique transaction ID that doesn't conflict with any active query.
-    // Limit maximum pending queries to prevent infinite search loops under high load.
-    let mut rng_xid = rand::random::<u16>();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let mut lock = pending_queries.lock().unwrap();
-        if lock.len() >= MAX_PENDING_QUERIES {
-            return None;
-        }
-        while lock.contains_key(&rng_xid) {
-            rng_xid = rand::random::<u16>();
-        }
-        lock.insert(
-            rng_xid,
-            PendingQuery {
-                tx,
-                upstream_ip: upstream_dns,
-            },
-        );
-    }
+    let (rng_xid, rx) = register_pending_query(pending_queries, upstream_dns)?;
 
     let mut forwarded_query = query.to_vec();
     let xid_bytes = rng_xid.to_be_bytes();
@@ -488,7 +492,6 @@ async fn forward_query(
     let mut response = match rx_res {
         Ok(Ok(resp)) => resp,
         _ => {
-            // Clean up registry entry if timeout/error occurs to prevent memory leaks
             pending_queries.lock().unwrap().remove(&rng_xid);
             return None;
         }

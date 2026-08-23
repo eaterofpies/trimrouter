@@ -71,6 +71,33 @@ struct LoggingSection {
     level: Option<String>,
 }
 
+fn parse_mac_addresses(net: &NetworkSection) -> Result<(MacAddr, MacAddr), RouterError> {
+    let wan_mac = MacAddr::from_str(&net.wan_mac)
+        .map_err(|_| RouterError::Generic("wan_mac must be a valid MAC address".to_string()))?;
+    let lan_mac = MacAddr::from_str(&net.lan_mac)
+        .map_err(|_| RouterError::Generic("lan_mac must be a valid MAC address".to_string()))?;
+    Ok((wan_mac, lan_mac))
+}
+
+fn parse_logging_config(logging: Option<&LoggingSection>) -> Result<LoggingConfig, RouterError> {
+    let max_log_size_mb = logging.and_then(|l| l.max_log_size_mb).unwrap_or(100);
+
+    let level = match logging.and_then(|l| l.level.as_deref()) {
+        Some(lvl_str) => log::LevelFilter::from_str(lvl_str).map_err(|_| {
+            RouterError::Generic(format!(
+                "Invalid logging level '{}'. Must be one of: error, warn, info, debug, trace",
+                lvl_str
+            ))
+        })?,
+        None => log::LevelFilter::Info,
+    };
+
+    Ok(LoggingConfig {
+        max_log_size_mb,
+        level,
+    })
+}
+
 impl RouterConfig {
     pub fn parse<S: ConfigReaderOps>(sys: &S) -> Result<Self, RouterError> {
         let content = sys.read_config_file().map_err(|e| {
@@ -87,11 +114,7 @@ impl RouterConfig {
             ))
         })?;
 
-        let wan_mac = MacAddr::from_str(&parsed.network.wan_mac)
-            .map_err(|_| RouterError::Generic("wan_mac must be a valid MAC address".to_string()))?;
-        let lan_mac = MacAddr::from_str(&parsed.network.lan_mac)
-            .map_err(|_| RouterError::Generic("lan_mac must be a valid MAC address".to_string()))?;
-
+        let (wan_mac, lan_mac) = parse_mac_addresses(&parsed.network)?;
         let lan_ip = parsed
             .network
             .lan_ip
@@ -102,27 +125,7 @@ impl RouterConfig {
             .unwrap_or_else(|| "10.0.0.1/24".to_string());
 
         let reboot_delay = parsed.system.and_then(|s| s.reboot_delay);
-
-        let max_log_size_mb = parsed
-            .logging
-            .as_ref()
-            .and_then(|l| l.max_log_size_mb)
-            .unwrap_or(100);
-
-        let log_level = match parsed.logging.as_ref().and_then(|l| l.level.as_deref()) {
-            Some(lvl_str) => log::LevelFilter::from_str(lvl_str).map_err(|_| {
-                RouterError::Generic(format!(
-                    "Invalid logging level '{}'. Must be one of: error, warn, info, debug, trace",
-                    lvl_str
-                ))
-            })?,
-            None => log::LevelFilter::Info,
-        };
-
-        let logging = LoggingConfig {
-            max_log_size_mb,
-            level: log_level,
-        };
+        let logging = parse_logging_config(parsed.logging.as_ref())?;
 
         Ok(RouterConfig {
             lan_ip,
