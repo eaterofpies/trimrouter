@@ -1,5 +1,5 @@
 use crate::error::RouterError;
-use crate::system::SystemOps;
+use crate::system::MountOps;
 use log::{debug, info, warn};
 use nix::mount::MsFlags;
 use std::fs::{self, DirEntry, File, OpenOptions};
@@ -264,7 +264,7 @@ pub fn wait_for_boot_partition() -> Result<(String, String), RouterError> {
     ))
 }
 
-pub fn mount_boot_partition<S: SystemOps>(sys: &S, boot_dev: &str) -> Result<(), RouterError> {
+pub fn mount_boot_partition<S: MountOps>(sys: &S, boot_dev: &str) -> Result<(), RouterError> {
     if let Err(e) = fs::create_dir_all(BOOT_MOUNT_POINT) {
         warn!(
             "[init] Warning: failed to create {} directory: {}",
@@ -288,7 +288,7 @@ pub fn mount_boot_partition<S: SystemOps>(sys: &S, boot_dev: &str) -> Result<(),
     Ok(())
 }
 
-pub fn setup_log_partition<S: SystemOps>(
+pub fn setup_log_partition<S: MountOps>(
     sys: &S,
     boot_dev: &str,
     _parent_disk: &str,

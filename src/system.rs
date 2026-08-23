@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
-pub trait SystemOps: Send + Sync + 'static {
+pub trait MountOps: Send + Sync + 'static {
     fn mount(
         &self,
         source: Option<&str>,
@@ -20,23 +20,32 @@ pub trait SystemOps: Send + Sync + 'static {
         flags: MsFlags,
         data: Option<&str>,
     ) -> Result<(), nix::Error>;
+}
 
+pub trait PowerOps: Send + Sync + 'static {
     fn reboot(&self, mode: RebootMode) -> Result<(), nix::Error>;
+}
 
+pub trait ProcessOps: Send + Sync + 'static {
     fn waitpid(
         &self,
         pid: Option<Pid>,
         options: Option<WaitPidFlag>,
     ) -> Result<WaitStatus, nix::Error>;
 
-    fn read_config_file(&self) -> Result<String, std::io::Error>;
-
     fn getpid(&self) -> Pid;
 }
 
+pub trait ConfigReaderOps: Send + Sync + 'static {
+    fn read_config_file(&self) -> Result<String, std::io::Error>;
+}
+
+pub trait SystemOps: MountOps + PowerOps + ProcessOps + ConfigReaderOps {}
+impl<T: MountOps + PowerOps + ProcessOps + ConfigReaderOps + ?Sized> SystemOps for T {}
+
 pub struct RealSystem;
 
-impl SystemOps for RealSystem {
+impl MountOps for RealSystem {
     fn mount(
         &self,
         source: Option<&str>,
@@ -54,11 +63,15 @@ impl SystemOps for RealSystem {
         }
         nix::mount::mount(source, target, Some(fstype), flags, data)
     }
+}
 
+impl PowerOps for RealSystem {
     fn reboot(&self, mode: RebootMode) -> Result<(), nix::Error> {
         nix::sys::reboot::reboot(mode).map(|_| ())
     }
+}
 
+impl ProcessOps for RealSystem {
     fn waitpid(
         &self,
         pid: Option<Pid>,
@@ -67,16 +80,18 @@ impl SystemOps for RealSystem {
         nix::sys::wait::waitpid(pid, options)
     }
 
-    fn read_config_file(&self) -> Result<String, std::io::Error> {
-        fs::read_to_string("/boot/config/trimrouter.toml")
-    }
-
     fn getpid(&self) -> Pid {
         nix::unistd::getpid()
     }
 }
 
-pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), RouterError> {
+impl ConfigReaderOps for RealSystem {
+    fn read_config_file(&self) -> Result<String, std::io::Error> {
+        fs::read_to_string("/boot/config/trimrouter.toml")
+    }
+}
+
+pub fn mount_virtual_filesystems<S: MountOps>(sys: &S) -> Result<(), RouterError> {
     info!("[init] Mounting virtual filesystems...");
 
     sys.mount(None, "/proc", "proc", MsFlags::empty(), None)
@@ -127,7 +142,7 @@ fn log_panic_info(info: &std::panic::PanicHookInfo<'_>) {
     error!("====================================================");
 }
 
-fn halt_on_panic<S: SystemOps>(sys: &S) {
+fn halt_on_panic<S: PowerOps + ProcessOps>(sys: &S) {
     if sys.getpid() != Pid::from_raw(1) {
         return;
     }
@@ -146,7 +161,7 @@ fn halt_on_panic<S: SystemOps>(sys: &S) {
     }
 }
 
-pub fn register_panic_handler<S: SystemOps>(sys: Arc<S>) {
+pub fn register_panic_handler<S: PowerOps + ProcessOps>(sys: Arc<S>) {
     panic::set_hook(Box::new(move |info| {
         log_panic_info(info);
         halt_on_panic(sys.as_ref());
@@ -186,7 +201,7 @@ pub mod mock {
         }
     }
 
-    impl SystemOps for MockSystem {
+    impl MountOps for MockSystem {
         fn mount(
             &self,
             source: Option<&str>,
@@ -203,12 +218,16 @@ pub mod mock {
             ));
             Ok(())
         }
+    }
 
+    impl PowerOps for MockSystem {
         fn reboot(&self, mode: RebootMode) -> Result<(), nix::Error> {
             *self.reboot_call.lock().unwrap() = Some(mode);
             Ok(())
         }
+    }
 
+    impl ProcessOps for MockSystem {
         fn waitpid(
             &self,
             _pid: Option<Pid>,
@@ -222,6 +241,12 @@ pub mod mock {
             }
         }
 
+        fn getpid(&self) -> Pid {
+            self.pid
+        }
+    }
+
+    impl ConfigReaderOps for MockSystem {
         fn read_config_file(&self) -> Result<String, std::io::Error> {
             if self.config_content.is_empty() {
                 Err(std::io::Error::new(
@@ -231,10 +256,6 @@ pub mod mock {
             } else {
                 Ok(self.config_content.clone())
             }
-        }
-
-        fn getpid(&self) -> Pid {
-            self.pid
         }
     }
 }

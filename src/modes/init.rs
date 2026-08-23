@@ -10,7 +10,7 @@ use crate::partition::{
 use crate::reaper;
 use crate::signal;
 use crate::system::{
-    self, RealSystem, SystemOps, mount_virtual_filesystems, register_panic_handler,
+    self, ProcessOps, RealSystem, mount_virtual_filesystems, register_panic_handler,
 };
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
@@ -211,7 +211,10 @@ async fn configure_networking_and_services(
     dns_forwarder
 }
 
-async fn start_power_button_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
+async fn start_power_button_monitor<S: system::PowerOps>(
+    sys: Arc<S>,
+    shutdown_flag: Arc<AtomicBool>,
+) {
     debug!("[init] Starting ACPI power button monitor...");
     for i in 0..5 {
         let path = format!("/dev/input/event{}", i);

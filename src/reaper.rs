@@ -1,4 +1,4 @@
-use crate::system::SystemOps;
+use crate::system::ProcessOps;
 use log::{debug, error, warn};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
@@ -7,14 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Duration, sleep};
 
-async fn fallback_polling_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
+async fn fallback_polling_reaper<S: ProcessOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     while !shutdown_flag.load(Ordering::Relaxed) {
         reap_zombies(sys.as_ref());
         sleep(Duration::from_millis(500)).await;
     }
 }
 
-pub async fn start_orphan_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
+pub async fn start_orphan_reaper<S: ProcessOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     debug!("[reaper] Starting orphan process reaper task...");
 
     let mut sigchld_stream = match signal(SignalKind::child()) {
@@ -41,7 +41,7 @@ pub async fn start_orphan_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<A
     }
 }
 
-fn try_reap_zombie<S: SystemOps>(sys: &S) -> bool {
+fn try_reap_zombie<S: ProcessOps>(sys: &S) -> bool {
     match sys.waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
         Ok(WaitStatus::Exited(pid, code)) => {
             debug!(
@@ -67,7 +67,7 @@ fn try_reap_zombie<S: SystemOps>(sys: &S) -> bool {
     }
 }
 
-pub fn reap_zombies<S: SystemOps>(sys: &S) {
+pub fn reap_zombies<S: ProcessOps>(sys: &S) {
     loop {
         if !try_reap_zombie(sys) {
             break;

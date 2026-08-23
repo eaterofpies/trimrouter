@@ -1,5 +1,5 @@
 use crate::error::RouterError;
-use crate::system::SystemOps;
+use crate::system::ConfigReaderOps;
 use pnet::util::MacAddr;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -72,7 +72,7 @@ struct LoggingSection {
 }
 
 impl RouterConfig {
-    pub fn parse<S: SystemOps>(sys: &S) -> Result<Self, RouterError> {
+    pub fn parse<S: ConfigReaderOps>(sys: &S) -> Result<Self, RouterError> {
         let content = sys.read_config_file().map_err(|e| {
             RouterError::Generic(format!(
                 "Failed to read trimrouter.toml configuration file: {}",
