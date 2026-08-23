@@ -2,7 +2,7 @@ use crate::services::ipc::{DnsParentToWorkerMsg, recv_msg};
 use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, async_udp_socket, run_sandboxed_worker, wait_shutdown,
 };
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::io::Error as IoError;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -331,7 +331,12 @@ async fn handle_dns_query(
     if let Some(mut response) = lookup_cache(&cache_key, &cache) {
         response[0] = query[0];
         response[1] = query[1];
-        let _ = socket.send_to(&response, src).await;
+        if let Err(e) = socket.send_to(&response, src).await {
+            debug!(
+                "[dns-forwarder] Failed to send cached DNS response to {}: {}",
+                src, e
+            );
+        }
         return;
     }
 
@@ -342,7 +347,12 @@ async fn handle_dns_query(
             forward_query(&query, upstream_ip, &upstream_socket, &pending_queries).await
         {
             insert_cache(cache_key, response.clone(), &cache);
-            let _ = socket.send_to(&response, src).await;
+            if let Err(e) = socket.send_to(&response, src).await {
+                debug!(
+                    "[dns-forwarder] Failed to send DNS response to {}: {}",
+                    src, e
+                );
+            }
             return;
         }
     }

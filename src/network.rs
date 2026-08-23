@@ -109,11 +109,12 @@ pub async fn configure_interface_ip(name: &str, ip_cidr: &str) -> Result<bool, R
             if is_match {
                 already_configured = true;
             } else {
-                debug!(
-                    "[network] Deleting stale IP address from interface {}: prefix_len={}",
-                    name, addr_msg.header.prefix_len
-                );
-                let _ = handle.address().del(addr_msg).execute().await;
+                if let Err(e) = handle.address().del(addr_msg).execute().await {
+                    debug!(
+                        "[network] Failed to delete stale IP from interface {}: {}",
+                        name, e
+                    );
+                }
             }
         }
     }

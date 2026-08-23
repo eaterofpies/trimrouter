@@ -8,7 +8,7 @@ use crate::error::RouterError;
 use crate::network;
 use crate::services::{self, Service};
 use futures_util::{StreamExt, TryStreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
@@ -142,7 +142,9 @@ pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
             && n != "lo"
         {
             // Bring it UP administratively so carrier detection/negotiation can occur
-            let _ = network::ensure_interface_up(&n).await;
+            if let Err(e) = network::ensure_interface_up(&n).await {
+                debug!("[interface] Failed to bring interface {} up: {}", n, e);
+            }
 
             let has_link = link_msg.header.flags.contains(LinkFlags::LowerUp);
             link_states.insert(index, (n.clone(), addr, has_link));
@@ -286,7 +288,9 @@ async fn handle_new_link_event(
     if detected_indices.insert(index) {
         log_detected_device(&n, addr);
         // Ensure the newly detected interface is administratively UP to enable link negotiation
-        let _ = network::ensure_interface_up(&n).await;
+        if let Err(e) = network::ensure_interface_up(&n).await {
+            debug!("[interface] Failed to ensure interface {} up: {}", n, e);
+        }
     }
 
     // 2. Route hotplug matching to the respective managed interface
