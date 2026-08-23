@@ -119,8 +119,8 @@ fn start_parent_dns_monitor(
 
 fn setup_dns_forwarder_attempt() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> {
     let (parent_ipc, child_ipc) = create_ipc_fds()?;
-    let dns_socket = UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT))?;
-    let upstream_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let dns_socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DNS_PORT))?;
+    let upstream_socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
 
     Ok((
         crate::cli::WorkerService::DnsForwarder {
