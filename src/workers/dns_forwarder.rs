@@ -1,17 +1,16 @@
 use crate::managers::ipc::{recv_msg, DnsParentToWorkerMsg};
 use crate::managers::utils::{
-    drop_privileges, wait_shutdown, DNS_FORWARDER_GID, DNS_FORWARDER_UID,
+    run_sandboxed_worker, wait_shutdown, DNS_FORWARDER_GID, DNS_FORWARDER_UID,
 };
 use log::{error, info, warn};
 use std::collections::HashMap;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::Error as IoError;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::unix::OwnedReadHalf;
-use tokio::net::{UdpSocket, UnixStream};
+use tokio::net::UdpSocket;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
 // =========================================================================
@@ -52,8 +51,6 @@ pub async fn run_dns_forwarder_worker(
     dns_socket_fd: RawFd,
     upstream_socket_fd: RawFd,
 ) -> Result<(), IoError> {
-    info!("[dns-forwarder-worker] Starting unprivileged DNS forwarder worker...");
-
     // Convert raw FDs
     let std_dns_socket = unsafe { StdUdpSocket::from_raw_fd(dns_socket_fd) };
     let std_upstream_socket = unsafe { StdUdpSocket::from_raw_fd(upstream_socket_fd) };
@@ -64,62 +61,61 @@ pub async fn run_dns_forwarder_worker(
     let dns_socket = UdpSocket::from_std(std_dns_socket)?;
     let upstream_socket = UdpSocket::from_std(std_upstream_socket)?;
 
-    let std_ipc = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
-    std_ipc.set_nonblocking(true)?;
-    let ipc_stream = UnixStream::from_std(std_ipc)?;
-    let (ipc_reader, _ipc_writer) = ipc_stream.into_split();
+    run_sandboxed_worker(
+        "dns-forwarder",
+        DNS_FORWARDER_UID,
+        DNS_FORWARDER_GID,
+        ipc_fd,
+        |ipc| async move {
+            let dns_socket = Arc::new(dns_socket);
+            let upstream_socket = Arc::new(upstream_socket);
 
-    // Drop privileges
-    drop_privileges(DNS_FORWARDER_UID, DNS_FORWARDER_GID)
-        .map_err(|e| IoError::new(ErrorKind::PermissionDenied, e))?;
-    info!(
-        "[dns-forwarder-worker] Privileges dropped successfully (running as dns-forwarder inside chroot jail)."
-    );
+            let cache: SharedCache = Arc::new(Mutex::new(HashMap::new()));
+            let pending_queries: PendingQueries = Arc::new(Mutex::new(HashMap::new()));
+            let upstream_dns = Arc::new(Mutex::new(Vec::<Ipv4Addr>::new()));
 
-    let dns_socket = Arc::new(dns_socket);
-    let upstream_socket = Arc::new(upstream_socket);
+            let (shutdown_tx, shutdown_rx) = channel(false);
 
-    let cache: SharedCache = Arc::new(Mutex::new(HashMap::new()));
-    let pending_queries: PendingQueries = Arc::new(Mutex::new(HashMap::new()));
-    let upstream_dns = Arc::new(Mutex::new(Vec::<Ipv4Addr>::new()));
+            // Spawn IPC monitor task to receive upstream DNS servers dynamically
+            tokio::spawn(run_dns_ipc_monitor(
+                ipc.reader,
+                ipc.writer,
+                upstream_dns.clone(),
+                shutdown_tx.clone(),
+            ));
 
-    let (shutdown_tx, shutdown_rx) = channel(false);
+            // Spawn the background receiver task for upstream replies.
+            let upstream_task = tokio::spawn(run_upstream_receiver(
+                upstream_socket.clone(),
+                pending_queries.clone(),
+                shutdown_rx.clone(),
+            ));
 
-    // Spawn IPC monitor task to receive upstream DNS servers dynamically
-    tokio::spawn(run_dns_ipc_monitor(
-        ipc_reader,
-        upstream_dns.clone(),
-        shutdown_tx.clone(),
-    ));
+            // Spawn periodic cleanup task to prune expired cache entries
+            let cleanup_task = tokio::spawn(run_cache_cleanup(cache.clone(), shutdown_rx.clone()));
 
-    // Spawn the background receiver task for upstream replies.
-    let upstream_task = tokio::spawn(run_upstream_receiver(
-        upstream_socket.clone(),
-        pending_queries.clone(),
-        shutdown_rx.clone(),
-    ));
+            // Run the main query forwarder loop
+            run_query_loop(
+                dns_socket,
+                upstream_socket,
+                cache,
+                pending_queries,
+                upstream_dns,
+                shutdown_rx,
+            )
+            .await;
 
-    // Spawn periodic cleanup task to prune expired cache entries
-    let cleanup_task = tokio::spawn(run_cache_cleanup(cache.clone(), shutdown_rx.clone()));
-
-    // Run the main query forwarder loop
-    run_query_loop(
-        dns_socket,
-        upstream_socket,
-        cache,
-        pending_queries,
-        upstream_dns,
-        shutdown_rx,
+            let _ = upstream_task.await;
+            let _ = cleanup_task.await;
+            Ok(())
+        },
     )
-    .await;
-
-    let _ = upstream_task.await;
-    let _ = cleanup_task.await;
-    Ok(())
+    .await
 }
 
 async fn run_dns_ipc_monitor(
     mut reader: OwnedReadHalf,
+    _writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
     shutdown_tx: Sender<bool>,
 ) {

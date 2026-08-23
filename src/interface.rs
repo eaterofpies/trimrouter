@@ -26,9 +26,9 @@ pub enum RouterService {
     LanManager(managers::LanManager),
 }
 
-impl RouterService {
+impl Service for RouterService {
     /// Starts the encapsulated router service.
-    pub async fn start(&mut self) -> Result<(), managers::ServiceError> {
+    async fn start(&mut self) -> Result<(), managers::ServiceError> {
         match self {
             RouterService::DhcpClient(s) => s.start().await,
             RouterService::SntpClient(s) => s.start().await,
@@ -37,7 +37,7 @@ impl RouterService {
     }
 
     /// Stops the encapsulated router service.
-    pub async fn stop(&mut self) -> Result<(), managers::ServiceError> {
+    async fn stop(&mut self) -> Result<(), managers::ServiceError> {
         match self {
             RouterService::DhcpClient(s) => s.stop().await,
             RouterService::SntpClient(s) => s.stop().await,

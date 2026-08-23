@@ -1,6 +1,29 @@
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
+use tokio::sync::Mutex;
+
+pub struct IpcEndpoint {
+    pub reader: OwnedReadHalf,
+    pub writer: Arc<Mutex<OwnedWriteHalf>>,
+}
+
+impl IpcEndpoint {
+    pub fn from_raw_fd(fd: RawFd) -> Result<Self, std::io::Error> {
+        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        std_stream.set_nonblocking(true)?;
+        let ipc_stream = UnixStream::from_std(std_stream)?;
+        let (reader, writer) = ipc_stream.into_split();
+        Ok(Self {
+            reader,
+            writer: Arc::new(Mutex::new(writer)),
+        })
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DnsParentToWorkerMsg {

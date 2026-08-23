@@ -17,6 +17,9 @@ mod error;
 #[path = "../src/packet.rs"]
 mod packet;
 
+#[path = "../src/managers/ipc.rs"]
+mod ipc;
+
 #[path = "../src/managers/utils.rs"]
 mod utils;
 

@@ -1,16 +1,14 @@
 use crate::managers::ipc::{recv_msg, send_msg, SntpClientToParentMsg, SntpParentToWorkerMsg};
 use crate::managers::utils::{
-    drop_privileges, resolve_dns_a_record, wait_shutdown, SNTP_GID, SNTP_UID,
+    resolve_dns_a_record, run_sandboxed_worker, wait_shutdown, SNTP_GID, SNTP_UID,
 };
 use log::{error, info, warn};
-use std::io::{Error as IoError, ErrorKind};
+use std::io::Error as IoError;
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::UnixStream;
 use tokio::sync::watch::{channel, Receiver};
 use tokio::sync::Mutex as TokioMutex;
 
@@ -22,23 +20,10 @@ const NTP_PORT: u16 = 123;
 const WAN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn run_sntp_client_worker(ipc_fd: RawFd) -> Result<(), IoError> {
-    info!("[sntp-client-worker] Starting unprivileged SNTP time synchronization worker...");
-
-    let std_ipc = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
-    std_ipc.set_nonblocking(true)?;
-    let ipc_stream = UnixStream::from_std(std_ipc)?;
-    let (mut ipc_reader, ipc_writer) = ipc_stream.into_split();
-    let shared_ipc_writer = Arc::new(TokioMutex::new(ipc_writer));
-
-    // Drop privileges
-    drop_privileges(SNTP_UID, SNTP_GID)
-        .map_err(|e| IoError::new(ErrorKind::PermissionDenied, e))?;
-    info!(
-        "[sntp-client-worker] Privileges dropped successfully (running as sntp inside chroot jail)."
-    );
-
-    let (shutdown_tx, mut shutdown_rx) = channel(false);
-    let wan_active = Arc::new(Mutex::new(false));
+    run_sandboxed_worker("sntp-client", SNTP_UID, SNTP_GID, ipc_fd, |ipc| async move {
+        let (mut ipc_reader, shared_ipc_writer) = (ipc.reader, ipc.writer);
+        let (shutdown_tx, mut shutdown_rx) = channel(false);
+        let wan_active = Arc::new(Mutex::new(false));
 
     // Monitor parent messages
     let wan_active_clone = wan_active.clone();
@@ -84,6 +69,8 @@ pub async fn run_sntp_client_worker(ipc_fd: RawFd) -> Result<(), IoError> {
     }
 
     Ok(())
+    })
+    .await
 }
 
 async fn handle_sntp_iteration(

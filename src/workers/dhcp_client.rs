@@ -1,8 +1,8 @@
 use crate::managers::dhcp_client::{configure_wan, deconfigure_wan};
 use crate::managers::ipc::{send_msg, DhcpClientToParentMsg};
 use crate::managers::utils::{
-    drop_privileges, get_interface_mac, mask_to_prefix_len as utils_mask_to_prefix_len,
-    parse_dhcp_payload, wait_shutdown, CleanOption, RawPacketSocket, SharedWanLease, WanLease,
+    get_interface_mac, mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload,
+    run_sandboxed_worker, wait_shutdown, CleanOption, RawPacketSocket, SharedWanLease, WanLease,
     DHCP_CLIENT_GID, DHCP_CLIENT_UID,
 };
 use crate::packet::build_raw_packet;
@@ -11,8 +11,7 @@ use dhcproto::{Encodable, Encoder};
 use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
@@ -576,11 +575,6 @@ pub async fn run_dhcp_client_worker(
     raw_socket_fd: RawFd,
     wan_interface: String,
 ) -> Result<(), std::io::Error> {
-    info!(
-        "[dhcp-client-worker] Starting unprivileged WAN DHCP client worker on {}...",
-        wan_interface
-    );
-
     let socket = RawPacketSocket::from_raw_fd(raw_socket_fd)?;
     let mac = match get_interface_mac(&wan_interface).await {
         Ok(m) => m,
@@ -590,37 +584,29 @@ pub async fn run_dhcp_client_worker(
     };
     let client_socket = DhcpClientSocket::from_raw_socket(socket, mac);
 
-    let std_stream = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
-    std_stream.set_nonblocking(true)?;
-    let ipc_stream = tokio::net::UnixStream::from_std(std_stream)?;
-    let (ipc_reader, ipc_writer) = ipc_stream.into_split();
-    let shared_ipc_writer = Arc::new(tokio::sync::Mutex::new(ipc_writer));
+    run_sandboxed_worker(
+        "dhcp-client",
+        DHCP_CLIENT_UID,
+        DHCP_CLIENT_GID,
+        ipc_fd,
+        |ipc| async move {
+            let dummy_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
+            let client = DhcpClientInternal {
+                socket: client_socket,
+                mac,
+                lease_state: dummy_lease_state,
+                wan_interface: wan_interface.clone(),
+                ipc_writer: Some(ipc.writer),
+            };
 
-    if let Err(e) = drop_privileges(DHCP_CLIENT_UID, DHCP_CLIENT_GID) {
-        error!(
-            "[dhcp-client-worker] FATAL: Failed to drop privileges: {}",
-            e
-        );
-        std::process::exit(1);
-    }
-    info!(
-        "[dhcp-client-worker] Privileges dropped successfully (running as dhcp-client inside chroot jail)."
-    );
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(monitor_parent_ipc(ipc.reader, shutdown_tx));
 
-    let dummy_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
-    let client = DhcpClientInternal {
-        socket: client_socket,
-        mac,
-        lease_state: dummy_lease_state,
-        wan_interface: wan_interface.clone(),
-        ipc_writer: Some(shared_ipc_writer),
-    };
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(monitor_parent_ipc(ipc_reader, shutdown_tx));
-
-    client.run(shutdown_rx).await;
-    Ok(())
+            client.run(shutdown_rx).await;
+            Ok(())
+        },
+    )
+    .await
 }
 
 fn calculate_next_delay(current_delay: u32) -> u32 {

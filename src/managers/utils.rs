@@ -1,5 +1,6 @@
+use super::ipc::IpcEndpoint;
 use crate::error::RouterError;
-use log::warn;
+use log::{info, warn};
 use pnet::util::MacAddr;
 use rtnetlink::packet_route::link::LinkAttribute;
 use std::net::Ipv4Addr;
@@ -570,6 +571,30 @@ pub fn drop_privileges(uid: u32, gid: u32) -> Result<(), std::io::Error> {
     apply_seccomp()?;
 
     Ok(())
+}
+
+pub async fn run_sandboxed_worker<F, Fut>(
+    service_name: &str,
+    uid: u32,
+    gid: u32,
+    ipc_fd: RawFd,
+    worker_fn: F,
+) -> Result<(), std::io::Error>
+where
+    F: FnOnce(IpcEndpoint) -> Fut,
+    Fut: std::future::Future<Output = Result<(), std::io::Error>>,
+{
+    info!("[{}-worker] Starting unprivileged worker...", service_name);
+    let ipc = IpcEndpoint::from_raw_fd(ipc_fd)?;
+
+    drop_privileges(uid, gid)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    info!(
+        "[{}-worker] Privileges dropped successfully (running as {} inside chroot jail).",
+        service_name, service_name
+    );
+
+    worker_fn(ipc).await
 }
 
 pub fn setup_worker_sockets(interface: &str) -> std::io::Result<(RawFd, RawFd, RawFd)> {

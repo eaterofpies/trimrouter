@@ -1,6 +1,6 @@
 use crate::managers::ipc::{recv_msg, DhcpServerParentToWorkerMsg};
 use crate::managers::utils::{
-    drop_privileges, get_interface_mac, parse_dhcp_payload, read_raw_packet, send_raw_packet,
+    get_interface_mac, parse_dhcp_payload, read_raw_packet, run_sandboxed_worker, send_raw_packet,
     wait_shutdown, DHCP_SERVER_GID, DHCP_SERVER_UID,
 };
 use crate::packet::build_raw_packet;
@@ -11,8 +11,7 @@ use pnet::packet::ethernet::EthernetPacket;
 use pnet::util::MacAddr;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
 use std::net::Ipv4Addr;
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
@@ -183,16 +182,6 @@ pub async fn run_dhcp_server_worker(
     lan_interface: String,
     lan_ip: String,
 ) -> Result<(), std::io::Error> {
-    info!(
-        "[dhcp-server-worker] Starting unprivileged LAN DHCP server worker on {}...",
-        lan_interface
-    );
-
-    let std_stream = unsafe { StdUnixStream::from_raw_fd(ipc_fd) };
-    std_stream.set_nonblocking(true)?;
-    let ipc_stream = tokio::net::UnixStream::from_std(std_stream)?;
-    let (ipc_reader, _ipc_writer) = ipc_stream.into_split();
-
     let net: ipnet::Ipv4Net = lan_ip.parse().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -212,57 +201,58 @@ pub async fn run_dhcp_server_worker(
         );
     }
 
-    if let Err(e) = drop_privileges(DHCP_SERVER_UID, DHCP_SERVER_GID) {
-        error!(
-            "[dhcp-server-worker] FATAL: Failed to drop privileges: {}",
-            e
-        );
-        std::process::exit(1);
-    }
-    info!(
-        "[dhcp-server-worker] Privileges dropped successfully (running as dhcp-server inside chroot jail)."
-    );
-
     let mac = get_interface_mac(&lan_interface)
         .await
         .map_err(std::io::Error::other)?;
     let async_sock = AsyncFd::new(raw_socket_fd)?;
 
-    let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
-    let leases_clone = Arc::clone(&leases);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    run_sandboxed_worker(
+        "dhcp-server",
+        DHCP_SERVER_UID,
+        DHCP_SERVER_GID,
+        ipc_fd,
+        |ipc| async move {
+            let leases = Arc::new(tokio::sync::Mutex::new(LeaseTable::new()));
+            let leases_clone = Arc::clone(&leases);
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let mut reader = ipc_reader;
-    tokio::spawn(async move {
-        loop {
-            match recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut reader).await {
-                Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
-                    ip_address,
-                    mac_address,
-                })) => {
-                    let mac = MacAddr::from(mac_address);
-                    update_lease_from_neighbor(mac, ip_address, &leases_clone).await;
+            let mut reader = ipc.reader;
+            let _keep_writer = ipc.writer;
+            tokio::spawn(async move {
+                let _writer_ref = _keep_writer;
+                loop {
+                    match recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut reader).await {
+                        Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
+                            ip_address,
+                            mac_address,
+                        })) => {
+                            let mac = MacAddr::from(mac_address);
+                            update_lease_from_neighbor(mac, ip_address, &leases_clone).await;
+                        }
+                        Ok(None) | Err(_) => {
+                            info!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
+                            let _ = shutdown_tx.send(true);
+                            break;
+                        }
+                    }
                 }
-                Ok(None) | Err(_) => {
-                    info!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
-                    let _ = shutdown_tx.send(true);
-                    break;
-                }
-            }
-        }
-    });
+            });
 
-    let config = Arc::new(ServerConfig {
-        server_ip,
-        subnet_mask,
-        server_mac: mac,
-        net,
-    });
+            let config = Arc::new(ServerConfig {
+                server_ip,
+                subnet_mask,
+                server_mac: mac,
+                net,
+            });
 
-    let async_sock_shared = Arc::new(async_sock);
-    let mut shutdown_rx_clone = shutdown_rx.clone();
-    let _ = run_server_loop(async_sock_shared, config, leases, &mut shutdown_rx_clone).await;
-    Ok(())
+            let async_sock_shared = Arc::new(async_sock);
+            let mut shutdown_rx_clone = shutdown_rx.clone();
+            let _ =
+                run_server_loop(async_sock_shared, config, leases, &mut shutdown_rx_clone).await;
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn receive_next_packet(
