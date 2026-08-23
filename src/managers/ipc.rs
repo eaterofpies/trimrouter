@@ -1,11 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
+
+pub fn async_unix_stream(fd: OwnedFd) -> Result<UnixStream, std::io::Error> {
+    let std_stream = std::os::unix::net::UnixStream::from(fd);
+    std_stream.set_nonblocking(true)?;
+    UnixStream::from_std(std_stream)
+}
 
 pub struct IpcEndpoint {
     pub reader: OwnedReadHalf,
@@ -13,15 +19,18 @@ pub struct IpcEndpoint {
 }
 
 impl IpcEndpoint {
-    pub fn from_raw_fd(fd: RawFd) -> Result<Self, std::io::Error> {
-        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        std_stream.set_nonblocking(true)?;
-        let ipc_stream = UnixStream::from_std(std_stream)?;
+    pub fn from_owned_fd(fd: OwnedFd) -> Result<Self, std::io::Error> {
+        let ipc_stream = async_unix_stream(fd)?;
         let (reader, writer) = ipc_stream.into_split();
         Ok(Self {
             reader,
             writer: Arc::new(Mutex::new(writer)),
         })
+    }
+
+    pub fn from_raw_fd(fd: RawFd) -> Result<Self, std::io::Error> {
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Self::from_owned_fd(owned_fd)
     }
 }
 

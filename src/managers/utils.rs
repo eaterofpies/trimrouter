@@ -18,7 +18,7 @@ use std::convert::TryInto;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -148,7 +148,7 @@ pub async fn get_interface_mac(ifname: &str) -> Result<MacAddr, String> {
     })
 }
 
-pub fn open_raw_socket(ifname: &str) -> Result<RawFd, String> {
+pub fn open_raw_socket(ifname: &str) -> Result<OwnedFd, String> {
     // Create the packet raw socket
     let socket = Socket::new(
         Domain::from(libc::AF_PACKET),
@@ -194,7 +194,7 @@ pub fn open_raw_socket(ifname: &str) -> Result<RawFd, String> {
         .bind(&sockaddr)
         .map_err(|e| format!("bind(AF_PACKET) failed: {}", e))?;
 
-    Ok(socket.into_raw_fd())
+    Ok(socket.into())
 }
 
 pub fn parse_dhcp_payload(buf: &[u8], expected_port: u16) -> Option<Message> {
@@ -214,7 +214,7 @@ pub fn parse_dhcp_payload(buf: &[u8], expected_port: u16) -> Option<Message> {
 }
 
 pub fn try_read_raw(
-    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, std::os::unix::io::RawFd>,
+    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, OwnedFd>,
     buf: &mut [u8],
 ) -> Result<Option<usize>, std::io::Error> {
     match guard.try_io(|inner| {
@@ -238,7 +238,7 @@ pub fn try_read_raw(
 }
 
 pub async fn read_raw_packet(
-    async_sock: &tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>,
+    async_sock: &tokio::io::unix::AsyncFd<OwnedFd>,
     buf: &mut [u8],
 ) -> Result<usize, std::io::Error> {
     loop {
@@ -250,7 +250,7 @@ pub async fn read_raw_packet(
 }
 
 pub fn try_write_raw(
-    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, std::os::unix::io::RawFd>,
+    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, OwnedFd>,
     frame: &[u8],
 ) -> Result<Option<isize>, std::io::Error> {
     match guard.try_io(|inner| {
@@ -273,10 +273,7 @@ pub fn try_write_raw(
     }
 }
 
-pub async fn send_raw_packet(
-    async_sock: &tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>,
-    frame: &[u8],
-) {
+pub async fn send_raw_packet(async_sock: &tokio::io::unix::AsyncFd<OwnedFd>, frame: &[u8]) {
     loop {
         let mut guard = match async_sock.writable().await {
             Ok(g) => g,
@@ -293,25 +290,28 @@ pub async fn send_raw_packet(
 /// A generic asynchronous wrapper around an AF_PACKET raw socket for sending
 /// and receiving raw Ethernet frames on a specific network interface.
 pub struct RawPacketSocket {
-    socket: Option<tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>>,
+    socket: Option<tokio::io::unix::AsyncFd<OwnedFd>>,
 }
 
 impl RawPacketSocket {
     pub fn new(interface_name: &str) -> Result<Self, std::io::Error> {
         let raw_fd = open_raw_socket(interface_name).map_err(std::io::Error::other)?;
-        let socket = tokio::io::unix::AsyncFd::new(raw_fd).inspect_err(|_| unsafe {
-            let _ = libc::close(raw_fd);
-        })?;
+        let socket = tokio::io::unix::AsyncFd::new(raw_fd)?;
         Ok(Self {
             socket: Some(socket),
         })
     }
 
-    pub fn from_raw_fd(raw_fd: std::os::unix::io::RawFd) -> Result<Self, std::io::Error> {
-        let socket = tokio::io::unix::AsyncFd::new(raw_fd)?;
+    pub fn from_owned_fd(owned_fd: OwnedFd) -> Result<Self, std::io::Error> {
+        let socket = tokio::io::unix::AsyncFd::new(owned_fd)?;
         Ok(Self {
             socket: Some(socket),
         })
+    }
+
+    pub fn from_raw_fd(raw_fd: RawFd) -> Result<Self, std::io::Error> {
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        Self::from_owned_fd(owned_fd)
     }
 
     pub async fn send(&self, frame: &[u8]) -> Result<(), std::io::Error> {
@@ -348,17 +348,6 @@ impl RawPacketSocket {
             }
         }
         Ok(None)
-    }
-}
-
-impl Drop for RawPacketSocket {
-    fn drop(&mut self) {
-        if let Some(async_fd) = self.socket.take() {
-            let fd = async_fd.into_inner();
-            unsafe {
-                let _ = libc::close(fd);
-            }
-        }
     }
 }
 
@@ -570,7 +559,7 @@ pub async fn run_sandboxed_worker<F, Fut>(
     service_name: &str,
     uid: u32,
     gid: u32,
-    ipc_fd: RawFd,
+    ipc_fd: OwnedFd,
     worker_fn: F,
 ) -> Result<(), std::io::Error>
 where
@@ -578,7 +567,7 @@ where
     Fut: std::future::Future<Output = Result<(), std::io::Error>>,
 {
     info!("[{}-worker] Starting unprivileged worker...", service_name);
-    let ipc = IpcEndpoint::from_raw_fd(ipc_fd)?;
+    let ipc = IpcEndpoint::from_owned_fd(ipc_fd)?;
 
     drop_privileges(uid, gid)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
@@ -590,36 +579,25 @@ where
     worker_fn(ipc).await
 }
 
-pub fn setup_worker_sockets(interface: &str) -> std::io::Result<(RawFd, RawFd, RawFd)> {
-    let raw_socket_fd = open_raw_socket(interface).map_err(std::io::Error::other)?;
-
-    let mut fds = [0; 2];
-    let res = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-    if res < 0 {
-        unsafe {
-            libc::close(raw_socket_fd);
-        }
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((raw_socket_fd, fds[0], fds[1]))
-}
-
-pub fn create_ipc_fds() -> Result<(RawFd, RawFd), std::io::Error> {
+pub fn setup_worker_sockets(interface: &str) -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
+    let raw_socket = open_raw_socket(interface).map_err(std::io::Error::other)?;
     let (parent_stream, child_stream) = tokio::net::UnixStream::pair()?;
     let parent_std = parent_stream.into_std()?;
-    let parent_fd = parent_std.into_raw_fd();
+    let child_std = child_stream.into_std()?;
+    Ok((raw_socket, parent_std.into(), child_std.into()))
+}
 
-    let child_std = match child_stream.into_std() {
-        Ok(std_stream) => std_stream,
-        Err(e) => {
-            unsafe {
-                libc::close(parent_fd);
-            }
-            return Err(e);
-        }
-    };
-    let child_fd = child_std.into_raw_fd();
-    Ok((parent_fd, child_fd))
+pub fn create_ipc_fds() -> Result<(OwnedFd, OwnedFd), std::io::Error> {
+    let (parent_stream, child_stream) = tokio::net::UnixStream::pair()?;
+    let parent_std = parent_stream.into_std()?;
+    let child_std = child_stream.into_std()?;
+    Ok((parent_std.into(), child_std.into()))
+}
+
+pub fn async_udp_socket(fd: OwnedFd) -> Result<tokio::net::UdpSocket, std::io::Error> {
+    let std_sock = std::net::UdpSocket::from(fd);
+    std_sock.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(std_sock)
 }
 
 pub async fn handle_supervisor_restart_delay(

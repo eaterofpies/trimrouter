@@ -10,7 +10,7 @@ use log::{error, info};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{self, BufRead, BufReader, Read};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -109,8 +109,8 @@ impl ExternalWorker {
         mut run_monitor: M,
     ) -> Result<(), ServiceError>
     where
-        S: FnMut() -> Result<(crate::cli::WorkerService, RawFd), ServiceError> + Send + 'static,
-        M: FnMut(RawFd, u32, Receiver<bool>) -> Result<JoinHandle<()>, ServiceError>
+        S: FnMut() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> + Send + 'static,
+        M: FnMut(OwnedFd, u32, Receiver<bool>) -> Result<JoinHandle<()>, ServiceError>
             + Send
             + 'static,
     {
@@ -157,9 +157,6 @@ impl ExternalWorker {
                     Ok(c) => c,
                     Err(e) => {
                         error!("[{}-parent] Spawn failed: {:?}", service_name, e);
-                        unsafe {
-                            let _ = libc::close(parent_ipc_fd);
-                        }
                         continue;
                     }
                 };
@@ -176,9 +173,6 @@ impl ExternalWorker {
                                 service_name, e
                             );
                             utils::terminate_worker(child_pid).await;
-                            unsafe {
-                                let _ = libc::close(parent_ipc_fd);
-                            }
                             continue;
                         }
                     };

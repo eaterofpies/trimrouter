@@ -1,5 +1,47 @@
 use clap::{Parser, Subcommand};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+#[derive(Debug)]
+pub struct CliFd(pub OwnedFd);
+
+impl Clone for CliFd {
+    fn clone(&self) -> Self {
+        Self(
+            self.0
+                .try_clone()
+                .expect("failed to duplicate file descriptor"),
+        )
+    }
+}
+
+impl From<OwnedFd> for CliFd {
+    fn from(fd: OwnedFd) -> Self {
+        Self(fd)
+    }
+}
+
+impl From<std::net::UdpSocket> for CliFd {
+    fn from(sock: std::net::UdpSocket) -> Self {
+        Self(sock.into())
+    }
+}
+
+impl From<CliFd> for OwnedFd {
+    fn from(cli_fd: CliFd) -> Self {
+        cli_fd.0
+    }
+}
+
+impl AsRawFd for CliFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+fn parse_cli_fd(s: &str) -> Result<CliFd, String> {
+    let fd_num = s.parse::<RawFd>().map_err(|e| e.to_string())?;
+    Ok(CliFd(unsafe { OwnedFd::from_raw_fd(fd_num) }))
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "trimrouter-multicall", multicall = true)]
@@ -84,70 +126,96 @@ pub enum TrimrouterSubcommands {
 #[derive(Subcommand, Debug, Clone)]
 pub enum WorkerService {
     #[command(name = "sntp-client")]
-    SntpClient { ipc_fd: i32 },
+    SntpClient {
+        #[arg(value_parser = parse_cli_fd)]
+        ipc_fd: CliFd,
+    },
     #[command(name = "dhcp-client")]
     DhcpClient {
-        ipc_fd: i32,
-        raw_socket_fd: i32,
+        #[arg(value_parser = parse_cli_fd)]
+        ipc_fd: CliFd,
+        #[arg(value_parser = parse_cli_fd)]
+        raw_socket_fd: CliFd,
         wan_interface: String,
     },
     #[command(name = "dhcp-server")]
     DhcpServer {
-        ipc_fd: i32,
-        raw_socket_fd: i32,
+        #[arg(value_parser = parse_cli_fd)]
+        ipc_fd: CliFd,
+        #[arg(value_parser = parse_cli_fd)]
+        raw_socket_fd: CliFd,
         wan_interface: String,
         lan_ip: String,
     },
     #[command(name = "dns-forwarder")]
     DnsForwarder {
-        ipc_fd: i32,
-        dns_socket_fd: i32,
-        upstream_socket_fd: i32,
+        #[arg(value_parser = parse_cli_fd)]
+        ipc_fd: CliFd,
+        #[arg(value_parser = parse_cli_fd)]
+        dns_socket_fd: CliFd,
+        #[arg(value_parser = parse_cli_fd)]
+        upstream_socket_fd: CliFd,
     },
 }
 
 impl WorkerService {
     pub fn to_args_and_child_fds(&self) -> (Vec<String>, Vec<RawFd>) {
         match self {
-            Self::SntpClient { ipc_fd } => (vec![ipc_fd.to_string()], vec![*ipc_fd]),
+            Self::SntpClient { ipc_fd } => {
+                let raw = ipc_fd.as_raw_fd();
+                (vec![raw.to_string()], vec![raw])
+            }
             Self::DhcpClient {
                 ipc_fd,
                 raw_socket_fd,
                 wan_interface,
-            } => (
-                vec![
-                    ipc_fd.to_string(),
-                    raw_socket_fd.to_string(),
-                    wan_interface.clone(),
-                ],
-                vec![*ipc_fd, *raw_socket_fd],
-            ),
+            } => {
+                let ipc_raw = ipc_fd.as_raw_fd();
+                let sock_raw = raw_socket_fd.as_raw_fd();
+                (
+                    vec![
+                        ipc_raw.to_string(),
+                        sock_raw.to_string(),
+                        wan_interface.clone(),
+                    ],
+                    vec![ipc_raw, sock_raw],
+                )
+            }
             Self::DhcpServer {
                 ipc_fd,
                 raw_socket_fd,
                 wan_interface,
                 lan_ip,
-            } => (
-                vec![
-                    ipc_fd.to_string(),
-                    raw_socket_fd.to_string(),
-                    wan_interface.clone(),
-                    lan_ip.clone(),
-                ],
-                vec![*ipc_fd, *raw_socket_fd],
-            ),
+            } => {
+                let ipc_raw = ipc_fd.as_raw_fd();
+                let sock_raw = raw_socket_fd.as_raw_fd();
+                (
+                    vec![
+                        ipc_raw.to_string(),
+                        sock_raw.to_string(),
+                        wan_interface.clone(),
+                        lan_ip.clone(),
+                    ],
+                    vec![ipc_raw, sock_raw],
+                )
+            }
             Self::DnsForwarder {
                 ipc_fd,
                 dns_socket_fd,
                 upstream_socket_fd,
-            } => (
-                vec![
-                    ipc_fd.to_string(),
-                    dns_socket_fd.to_string(),
-                    upstream_socket_fd.to_string(),
-                ],
-                vec![*ipc_fd, *dns_socket_fd, *upstream_socket_fd],
-            ),
+            } => {
+                let ipc_raw = ipc_fd.as_raw_fd();
+                let dns_raw = dns_socket_fd.as_raw_fd();
+                let upstream_raw = upstream_socket_fd.as_raw_fd();
+                (
+                    vec![
+                        ipc_raw.to_string(),
+                        dns_raw.to_string(),
+                        upstream_raw.to_string(),
+                    ],
+                    vec![ipc_raw, dns_raw, upstream_raw],
+                )
+            }
         }
     }
 }
@@ -155,25 +223,34 @@ impl WorkerService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::io::IntoRawFd;
 
     #[test]
     fn test_multicall_parsing() {
+        let (s1, s2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd1 = s1.into_raw_fd();
+        let fd2 = s2.into_raw_fd();
+
         let args1 = vec![
             "trimrouter".to_string(),
             "worker".to_string(),
             "dhcp-client".to_string(),
-            "3".to_string(),
-            "4".to_string(),
+            fd1.to_string(),
+            fd2.to_string(),
             "eth0".to_string(),
         ];
         assert!(Cli::try_parse_from(&args1).is_ok());
+
+        let (s3, s4) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd3 = s3.into_raw_fd();
+        let fd4 = s4.into_raw_fd();
 
         let args2 = vec![
             "/bin/trimrouter".to_string(),
             "worker".to_string(),
             "dhcp-client".to_string(),
-            "3".to_string(),
-            "4".to_string(),
+            fd3.to_string(),
+            fd4.to_string(),
             "eth0".to_string(),
         ];
         assert!(Cli::try_parse_from(&args2).is_ok());
@@ -191,21 +268,28 @@ mod tests {
         assert!(matches!(cli_init2.command, Some(Commands::Init { .. })));
 
         // Test worker spawned via /proc/self/exe
+        let (s5, _s6) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd5 = s5.into_raw_fd();
         let exe_worker_args = vec![
             "/proc/self/exe".to_string(),
             "worker".to_string(),
             "sntp-client".to_string(),
-            "5".to_string(),
+            fd5.to_string(),
         ];
         assert!(Cli::try_parse_from(&exe_worker_args).is_ok());
 
+        let (s7, s8) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (s9, _s10) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd7 = s7.into_raw_fd();
+        let fd8 = s8.into_raw_fd();
+        let fd9 = s9.into_raw_fd();
         let exe_short_args = vec![
             "exe".to_string(),
             "worker".to_string(),
             "dns-forwarder".to_string(),
-            "3".to_string(),
-            "4".to_string(),
-            "5".to_string(),
+            fd7.to_string(),
+            fd8.to_string(),
+            fd9.to_string(),
         ];
         assert!(Cli::try_parse_from(&exe_short_args).is_ok());
     }

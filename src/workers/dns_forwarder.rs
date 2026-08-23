@@ -1,12 +1,12 @@
 use crate::managers::ipc::{DnsParentToWorkerMsg, recv_msg};
 use crate::managers::utils::{
-    DNS_FORWARDER_GID, DNS_FORWARDER_UID, run_sandboxed_worker, wait_shutdown,
+    DNS_FORWARDER_GID, DNS_FORWARDER_UID, async_udp_socket, run_sandboxed_worker, wait_shutdown,
 };
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::io::Error as IoError;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -47,19 +47,12 @@ type SharedCache = Arc<Mutex<HashMap<Vec<u8>, CacheEntry>>>;
 type PendingQueries = Arc<Mutex<HashMap<u16, PendingQuery>>>;
 
 pub async fn run_dns_forwarder_worker(
-    ipc_fd: RawFd,
-    dns_socket_fd: RawFd,
-    upstream_socket_fd: RawFd,
+    ipc_fd: OwnedFd,
+    dns_socket_fd: OwnedFd,
+    upstream_socket_fd: OwnedFd,
 ) -> Result<(), IoError> {
-    // Convert raw FDs
-    let std_dns_socket = unsafe { StdUdpSocket::from_raw_fd(dns_socket_fd) };
-    let std_upstream_socket = unsafe { StdUdpSocket::from_raw_fd(upstream_socket_fd) };
-
-    std_dns_socket.set_nonblocking(true)?;
-    std_upstream_socket.set_nonblocking(true)?;
-
-    let dns_socket = UdpSocket::from_std(std_dns_socket)?;
-    let upstream_socket = UdpSocket::from_std(std_upstream_socket)?;
+    let dns_socket = async_udp_socket(dns_socket_fd)?;
+    let upstream_socket = async_udp_socket(upstream_socket_fd)?;
 
     run_sandboxed_worker(
         "dns-forwarder",

@@ -1,4 +1,4 @@
-use super::ipc::{DhcpClientToParentMsg, recv_msg};
+use super::ipc::{DhcpClientToParentMsg, async_unix_stream, recv_msg};
 use super::utils::{
     CleanOption, SharedWanLease, WanLease, mask_to_prefix_len, prefix_len_to_mask,
     setup_worker_sockets, terminate_worker,
@@ -8,8 +8,7 @@ use crate::workers::dhcp_client::DhcpError;
 use futures_util::TryStreamExt;
 use log::{error, info, warn};
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::io::OwnedFd;
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
@@ -84,14 +83,12 @@ async fn clear_parent_lease(lease_state: &SharedWanLease, wan_interface: &str) {
 }
 
 fn start_parent_supervisor_task(
-    parent_ipc_fd: RawFd,
+    parent_ipc_fd: OwnedFd,
     child_pid: u32,
     wan_interface: String,
     lease_state: SharedWanLease,
 ) -> Result<JoinHandle<()>, ServiceError> {
-    let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
-    std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
-    let parent_ipc_stream = UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let parent_ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
 
     let handle = tokio::spawn(run_parent_dhcp_monitor(
         parent_ipc_stream,
@@ -151,17 +148,17 @@ async fn run_parent_dhcp_monitor(
 
 fn setup_dhcp_client_attempt(
     wan_interface: &str,
-) -> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
-    let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) = setup_worker_sockets(wan_interface)
+) -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> {
+    let (raw_socket_fd, parent_ipc, child_ipc) = setup_worker_sockets(wan_interface)
         .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
 
     let worker_service = crate::cli::WorkerService::DhcpClient {
-        ipc_fd: child_ipc_fd,
-        raw_socket_fd,
+        ipc_fd: child_ipc.into(),
+        raw_socket_fd: raw_socket_fd.into(),
         wan_interface: wan_interface.to_string(),
     };
 
-    Ok((worker_service, parent_ipc_fd))
+    Ok((worker_service, parent_ipc))
 }
 
 impl Service for DhcpClient {

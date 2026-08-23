@@ -4,7 +4,7 @@ use log::{debug, info, warn};
 use nix::mount::MsFlags;
 use std::fs::{self, DirEntry, File, OpenOptions};
 use std::io::{Error as IoError, Seek, SeekFrom};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,14 +32,14 @@ fn get_partition_sectors(p2_name: &str) -> Result<u64, RouterError> {
     Ok(sectors)
 }
 
-fn reread_partition_table(fd: RawFd) {
+fn reread_partition_table<F: AsFd>(fd: &F) {
     #[cfg(target_env = "musl")]
     const BLKRRPART: libc::c_int = 0x125F;
     #[cfg(not(target_env = "musl"))]
     const BLKRRPART: libc::c_ulong = 0x125F;
 
     unsafe {
-        let res = libc::ioctl(fd, BLKRRPART);
+        let res = libc::ioctl(fd.as_fd().as_raw_fd(), BLKRRPART);
         if res < 0 {
             let err = IoError::last_os_error();
             warn!(
@@ -105,7 +105,7 @@ fn write_mbr_partition_2(parent_disk: &str) -> Result<(), RouterError> {
         .map_err(|e| RouterError::Generic(format!("Failed to flush MBR: {}", e)))?;
 
     info!("[init] MBR partition 2 entry written. Rereading partition table...");
-    reread_partition_table(disk_file.as_raw_fd());
+    reread_partition_table(&disk_file);
     Ok(())
 }
 

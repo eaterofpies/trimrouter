@@ -6,7 +6,7 @@ use std::process::exit;
 pub async fn run_worker(service: WorkerService) {
     match service {
         WorkerService::SntpClient { ipc_fd } => {
-            if let Err(e) = sntp_client::run_sntp_client_worker(ipc_fd).await {
+            if let Err(e) = sntp_client::run_sntp_client_worker(ipc_fd.into()).await {
                 error!("[sntp-client-worker] ERROR: {}", e);
                 exit(1);
             }
@@ -17,8 +17,12 @@ pub async fn run_worker(service: WorkerService) {
             raw_socket_fd,
             wan_interface,
         } => {
-            if let Err(e) =
-                dhcp_client::run_dhcp_client_worker(ipc_fd, raw_socket_fd, wan_interface).await
+            if let Err(e) = dhcp_client::run_dhcp_client_worker(
+                ipc_fd.into(),
+                raw_socket_fd.into(),
+                wan_interface,
+            )
+            .await
             {
                 error!("[dhcp-client-worker] ERROR: {}", e);
                 exit(1);
@@ -31,9 +35,13 @@ pub async fn run_worker(service: WorkerService) {
             wan_interface,
             lan_ip,
         } => {
-            if let Err(e) =
-                dhcp_server::run_dhcp_server_worker(ipc_fd, raw_socket_fd, wan_interface, lan_ip)
-                    .await
+            if let Err(e) = dhcp_server::run_dhcp_server_worker(
+                ipc_fd.into(),
+                raw_socket_fd.into(),
+                wan_interface,
+                lan_ip,
+            )
+            .await
             {
                 error!("[dhcp-server-worker] ERROR: {}", e);
                 exit(1);
@@ -45,9 +53,12 @@ pub async fn run_worker(service: WorkerService) {
             dns_socket_fd,
             upstream_socket_fd,
         } => {
-            if let Err(e) =
-                dns_forwarder::run_dns_forwarder_worker(ipc_fd, dns_socket_fd, upstream_socket_fd)
-                    .await
+            if let Err(e) = dns_forwarder::run_dns_forwarder_worker(
+                ipc_fd.into(),
+                dns_socket_fd.into(),
+                upstream_socket_fd.into(),
+            )
+            .await
             {
                 error!("[dns-forwarder-worker] ERROR: {}", e);
                 exit(1);

@@ -11,7 +11,7 @@ use dhcproto::{Encodable, Encoder};
 use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
@@ -571,11 +571,11 @@ async fn monitor_parent_ipc(
 }
 
 pub async fn run_dhcp_client_worker(
-    ipc_fd: RawFd,
-    raw_socket_fd: RawFd,
+    ipc_fd: OwnedFd,
+    raw_socket_fd: OwnedFd,
     wan_interface: String,
 ) -> Result<(), std::io::Error> {
-    let socket = RawPacketSocket::from_raw_fd(raw_socket_fd)?;
+    let socket = RawPacketSocket::from_owned_fd(raw_socket_fd)?;
     let mac = match get_interface_mac(&wan_interface).await {
         Ok(m) => m,
         Err(e) => {

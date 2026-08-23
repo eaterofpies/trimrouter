@@ -1,14 +1,12 @@
-use super::ipc::{DnsParentToWorkerMsg, send_msg};
+use super::ipc::{DnsParentToWorkerMsg, async_unix_stream, send_msg};
 use super::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
 use super::{ExternalWorker, Service, ServiceError};
 use log::info;
 use std::io::{Error as IoError, ErrorKind};
 use std::net::{Ipv4Addr, UdpSocket};
-use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
@@ -106,14 +104,12 @@ async fn update_upstream_resolvers(
 }
 
 fn start_parent_dns_monitor(
-    parent_ipc_fd: RawFd,
+    parent_ipc_fd: OwnedFd,
     child_pid: u32,
     lease_state: SharedWanLease,
     shutdown_rx: Receiver<bool>,
 ) -> Result<JoinHandle<()>, ServiceError> {
-    let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
-    std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
-    let ipc_stream = UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
     let shared_ipc_writer = Arc::new(Mutex::new(ipc_writer));
 
@@ -128,20 +124,18 @@ fn start_parent_dns_monitor(
     Ok(handle)
 }
 
-fn setup_dns_forwarder_attempt() -> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
-    let (parent_ipc_fd, child_ipc_fd) = create_ipc_fds()?;
+fn setup_dns_forwarder_attempt() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> {
+    let (parent_ipc, child_ipc) = create_ipc_fds()?;
     let dns_socket = UdpSocket::bind(format!("0.0.0.0:{}", DNS_PORT))?;
-    let dns_socket_fd = dns_socket.into_raw_fd();
     let upstream_socket = UdpSocket::bind("0.0.0.0:0")?;
-    let upstream_socket_fd = upstream_socket.into_raw_fd();
 
     Ok((
         crate::cli::WorkerService::DnsForwarder {
-            ipc_fd: child_ipc_fd,
-            dns_socket_fd,
-            upstream_socket_fd,
+            ipc_fd: child_ipc.into(),
+            dns_socket_fd: dns_socket.into(),
+            upstream_socket_fd: upstream_socket.into(),
         },
-        parent_ipc_fd,
+        parent_ipc,
     ))
 }
 

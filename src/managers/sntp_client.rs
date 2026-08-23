@@ -1,15 +1,15 @@
-use super::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
+use super::ipc::{
+    SntpClientToParentMsg, SntpParentToWorkerMsg, async_unix_stream, recv_msg, send_msg,
+};
 use super::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
 use super::{ExternalWorker, Service, ServiceError};
 use log::{error, info};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};
 use std::io::Error as IoError;
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
@@ -121,14 +121,12 @@ fn set_system_clock(seconds: i64, nanoseconds: i64) {
 }
 
 fn start_parent_sntp_monitor(
-    parent_ipc_fd: RawFd,
+    parent_ipc_fd: OwnedFd,
     child_pid: u32,
     lease_state: SharedWanLease,
     shutdown_rx: Receiver<bool>,
 ) -> Result<JoinHandle<()>, ServiceError> {
-    let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
-    std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
-    let ipc_stream = UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
     let shared_ipc_writer = Arc::new(Mutex::new(ipc_writer));
 
@@ -145,13 +143,13 @@ fn start_parent_sntp_monitor(
     Ok(handle)
 }
 
-fn setup_sntp_attempt() -> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
-    let (parent_ipc_fd, child_ipc_fd) = create_ipc_fds()?;
+fn setup_sntp_attempt() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> {
+    let (parent_ipc, child_ipc) = create_ipc_fds()?;
     Ok((
         crate::cli::WorkerService::SntpClient {
-            ipc_fd: child_ipc_fd,
+            ipc_fd: child_ipc.into(),
         },
-        parent_ipc_fd,
+        parent_ipc,
     ))
 }
 

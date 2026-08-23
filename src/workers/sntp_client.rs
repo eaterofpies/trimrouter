@@ -5,7 +5,7 @@ use crate::managers::utils::{
 use log::{error, info, warn};
 use std::io::Error as IoError;
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -19,7 +19,7 @@ const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(900); // 15 minutes
 const NTP_PORT: u16 = 123;
 const WAN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-pub async fn run_sntp_client_worker(ipc_fd: RawFd) -> Result<(), IoError> {
+pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
     run_sandboxed_worker(
         "sntp-client",
         SNTP_UID,

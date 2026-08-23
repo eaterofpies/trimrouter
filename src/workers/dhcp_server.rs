@@ -11,7 +11,7 @@ use pnet::packet::ethernet::EthernetPacket;
 use pnet::util::MacAddr;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
 use std::net::Ipv4Addr;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
@@ -180,8 +180,8 @@ async fn update_lease_from_neighbor(
 }
 
 pub async fn run_dhcp_server_worker(
-    ipc_fd: RawFd,
-    raw_socket_fd: RawFd,
+    ipc_fd: OwnedFd,
+    raw_socket_fd: OwnedFd,
     lan_interface: String,
     lan_ip: String,
 ) -> Result<(), std::io::Error> {
@@ -268,7 +268,7 @@ async fn run_dhcp_server_ipc_monitor(
 }
 
 async fn receive_next_packet(
-    async_sock: &AsyncFd<RawFd>,
+    async_sock: &AsyncFd<OwnedFd>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     buf: &mut [u8],
 ) -> Result<Option<usize>, std::io::Error> {
@@ -290,7 +290,7 @@ async fn receive_next_packet(
 }
 
 async fn run_server_loop(
-    async_sock: Arc<AsyncFd<RawFd>>,
+    async_sock: Arc<AsyncFd<OwnedFd>>,
     config: Arc<ServerConfig>,
     leases: Arc<tokio::sync::Mutex<LeaseTable>>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -319,7 +319,7 @@ async fn run_server_loop(
 
 async fn process_incoming_packet(
     buf: Vec<u8>,
-    async_sock: Arc<AsyncFd<RawFd>>,
+    async_sock: Arc<AsyncFd<OwnedFd>>,
     config: Arc<ServerConfig>,
     leases: Arc<tokio::sync::Mutex<LeaseTable>>,
 ) {
@@ -431,7 +431,7 @@ fn build_dhcp_reply_payload(
 }
 
 async fn send_dhcp_nak(
-    async_sock: &AsyncFd<RawFd>,
+    async_sock: &AsyncFd<OwnedFd>,
     dhcp: &Message,
     client_mac: MacAddr,
     config: &ServerConfig,
@@ -583,7 +583,7 @@ async fn probe_and_allocate_ip(
 }
 
 async fn handle_dhcp_discover(
-    async_sock: Arc<AsyncFd<RawFd>>,
+    async_sock: Arc<AsyncFd<OwnedFd>>,
     config: &ServerConfig,
     dhcp: &Message,
     client_mac: MacAddr,
@@ -723,7 +723,7 @@ async fn confirm_lease(
 }
 
 async fn send_dhcp_ack(
-    async_sock: &AsyncFd<RawFd>,
+    async_sock: &AsyncFd<OwnedFd>,
     dhcp: &Message,
     client_mac: MacAddr,
     leased_ip: Ipv4Addr,
@@ -753,7 +753,7 @@ async fn send_dhcp_ack(
 }
 
 async fn handle_dhcp_request(
-    async_sock: Arc<AsyncFd<RawFd>>,
+    async_sock: Arc<AsyncFd<OwnedFd>>,
     config: &ServerConfig,
     dhcp: &Message,
     client_mac: MacAddr,

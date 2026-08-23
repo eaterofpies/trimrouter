@@ -1,4 +1,4 @@
-use super::ipc::{DhcpServerParentToWorkerMsg, send_msg};
+use super::ipc::{DhcpServerParentToWorkerMsg, async_unix_stream, send_msg};
 use super::utils::{setup_worker_sockets, terminate_worker};
 use super::{ExternalWorker, Service, ServiceError};
 use futures_util::{Stream, StreamExt};
@@ -7,10 +7,8 @@ use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
-use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
@@ -37,13 +35,11 @@ impl DhcpServer {
 }
 
 fn start_parent_arp_listener(
-    parent_ipc_fd: RawFd,
+    parent_ipc_fd: OwnedFd,
     child_pid: u32,
     shutdown_rx: Receiver<bool>,
 ) -> Result<JoinHandle<()>, ServiceError> {
-    let std_stream = unsafe { StdUnixStream::from_raw_fd(parent_ipc_fd) };
-    std_stream.set_nonblocking(true).map_err(ServiceError::Io)?;
-    let ipc_stream = UnixStream::from_std(std_stream).map_err(ServiceError::Io)?;
+    let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (_, ipc_writer) = ipc_stream.into_split();
     let shared_ipc_writer = Arc::new(Mutex::new(ipc_writer));
 
@@ -124,17 +120,17 @@ async fn run_parent_dhcp_server_monitor<S, A>(
 fn setup_dhcp_server_attempt(
     lan_interface: &str,
     lan_ip: &str,
-) -> Result<(crate::cli::WorkerService, RawFd), ServiceError> {
-    let (raw_socket_fd, parent_ipc_fd, child_ipc_fd) = setup_worker_sockets(lan_interface)
+) -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> {
+    let (raw_socket_fd, parent_ipc, child_ipc) = setup_worker_sockets(lan_interface)
         .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
     Ok((
         crate::cli::WorkerService::DhcpServer {
-            ipc_fd: child_ipc_fd,
-            raw_socket_fd,
+            ipc_fd: child_ipc.into(),
+            raw_socket_fd: raw_socket_fd.into(),
             wan_interface: lan_interface.to_string(),
             lan_ip: lan_ip.to_string(),
         },
-        parent_ipc_fd,
+        parent_ipc,
     ))
 }
 
