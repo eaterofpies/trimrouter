@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::watch::{self, Receiver, Sender};
 use tokio::task::{self, JoinHandle};
 
@@ -132,9 +133,9 @@ impl ExternalWorker {
             }
         };
 
-        let spawn_time = std::time::Instant::now();
+        let spawn_time = Instant::now();
         let _ = monitor_handle.await;
-        if spawn_time.elapsed() >= std::time::Duration::from_secs(60) {
+        if spawn_time.elapsed() >= Duration::from_secs(60) {
             *attempt = 0;
         }
     }

@@ -1,7 +1,8 @@
 use crate::services::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
 use crate::services::utils::{
-    SNTP_GID, SNTP_UID, resolve_dns_a_record, run_sandboxed_worker, wait_shutdown,
+    NTP_PORT, SNTP_GID, SNTP_UID, resolve_dns_a_record, run_sandboxed_worker, wait_shutdown,
 };
+use chrono::{DateTime, Utc};
 use log::{error, info, warn};
 use std::io::Error as IoError;
 use std::net::{IpAddr, SocketAddr};
@@ -16,7 +17,6 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
 const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(900); // 15 minutes
 
-const NTP_PORT: u16 = 123;
 const WAN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
@@ -112,7 +112,7 @@ async fn handle_sntp_iteration(
             );
 
             // Send time spec back to parent over IPC
-            let duration = chrono_dt.signed_duration_since(chrono::DateTime::UNIX_EPOCH);
+            let duration = chrono_dt.signed_duration_since(DateTime::UNIX_EPOCH);
             if let Ok(std_duration) = duration.to_std() {
                 let msg = SntpClientToParentMsg::SetSystemTime {
                     seconds: std_duration.as_secs() as i64,
@@ -165,7 +165,7 @@ async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut Receiver<bool>)
     }
 }
 
-async fn sync_time() -> Result<chrono::DateTime<chrono::Utc>, String> {
+async fn sync_time() -> Result<DateTime<Utc>, String> {
     // Resolve time.google.com manually via local DNS forwarder
     let ntp_server_ip = resolve_dns_a_record("time.google.com").await?;
     let ntp_addr = SocketAddr::new(IpAddr::V4(ntp_server_ip), NTP_PORT);

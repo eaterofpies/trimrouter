@@ -1,6 +1,7 @@
 use crate::services::ipc::{DnsParentToWorkerMsg, recv_msg};
 use crate::services::utils::{
-    DNS_FORWARDER_GID, DNS_FORWARDER_UID, async_udp_socket, run_sandboxed_worker, wait_shutdown,
+    DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_udp_socket, run_sandboxed_worker,
+    wait_shutdown,
 };
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
@@ -16,7 +17,6 @@ use tokio::sync::watch::{Receiver, Sender, channel};
 // =========================================================================
 // DNS Constants & Config
 // =========================================================================
-const DNS_PORT: u16 = 53;
 const DNS_HEADER_SIZE: usize = 12;
 
 const DEFAULT_TTL_SECS: u32 = 30;
@@ -312,11 +312,11 @@ async fn handle_query_loop_error(e: IoError, shutdown_rx: &mut Receiver<bool>) {
 
 async fn handle_dns_query(
     query: Vec<u8>,
-    src: std::net::SocketAddr,
-    socket: Arc<tokio::net::UdpSocket>,
+    src: SocketAddr,
+    socket: Arc<UdpSocket>,
     cache: SharedCache,
     upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
-    upstream_socket: Arc<tokio::net::UdpSocket>,
+    upstream_socket: Arc<UdpSocket>,
     pending_queries: PendingQueries,
 ) {
     if query.len() < DNS_HEADER_SIZE {
@@ -478,7 +478,7 @@ async fn forward_query(
     forwarded_query[0] = xid_bytes[0];
     forwarded_query[1] = xid_bytes[1];
 
-    let upstream_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(upstream_dns), DNS_PORT);
+    let upstream_addr = SocketAddr::new(IpAddr::V4(upstream_dns), DNS_PORT);
     if upstream_socket
         .send_to(&forwarded_query, upstream_addr)
         .await

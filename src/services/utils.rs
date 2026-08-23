@@ -41,6 +41,10 @@ pub const DHCP_SERVER_GID: u32 = 10003;
 pub const DNS_FORWARDER_UID: u32 = 10004;
 pub const DNS_FORWARDER_GID: u32 = 10004;
 
+// Standard network protocol ports
+pub const DNS_PORT: u16 = 53;
+pub const NTP_PORT: u16 = 123;
+
 // =========================================================================
 // Shared WAN Lease Info
 // =========================================================================
@@ -163,7 +167,8 @@ pub fn open_raw_socket(ifname: &str) -> Result<OwnedFd, String> {
         .map_err(|e| format!("Failed to set nonblocking mode: {}", e))?;
 
     // Resolve interface name to its index
-    let c_ifname = std::ffi::CString::new(ifname).unwrap();
+    let c_ifname =
+        std::ffi::CString::new(ifname).map_err(|e| format!("Invalid interface name: {}", e))?;
     let if_index = unsafe { libc::if_nametoindex(c_ifname.as_ptr()) };
     if if_index == 0 {
         return Err(format!("Interface not found: {}", ifname));
@@ -340,7 +345,6 @@ pub fn get_timestamp_prefix() -> String {
 }
 
 const LOCALHOST: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-const DNS_PORT: u16 = 53;
 const LOCAL_DNS_BIND: &str = "127.0.0.1:0";
 
 fn find_first_a_record(answers: Vec<dns_parser::ResourceRecord<'_>>) -> Option<std::net::Ipv4Addr> {
