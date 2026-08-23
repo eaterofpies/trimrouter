@@ -94,9 +94,10 @@ async fn run_parent_dhcp_server_monitor<S, A>(
                             NeighbourAttribute::Destination(NeighbourAddress::Inet(ip)) => {
                                 ip_opt = Some(ip);
                             }
-                            NeighbourAttribute::LinkLayerAddress(mac_bytes) if mac_bytes.len() == 6 => {
-                                let bytes: [u8; 6] = mac_bytes.try_into().unwrap();
-                                mac_opt = Some(bytes);
+                            NeighbourAttribute::LinkLayerAddress(mac_bytes) => {
+                                if let Ok(bytes) = mac_bytes.try_into() {
+                                    mac_opt = Some(bytes);
+                                }
                             }
                             _ => {}
                         }
@@ -107,7 +108,13 @@ async fn run_parent_dhcp_server_monitor<S, A>(
                             mac_address: mac,
                         };
                         let mut writer = shared_ipc_writer.lock().await;
-                        let _ = send_msg(&mut *writer, &ipc_msg).await;
+                        if let Err(e) = send_msg(&mut *writer, &ipc_msg).await {
+                            log::error!(
+                                "[dhcp-server-parent] Failed to send neighbor update over IPC: {}",
+                                e
+                            );
+                            break;
+                        }
                     }
                 }
             }
