@@ -70,11 +70,22 @@ fn setup_console_io(sys: &RealSystem) {
 }
 
 fn setup_chroot_jail() {
-    fs::create_dir_all(CHROOT_JAIL_PATH).expect("Failed to create chroot jail directory");
+    if let Err(e) = fs::create_dir_all(CHROOT_JAIL_PATH) {
+        warn!(
+            "[init] Warning: Failed to create chroot jail directory: {}",
+            e
+        );
+        return;
+    }
     if let Ok(meta) = metadata(CHROOT_JAIL_PATH) {
         let mut perms = meta.permissions();
         perms.set_mode(0o555); // rx-rx-rx
-        set_permissions(CHROOT_JAIL_PATH, perms).expect("Failed to set chroot jail permissions");
+        if let Err(e) = set_permissions(CHROOT_JAIL_PATH, perms) {
+            warn!(
+                "[init] Warning: Failed to set chroot jail permissions: {}",
+                e
+            );
+        }
     }
 }
 

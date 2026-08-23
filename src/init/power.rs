@@ -1,5 +1,5 @@
 use super::system::PowerOps;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use nix::sys::reboot::RebootMode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,9 +9,18 @@ use tokio::time::{Duration, sleep};
 pub async fn start_signal_monitor<S: PowerOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     debug!("[init] Starting system signal monitor...");
 
-    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to bind SIGINT");
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to bind SIGTERM");
-    let mut sigpwr = signal(SignalKind::from_raw(libc::SIGPWR)).expect("Failed to bind SIGPWR");
+    let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
+        error!("[init] Failed to bind SIGINT");
+        return;
+    };
+    let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+        error!("[init] Failed to bind SIGTERM");
+        return;
+    };
+    let Ok(mut sigpwr) = signal(SignalKind::from_raw(libc::SIGPWR)) else {
+        error!("[init] Failed to bind SIGPWR");
+        return;
+    };
 
     let received_signal = tokio::select! {
         _ = sigint.recv() => "SIGINT (Interrupt)",
