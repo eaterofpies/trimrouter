@@ -217,7 +217,7 @@ impl ExternalWorker {
         Ok(child)
     }
 
-    fn spawn_process(
+    pub(crate) fn spawn_process(
         service_name: &str,
         args: &[&str],
         child_fds: &[BorrowedFd<'_>],

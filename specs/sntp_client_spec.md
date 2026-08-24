@@ -9,11 +9,12 @@ The SNTP Client is an embedded service in `trimrouter` that periodically synchro
 
 ## 1. Lifecycle and Dependencies
 
-The SNTP client relies on active network connectivity and DNS resolution:
+The SNTP service uses a decoupled, event-driven supervisor pattern:
 
-1.  **WAN Dependency**: The service loop remains idle in a suspended state (`wait_for_wan`) until a valid IP address is assigned to the WAN interface.
-2.  **DNS Dependency**: Resolves the domain `time.google.com` dynamically using the local DNS forwarder before initiating the NTP connection.
-3.  **Shutdown Watch**: Monitors a watch channel for shutdown events to exit the loop cleanly and release resources.
+1.  **Dynamic Worker Lifecycle**: The privileged parent supervisor (`SntpClient`) monitors the WAN lease watch channel (`WanLeaseReceiver`). When a valid WAN IP lease is acquired, the supervisor dynamically spawns the sandboxed worker child process. When the WAN lease is cleared or lost, the supervisor automatically stops and terminates the worker, ensuring zero CPU and memory resources are consumed when WAN is inactive.
+2.  **Autonomous Sandboxed Worker**: The child worker has no dependency on interface states or IPC status messages. Once started, it queries NTP and reports the time back to the parent over IPC, retrying with exponential backoff on transient network failures.
+3.  **DNS Dependency**: Resolves the domain `time.google.com` dynamically using the local DNS forwarder before initiating the NTP connection.
+4.  **Shutdown Watch**: The supervisor cleanly stops the worker via `SIGTERM` when the service is stopped.
 
 ---
 

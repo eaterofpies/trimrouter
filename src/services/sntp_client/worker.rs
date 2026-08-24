@@ -1,4 +1,4 @@
-use crate::services::ipc::{SntpClientToParentMsg, SntpParentToWorkerMsg, recv_msg, send_msg};
+use crate::services::ipc::{SntpClientToParentMsg, send_msg};
 use crate::services::utils::{
     NTP_PORT, SNTP_GID, SNTP_UID, resolve_dns_a_record, run_sandboxed_worker, wait_shutdown,
 };
@@ -7,17 +7,15 @@ use log::{error, info, warn};
 use std::io::Error as IoError;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::io::OwnedFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::watch::{Receiver, Sender, channel};
+use tokio::sync::watch::{Receiver, channel};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
 const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(900); // 15 minutes
-
-const WAN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
     run_sandboxed_worker(
@@ -26,26 +24,12 @@ pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
         SNTP_GID,
         ipc_fd,
         |ipc| async move {
-            let (ipc_reader, shared_ipc_writer) = (ipc.reader, ipc.writer);
-            let (shutdown_tx, mut shutdown_rx) = channel(false);
-            let wan_active = Arc::new(Mutex::new(false));
-
-            // Monitor parent messages
-            tokio::spawn(run_sntp_worker_ipc_monitor(
-                ipc_reader,
-                wan_active.clone(),
-                shutdown_tx.clone(),
-            ));
-
+            let shared_ipc_writer = ipc.writer;
+            let (_shutdown_tx, mut shutdown_rx) = channel(false);
             let mut current_retry_delay = RETRY_INTERVAL;
 
-            loop {
-                if *shutdown_rx.borrow() {
-                    break;
-                }
-
+            while !*shutdown_rx.borrow() {
                 if !handle_sntp_iteration(
-                    &wan_active,
                     &shared_ipc_writer,
                     &mut shutdown_rx,
                     &mut current_retry_delay,
@@ -62,45 +46,13 @@ pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
     .await
 }
 
-async fn run_sntp_worker_ipc_monitor(
-    mut ipc_reader: OwnedReadHalf,
-    wan_active: Arc<Mutex<bool>>,
-    shutdown_tx: Sender<bool>,
-) {
-    loop {
-        match recv_msg::<SntpParentToWorkerMsg, _>(&mut ipc_reader).await {
-            Ok(Some(SntpParentToWorkerMsg::SetWanStatus { active })) => {
-                let mut lock = wan_active.lock().unwrap();
-                *lock = active;
-            }
-            Ok(None) => {
-                info!("[sntp-client-worker] Parent closed IPC. Shutting down.");
-                let _ = shutdown_tx.send(true);
-                break;
-            }
-            Err(e) => {
-                error!("[sntp-client-worker] IPC read error: {}. Shutting down.", e);
-                let _ = shutdown_tx.send(true);
-                break;
-            }
-        }
-    }
-}
-
 async fn handle_sntp_iteration(
-    wan_active: &Arc<Mutex<bool>>,
     ipc_writer: &Arc<TokioMutex<OwnedWriteHalf>>,
     shutdown_rx: &mut Receiver<bool>,
     current_retry_delay: &mut Duration,
 ) -> bool {
-    if !wait_for_wan(wan_active, shutdown_rx).await {
-        return false;
-    }
-
     let sync_res = tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => {
-            return false;
-        }
+        _ = wait_shutdown(shutdown_rx) => return false,
         res = sync_time() => res,
     };
 
@@ -110,20 +62,7 @@ async fn handle_sntp_iteration(
                 "[sntp-client-worker] Successfully fetched NTP time: {}",
                 chrono_dt
             );
-
-            // Send time spec back to parent over IPC
-            let duration = chrono_dt.signed_duration_since(DateTime::UNIX_EPOCH);
-            if let Ok(std_duration) = duration.to_std() {
-                let msg = SntpClientToParentMsg::SetSystemTime {
-                    seconds: std_duration.as_secs() as i64,
-                    nanoseconds: std_duration.subsec_nanos() as i64,
-                };
-                let mut writer = ipc_writer.lock().await;
-                if let Err(e) = send_msg(&mut *writer, &msg).await {
-                    error!("[sntp-client] Failed to send SetSystemTime IPC msg: {}", e);
-                }
-            }
-
+            send_time_to_parent(ipc_writer, chrono_dt).await;
             *current_retry_delay = RETRY_INTERVAL;
             sleep_or_shutdown(SYNC_INTERVAL, shutdown_rx).await
         }
@@ -140,20 +79,19 @@ async fn handle_sntp_iteration(
     }
 }
 
-async fn wait_for_wan(wan_active: &Arc<Mutex<bool>>, shutdown_rx: &mut Receiver<bool>) -> bool {
-    loop {
-        let has_wan = {
-            let active = wan_active.lock().unwrap();
-            *active
+async fn send_time_to_parent(
+    ipc_writer: &Arc<TokioMutex<OwnedWriteHalf>>,
+    chrono_dt: DateTime<Utc>,
+) {
+    let duration = chrono_dt.signed_duration_since(DateTime::UNIX_EPOCH);
+    if let Ok(std_duration) = duration.to_std() {
+        let msg = SntpClientToParentMsg::SetSystemTime {
+            seconds: std_duration.as_secs() as i64,
+            nanoseconds: std_duration.subsec_nanos() as i64,
         };
-        if has_wan {
-            return true;
-        }
-        tokio::select! {
-            _ = wait_shutdown(shutdown_rx) => {
-                return false;
-            }
-            _ = tokio::time::sleep(WAN_CHECK_INTERVAL) => {}
+        let mut writer = ipc_writer.lock().await;
+        if let Err(e) = send_msg(&mut *writer, &msg).await {
+            error!("[sntp-client] Failed to send SetSystemTime IPC msg: {}", e);
         }
     }
 }
@@ -214,45 +152,5 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(!result); // should return false (shutdown triggered)
-    }
-
-    #[tokio::test]
-    async fn test_wait_for_wan_ready() {
-        let (_shutdown_tx, mut shutdown_rx) = channel(false);
-        let wan_active = Arc::new(Mutex::new(true));
-
-        let result = wait_for_wan(&wan_active, &mut shutdown_rx).await;
-        assert!(result); // should return true instantly
-    }
-
-    #[tokio::test]
-    async fn test_wait_for_wan_delayed() {
-        let (_shutdown_tx, mut shutdown_rx) = channel(false);
-        let wan_active = Arc::new(Mutex::new(false));
-        let wan_active_clone = wan_active.clone();
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let mut lock = wan_active_clone.lock().unwrap();
-            *lock = true;
-        });
-
-        let result = wait_for_wan(&wan_active, &mut shutdown_rx).await;
-        assert!(result); // should block and then return true
-    }
-
-    #[tokio::test]
-    async fn test_wait_for_wan_shutdown() {
-        let (shutdown_tx, mut shutdown_rx) = channel(false);
-        let wan_active = Arc::new(Mutex::new(false));
-
-        let handle = tokio::spawn(async move { wait_for_wan(&wan_active, &mut shutdown_rx).await });
-
-        // Trigger shutdown while waiting
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        shutdown_tx.send(true).unwrap();
-
-        let result = handle.await.unwrap();
-        assert!(!result); // should return false on shutdown
     }
 }

@@ -43,11 +43,6 @@ pub enum DhcpServerParentToWorkerMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub enum SntpParentToWorkerMsg {
-    SetWanStatus { active: bool },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DhcpClientToParentMsg {
     ApplyWanLease {
         ip_address: Ipv4Addr,
