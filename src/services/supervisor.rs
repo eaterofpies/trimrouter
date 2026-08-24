@@ -51,12 +51,56 @@ pub trait Service: Send + Sync {
 }
 
 // =========================================================================
+// Service Controller
+// =========================================================================
+#[derive(Default)]
+pub struct ServiceController {
+    shutdown_tx: Option<Sender<bool>>,
+    task_handle: Option<JoinHandle<()>>,
+}
+
+impl ServiceController {
+    pub const fn new() -> Self {
+        Self {
+            shutdown_tx: None,
+            task_handle: None,
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.task_handle.is_some()
+    }
+
+    pub fn start<F, Fut>(&mut self, spawn_fn: F) -> Result<(), ServiceError>
+    where
+        F: FnOnce(Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if self.is_running() {
+            return Err(ServiceError::AlreadyRunning);
+        }
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(spawn_fn(shutdown_rx));
+        self.shutdown_tx = Some(shutdown_tx);
+        self.task_handle = Some(handle);
+        Ok(())
+    }
+
+    pub async fn stop(&mut self) -> Result<(), ServiceError> {
+        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
+        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
+        let _ = tx.send(true);
+        let _ = handle.await;
+        Ok(())
+    }
+}
+
+// =========================================================================
 // External Worker Process Management
 // =========================================================================
 pub struct ExternalWorker {
     service_name: &'static str,
-    shutdown_tx: Option<Sender<bool>>,
-    task_handle: Option<JoinHandle<()>>,
+    controller: ServiceController,
     child_pid: Arc<AtomicU32>,
 }
 
@@ -64,23 +108,13 @@ impl ExternalWorker {
     pub fn new(service_name: &'static str) -> Self {
         Self {
             service_name,
-            shutdown_tx: None,
-            task_handle: None,
+            controller: ServiceController::new(),
             child_pid: Arc::new(AtomicU32::new(0)),
         }
     }
 
     pub(crate) fn get_worker_pid(&self) -> u32 {
         self.child_pid.load(Ordering::SeqCst)
-    }
-
-    fn is_running(&self) -> bool {
-        self.task_handle.is_some()
-    }
-
-    fn start(&mut self, shutdown_tx: Sender<bool>, handle: JoinHandle<()>) {
-        self.shutdown_tx = Some(shutdown_tx);
-        self.task_handle = Some(handle);
     }
 
     async fn attempt_supervised_run<S, M>(
@@ -151,15 +185,10 @@ impl ExternalWorker {
             + Send
             + 'static,
     {
-        if self.is_running() {
-            return Err(ServiceError::AlreadyRunning);
-        }
-
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let service_name = self.service_name;
         let child_pid_atomic = self.child_pid.clone();
 
-        let handle = tokio::spawn(async move {
+        self.controller.start(move |mut shutdown_rx| async move {
             let mut attempt = 0;
             while !*shutdown_rx.borrow() {
                 if !utils::handle_supervisor_restart_delay(
@@ -182,18 +211,11 @@ impl ExternalWorker {
                 )
                 .await;
             }
-        });
-
-        self.start(shutdown_tx, handle);
-        Ok(())
+        })
     }
 
     pub(crate) async fn stop(&mut self) -> Result<(), ServiceError> {
-        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
         let child_pid = self.child_pid.swap(0, Ordering::SeqCst);
-
-        let _ = tx.send(true);
         if child_pid != 0 {
             info!(
                 "[{}-parent] Stopping worker process PID {}",
@@ -202,8 +224,7 @@ impl ExternalWorker {
             utils::terminate_worker(child_pid).await;
         }
 
-        let _ = handle.await;
-        Ok(())
+        self.controller.stop().await
     }
 
     fn spawn_and_track_process(

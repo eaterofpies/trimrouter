@@ -1,26 +1,23 @@
 use crate::cli::WorkerService;
 use crate::services::ipc::{SntpClientToParentMsg, async_unix_stream, recv_msg};
-use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
+use crate::services::supervisor::{ExternalWorker, Service, ServiceController, ServiceError};
 use crate::services::utils::{WanLeaseReceiver, create_ipc_fds, terminate_worker};
 use log::{error, info};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::watch::{Receiver, Sender, channel};
-use tokio::task::JoinHandle;
+use tokio::sync::watch::Receiver;
 
 pub struct SntpClient {
     lease_rx: WanLeaseReceiver,
-    shutdown_tx: Option<Sender<bool>>,
-    task_handle: Option<JoinHandle<()>>,
+    controller: ServiceController,
 }
 
 impl SntpClient {
     pub fn new(lease_rx: WanLeaseReceiver) -> Self {
         Self {
             lease_rx,
-            shutdown_tx: None,
-            task_handle: None,
+            controller: ServiceController::new(),
         }
     }
 }
@@ -113,25 +110,13 @@ fn set_system_clock(seconds: i64, nanoseconds: i64) {
 
 impl Service for SntpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        let (shutdown_tx, shutdown_rx) = channel(false);
         let lease_rx = self.lease_rx.clone();
-
-        let handle = tokio::spawn(async move {
+        self.controller.start(|shutdown_rx| async move {
             run_sntp_manager_loop(lease_rx, shutdown_rx).await;
-        });
-
-        self.shutdown_tx = Some(shutdown_tx);
-        self.task_handle = Some(handle);
-        Ok(())
+        })
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(true);
-        }
-        if let Some(handle) = self.task_handle.take() {
-            let _ = handle.await;
-        }
-        Ok(())
+        self.controller.stop().await
     }
 }

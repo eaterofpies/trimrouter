@@ -1,4 +1,5 @@
 use crate::network;
+use crate::services::supervisor::ServiceController;
 use crate::services::utils::{WanLeaseReceiver, mask_to_prefix_len};
 use crate::services::{DhcpServer, Service, ServiceError};
 use futures_util::StreamExt;
@@ -7,16 +8,13 @@ use log::{debug, error, info, warn};
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
-use tokio::sync::watch::Sender;
-use tokio::task::JoinHandle;
 
 pub struct LanManager {
     lan_interface: String,
     initial_ip: String,
     backup_ip: String,
     lease_rx: WanLeaseReceiver,
-    shutdown_tx: Option<Sender<bool>>,
-    task_handle: Option<JoinHandle<()>>,
+    controller: ServiceController,
 }
 
 impl LanManager {
@@ -31,36 +29,25 @@ impl LanManager {
             initial_ip,
             backup_ip,
             lease_rx,
-            shutdown_tx: None,
-            task_handle: None,
+            controller: ServiceController::new(),
         }
     }
 }
 
 impl Service for LanManager {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        self.shutdown_tx = Some(shutdown_tx);
-
         let lan_interface = self.lan_interface.clone();
         let initial_ip = self.initial_ip.clone();
         let backup_ip = self.backup_ip.clone();
         let lease_rx = self.lease_rx.clone();
 
-        let handle = tokio::spawn(async move {
+        self.controller.start(|shutdown_rx| async move {
             run_lan_manager_loop(lan_interface, initial_ip, backup_ip, lease_rx, shutdown_rx).await;
-        });
-
-        self.task_handle = Some(handle);
-        Ok(())
+        })
     }
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
-        let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
-        let _ = tx.send(true);
-        let _ = handle.await;
-        Ok(())
+        self.controller.stop().await
     }
 }
 
