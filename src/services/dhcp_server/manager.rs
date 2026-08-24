@@ -8,9 +8,7 @@ use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
 use std::os::unix::io::OwnedFd;
-use std::sync::Arc;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 
@@ -41,7 +39,6 @@ fn start_parent_arp_listener(
 ) -> Result<JoinHandle<()>, ServiceError> {
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (_, ipc_writer) = ipc_stream.into_split();
-    let shared_ipc_writer = Arc::new(Mutex::new(ipc_writer));
 
     let connection_fut = rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]);
     let (connection, _handle, messages) = match connection_fut {
@@ -58,7 +55,7 @@ fn start_parent_arp_listener(
     let handle = tokio::spawn(run_parent_dhcp_server_monitor(
         child_pid,
         messages,
-        shared_ipc_writer,
+        ipc_writer,
         shutdown_rx,
     ));
 
@@ -68,7 +65,7 @@ fn start_parent_arp_listener(
 async fn run_parent_dhcp_server_monitor<S, A>(
     child_pid: u32,
     mut messages: S,
-    shared_ipc_writer: Arc<Mutex<OwnedWriteHalf>>,
+    mut ipc_writer: OwnedWriteHalf,
     mut shutdown_rx: Receiver<bool>,
 ) where
     S: Stream<Item = (NetlinkMessage<RouteNetlinkMessage>, A)> + Unpin + Send + 'static,
@@ -107,8 +104,7 @@ async fn run_parent_dhcp_server_monitor<S, A>(
                             ip_address: ip,
                             mac_address: mac,
                         };
-                        let mut writer = shared_ipc_writer.lock().await;
-                        if let Err(e) = send_msg(&mut *writer, &ipc_msg).await {
+                        if let Err(e) = send_msg(&mut ipc_writer, &ipc_msg).await {
                             error!(
                                 "[dhcp-server-parent] Failed to send neighbor update over IPC: {}",
                                 e

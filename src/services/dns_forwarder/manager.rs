@@ -5,10 +5,8 @@ use log::info;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::unix::io::OwnedFd;
-use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 
@@ -32,7 +30,7 @@ impl DnsForwarder {
 
 async fn run_parent_dns_monitor(
     mut ipc_reader: OwnedReadHalf,
-    shared_ipc_writer: Arc<Mutex<OwnedWriteHalf>>,
+    mut ipc_writer: OwnedWriteHalf,
     child_pid: u32,
     mut lease_rx: WanLeaseReceiver,
     mut shutdown_rx: Receiver<bool>,
@@ -49,7 +47,7 @@ async fn run_parent_dns_monitor(
     {
         let initial_servers = lease_rx.borrow_and_update().dns_servers.clone();
         if !initial_servers.is_empty() {
-            let _ = update_upstream_resolvers(&shared_ipc_writer, &initial_servers).await;
+            let _ = update_upstream_resolvers(&mut ipc_writer, &initial_servers).await;
             last_dns_servers = initial_servers;
         }
     }
@@ -73,7 +71,7 @@ async fn run_parent_dns_monitor(
                 }
                 let current_servers = lease_rx.borrow_and_update().dns_servers.clone();
                 if current_servers != last_dns_servers {
-                    if update_upstream_resolvers(&shared_ipc_writer, &current_servers).await.is_err() {
+                    if update_upstream_resolvers(&mut ipc_writer, &current_servers).await.is_err() {
                         break;
                     }
                     last_dns_servers = current_servers;
@@ -86,7 +84,7 @@ async fn run_parent_dns_monitor(
 }
 
 async fn update_upstream_resolvers(
-    shared_ipc_writer: &Arc<Mutex<OwnedWriteHalf>>,
+    ipc_writer: &mut OwnedWriteHalf,
     servers: &[Ipv4Addr],
 ) -> Result<(), IoError> {
     info!(
@@ -96,8 +94,7 @@ async fn update_upstream_resolvers(
     let msg = DnsParentToWorkerMsg::SetUpstreamResolvers {
         servers: servers.to_vec(),
     };
-    let mut writer = shared_ipc_writer.lock().await;
-    send_msg(&mut *writer, &msg).await
+    send_msg(ipc_writer, &msg).await
 }
 
 fn start_parent_dns_monitor(
@@ -108,11 +105,10 @@ fn start_parent_dns_monitor(
 ) -> Result<JoinHandle<()>, ServiceError> {
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
-    let shared_ipc_writer = Arc::new(Mutex::new(ipc_writer));
 
     let handle = tokio::spawn(run_parent_dns_monitor(
         ipc_reader,
-        shared_ipc_writer,
+        ipc_writer,
         child_pid,
         lease_rx,
         shutdown_rx,
