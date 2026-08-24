@@ -42,7 +42,6 @@ impl LeaseTable {
 
     /// Inserts or replaces the lease for `mac`, updating the IP index atomically.
     pub fn insert(&mut self, mac: MacAddr, lease: ClientLease) {
-        // Release the old IP from the index if this MAC already had a lease.
         if let Some(old) = self.by_mac.get(&mac) {
             self.allocated_ips.remove(&old.ip);
         }
@@ -51,7 +50,6 @@ impl LeaseTable {
     }
 
     /// Removes the lease for `mac` and updates the IP index atomically.
-    /// Returns the removed lease, or `None` if no lease existed.
     pub fn remove(&mut self, mac: &MacAddr) -> Option<ClientLease> {
         let lease = self.by_mac.remove(mac)?;
         self.allocated_ips.remove(&lease.ip);
@@ -71,9 +69,6 @@ impl LeaseTable {
     }
 
     /// Evicts all expired leases and returns their IPs to the available pool.
-    ///
-    /// The `allocated_ips` index is rebuilt from the remaining live leases
-    /// after eviction, guaranteeing the two structures stay in sync.
     pub fn evict_expired(&mut self) {
         self.by_mac.retain(|_, l| l.expiry > Instant::now());
         self.allocated_ips = self.by_mac.values().map(|l| l.ip).collect();
@@ -99,7 +94,68 @@ impl LeaseTable {
             .map(|(&mac, _)| mac)
     }
 
-    /// Number of active (non-expired) leases. Used in tests.
+    /// Allocates the next available candidate IP with a temporary hold.
+    pub fn allocate_candidate(
+        &mut self,
+        client_mac: MacAddr,
+        net: ipnet::Ipv4Net,
+        server_ip: Ipv4Addr,
+    ) -> Option<Ipv4Addr> {
+        let ip = self.next_available_ip(net, server_ip)?;
+        self.insert(
+            client_mac,
+            ClientLease {
+                ip,
+                expiry: Instant::now() + CANDIDATE_HOLD_DURATION,
+            },
+        );
+        Some(ip)
+    }
+
+    /// Validates a requested IP (or existing lease) and confirms the lease duration.
+    pub fn validate_and_confirm(
+        &mut self,
+        client_mac: MacAddr,
+        requested_ip: Option<Ipv4Addr>,
+        server_ip: Ipv4Addr,
+        net: ipnet::Ipv4Net,
+        duration: Duration,
+    ) -> Option<Ipv4Addr> {
+        let target_ip = requested_ip.or_else(|| self.get(&client_mac).map(|l| l.ip))?;
+        if target_ip == server_ip
+            || !net.contains(&target_ip)
+            || self.is_ip_taken_by_other(target_ip, client_mac)
+        {
+            return None;
+        }
+        self.insert(
+            client_mac,
+            ClientLease {
+                ip: target_ip,
+                expiry: Instant::now() + duration,
+            },
+        );
+        Some(target_ip)
+    }
+
+    /// Records or updates an active neighbor mapping received from Netlink.
+    pub fn update_from_neighbor(&mut self, mac: MacAddr, ip: Ipv4Addr) {
+        if mac == MacAddr::zero() || mac == MacAddr::broadcast() {
+            return;
+        }
+        if self.get(&mac).is_some_and(|existing| existing.ip == ip) {
+            return;
+        }
+        self.insert(
+            mac,
+            ClientLease {
+                ip,
+                expiry: Instant::now() + NEIGHBOR_HOLD_DURATION,
+            },
+        );
+    }
+
+    /// Number of active leases. Used in tests.
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.by_mac.len()
@@ -147,7 +203,7 @@ pub enum LeaseCommand {
     },
     Release {
         client_mac: MacAddr,
-        reply_tx: Option<oneshot::Sender<Option<Ipv4Addr>>>,
+        reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
     },
     AddNeighbor {
         mac: MacAddr,
@@ -255,7 +311,7 @@ impl LeaseHandle {
         self.sender
             .send(LeaseCommand::Release {
                 client_mac,
-                reply_tx: Some(reply_tx),
+                reply_tx,
             })
             .await
             .ok()?;
@@ -310,7 +366,8 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             server_ip,
             reply_tx,
         } => {
-            handle_allocate_candidate(client_mac, net, server_ip, leases, reply_tx);
+            let ip = leases.allocate_candidate(client_mac, net, server_ip);
+            let _ = reply_tx.send(ip);
         }
         LeaseCommand::ConfirmLease {
             client_mac,
@@ -333,15 +390,9 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             duration,
             reply_tx,
         } => {
-            handle_validate_and_confirm(
-                client_mac,
-                requested_ip,
-                server_ip,
-                net,
-                duration,
-                leases,
-                reply_tx,
-            );
+            let ip =
+                leases.validate_and_confirm(client_mac, requested_ip, server_ip, net, duration);
+            let _ = reply_tx.send(ip);
         }
         LeaseCommand::CheckConflict {
             target_ip,
@@ -367,82 +418,10 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             reply_tx,
         } => {
             let removed = leases.remove(&client_mac).map(|l| l.ip);
-            if let Some(tx) = reply_tx {
-                let _ = tx.send(removed);
-            }
+            let _ = reply_tx.send(removed);
         }
         LeaseCommand::AddNeighbor { mac, ip } => {
-            update_lease_from_neighbor(mac, ip, leases);
+            leases.update_from_neighbor(mac, ip);
         }
-    }
-}
-
-fn handle_allocate_candidate(
-    client_mac: MacAddr,
-    net: ipnet::Ipv4Net,
-    server_ip: Ipv4Addr,
-    leases: &mut LeaseTable,
-    reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
-) {
-    let ip = leases.next_available_ip(net, server_ip);
-    if let Some(allocated_ip) = ip {
-        leases.insert(
-            client_mac,
-            ClientLease {
-                ip: allocated_ip,
-                expiry: Instant::now() + CANDIDATE_HOLD_DURATION,
-            },
-        );
-    }
-    let _ = reply_tx.send(ip);
-}
-
-fn handle_validate_and_confirm(
-    client_mac: MacAddr,
-    requested_ip: Option<Ipv4Addr>,
-    server_ip: Ipv4Addr,
-    net: ipnet::Ipv4Net,
-    duration: Duration,
-    leases: &mut LeaseTable,
-    reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
-) {
-    let target_ip = requested_ip.or_else(|| leases.get(&client_mac).map(|l| l.ip));
-    let valid_ip = target_ip.filter(|&ip| {
-        ip != server_ip && net.contains(&ip) && !leases.is_ip_taken_by_other(ip, client_mac)
-    });
-    if let Some(ip) = valid_ip {
-        leases.insert(
-            client_mac,
-            ClientLease {
-                ip,
-                expiry: Instant::now() + duration,
-            },
-        );
-    }
-    let _ = reply_tx.send(valid_ip);
-}
-
-pub fn update_lease_from_neighbor(mac: MacAddr, ip: Ipv4Addr, leases: &mut LeaseTable) {
-    if mac == MacAddr::zero() || mac == MacAddr::broadcast() {
-        return;
-    }
-    if let Some(existing) = leases.get(&mac) {
-        if existing.ip != ip {
-            leases.insert(
-                mac,
-                ClientLease {
-                    ip,
-                    expiry: Instant::now() + NEIGHBOR_HOLD_DURATION,
-                },
-            );
-        }
-    } else {
-        leases.insert(
-            mac,
-            ClientLease {
-                ip,
-                expiry: Instant::now() + NEIGHBOR_HOLD_DURATION,
-            },
-        );
     }
 }
