@@ -82,7 +82,7 @@ On interface discovery, the controller instantiates the service suite:
 | Interface Type | Configured IP | Dynamic Services Injected |
 | :--- | :--- | :--- |
 | **WAN** (`InterfaceType::Wan`) | None (DHCP Assigned) | 1. `[DhcpClient](dhcp_client_spec.md)` (retrieves lease)<br>2. `[SntpClient](sntp_client_spec.md)` (synchronizes system time) |
-| **LAN** (`InterfaceType::Lan`) | Static (`192.168.1.1/24`) | 1. `[DhcpServer](dhcp_server_spec.md)` (allocates client leases) |
+| **LAN** (`InterfaceType::Lan`) | Static (`192.168.1.1/24`) | 1. `LanManager` (supervises `[DhcpServer](dhcp_server_spec.md)` and resolves WAN/LAN subnet collisions) |
 
 ---
 

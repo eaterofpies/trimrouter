@@ -8,6 +8,7 @@ use log::{debug, error, info, warn};
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
+use tokio::sync::watch::Receiver;
 
 pub struct LanManager {
     lan_interface: String,
@@ -55,15 +56,15 @@ async fn run_lan_manager_loop(
     lan_interface: String,
     initial_ip: String,
     backup_ip: String,
-    lease_rx: WanLeaseReceiver,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut lease_rx: WanLeaseReceiver,
+    mut shutdown_rx: Receiver<bool>,
 ) {
     info!(
         "[lan-manager] Starting LAN manager service on {}...",
         lan_interface
     );
 
-    let current_ip = initial_ip.clone();
+    let mut current_ip = initial_ip.clone();
     if let Err(e) = network::configure_interface_ip(&lan_interface, &current_ip).await {
         error!("[lan-manager] Failed to configure initial LAN IP: {}", e);
         return;
@@ -75,7 +76,7 @@ async fn run_lan_manager_loop(
         return;
     }
 
-    let (connection, _handle, messages) = match rtnetlink::new_multicast_connection(&[
+    let (connection, _handle, mut messages) = match rtnetlink::new_multicast_connection(&[
         MulticastGroup::Link,
         MulticastGroup::Ipv4Ifaddr,
     ]) {
@@ -89,16 +90,45 @@ async fn run_lan_manager_loop(
     tokio::spawn(connection);
 
     debug!("[lan-manager] Conflict monitoring started.");
-    listen_for_conflicts(
+    check_and_resolve(
         &lan_interface,
-        current_ip,
+        &mut current_ip,
         &backup_ip,
-        lease_rx,
+        &lease_rx,
         &mut dhcp_server,
-        messages,
-        shutdown_rx,
     )
     .await;
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            res = lease_rx.changed() => {
+                if res.is_err() {
+                    break;
+                }
+                check_and_resolve(
+                    &lan_interface,
+                    &mut current_ip,
+                    &backup_ip,
+                    &lease_rx,
+                    &mut dhcp_server,
+                )
+                .await;
+            }
+            Some((message, _addr)) = messages.next() => {
+                if is_address_or_link_event(&message.payload) {
+                    check_and_resolve(
+                        &lan_interface,
+                        &mut current_ip,
+                        &backup_ip,
+                        &lease_rx,
+                        &mut dhcp_server,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
 
     info!("[lan-manager] Stopping LAN DHCP server...");
     if let Err(e) = dhcp_server.stop().await {
@@ -107,74 +137,16 @@ async fn run_lan_manager_loop(
     info!("[lan-manager] LAN manager service stopped.");
 }
 
-async fn listen_for_conflicts(
-    lan_interface: &str,
-    mut active_ip: String,
-    backup_ip: &str,
-    mut lease_rx: WanLeaseReceiver,
-    dhcp_server: &mut DhcpServer,
-    mut messages: impl futures_util::Stream<
-        Item = (
-            rtnetlink::packet_core::NetlinkMessage<rtnetlink::packet_route::RouteNetlinkMessage>,
-            rtnetlink::sys::SocketAddr,
-        ),
-    > + Unpin,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    let _ = check_and_resolve(
-        lan_interface,
-        &mut active_ip,
-        backup_ip,
-        &lease_rx,
-        dhcp_server,
+fn is_address_or_link_event(payload: &NetlinkPayload<RouteNetlinkMessage>) -> bool {
+    let NetlinkPayload::InnerMessage(rtnl_msg) = payload else {
+        return false;
+    };
+    matches!(
+        rtnl_msg,
+        RouteNetlinkMessage::NewLink(_)
+            | RouteNetlinkMessage::NewAddress(_)
+            | RouteNetlinkMessage::DelAddress(_)
     )
-    .await;
-
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    break;
-                }
-            }
-            res = lease_rx.changed() => {
-                if res.is_err() {
-                    break;
-                }
-                let _ = check_and_resolve(
-                    lan_interface,
-                    &mut active_ip,
-                    backup_ip,
-                    &lease_rx,
-                    dhcp_server,
-                )
-                .await;
-            }
-            Some((message, _addr)) = messages.next() => {
-                let should_check = if let NetlinkPayload::InnerMessage(rtnl_msg) = message.payload {
-                    matches!(
-                        rtnl_msg,
-                        RouteNetlinkMessage::NewLink(_)
-                        | RouteNetlinkMessage::NewAddress(_)
-                        | RouteNetlinkMessage::DelAddress(_)
-                    )
-                } else {
-                    false
-                };
-
-                if should_check {
-                    let _ = check_and_resolve(
-                        lan_interface,
-                        &mut active_ip,
-                        backup_ip,
-                        &lease_rx,
-                        dhcp_server,
-                    )
-                    .await;
-                }
-            }
-        }
-    }
 }
 
 async fn shift_lan_subnet(
@@ -182,7 +154,7 @@ async fn shift_lan_subnet(
     current_ip: &mut String,
     new_ip: String,
     dhcp_server: &mut DhcpServer,
-) -> bool {
+) {
     info!("[lan-manager] Stopping LAN DHCP server...");
     if let Err(e) = dhcp_server.stop().await {
         error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
@@ -206,7 +178,7 @@ async fn shift_lan_subnet(
     );
     if let Err(e) = network::configure_interface_ip(lan_interface, &new_ip).await {
         error!("[lan-manager] Failed to reconfigure LAN IP: {}", e);
-        return false;
+        return;
     }
 
     *current_ip = new_ip.clone();
@@ -218,33 +190,36 @@ async fn shift_lan_subnet(
     }
 
     info!("[lan-manager] LAN subnet shifted successfully.");
-    true
 }
 
+/// Checks for IP subnet collisions between the active WAN lease and current LAN subnet.
+///
+/// If an overlap is detected (e.g., both WAN and LAN are on 192.168.1.0/24), this function
+/// resolves the conflict by migrating the LAN interface and its DHCP server to `backup_ip`.
 async fn check_and_resolve(
     lan_interface: &str,
     current_ip: &mut String,
     backup_ip: &str,
     lease_rx: &WanLeaseReceiver,
     dhcp_server: &mut DhcpServer,
-) -> bool {
+) {
     let wan_opt = {
         let lease = lease_rx.borrow();
         lease.ip.zip(lease.mask)
     };
 
     let Some((wan_ip, wan_mask)) = wan_opt else {
-        return false;
+        return;
     };
 
     let Ok(wan_prefix) = mask_to_prefix_len(wan_mask) else {
-        return false;
+        return;
     };
     let Ok(wan_net) = Ipv4Net::new(wan_ip, wan_prefix) else {
-        return false;
+        return;
     };
     let Ok(lan_net) = current_ip.parse::<Ipv4Net>() else {
-        return false;
+        return;
     };
 
     if wan_net.contains(&lan_net.network()) || lan_net.contains(&wan_net.network()) {
@@ -256,10 +231,9 @@ async fn check_and_resolve(
         let new_ip = backup_ip.to_string();
         if *current_ip == new_ip {
             // Already on backup subnet, can't shift further
-            return false;
+            return;
         }
 
-        return shift_lan_subnet(lan_interface, current_ip, new_ip, dhcp_server).await;
+        shift_lan_subnet(lan_interface, current_ip, new_ip, dhcp_server).await;
     }
-    false
 }
