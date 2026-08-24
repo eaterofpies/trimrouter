@@ -88,3 +88,85 @@ pub async fn recv_msg<T: for<'a> Deserialize<'a>, R: AsyncReadExt + Unpin>(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_ipc_roundtrip_all_message_types() {
+        let (sock1, sock2) = UnixStream::pair().unwrap();
+        let (mut r1, mut w1) = sock1.into_split();
+        let (mut r2, mut w2) = sock2.into_split();
+
+        // 1. DhcpClientToParentMsg::ApplyWanLease
+        let client_msg = DhcpClientToParentMsg::ApplyWanLease {
+            ip_address: Ipv4Addr::new(10, 0, 2, 15),
+            prefix_len: 24,
+            gateway: Ipv4Addr::new(10, 0, 2, 2),
+            dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
+        };
+        send_msg(&mut w1, &client_msg).await.unwrap();
+        let received: DhcpClientToParentMsg = recv_msg(&mut r2).await.unwrap().unwrap();
+        assert_eq!(received, client_msg);
+
+        // 2. DhcpClientToParentMsg::ClearWanLease
+        let clear_msg = DhcpClientToParentMsg::ClearWanLease;
+        send_msg(&mut w1, &clear_msg).await.unwrap();
+        let received: DhcpClientToParentMsg = recv_msg(&mut r2).await.unwrap().unwrap();
+        assert_eq!(received, clear_msg);
+
+        // 3. DhcpServerParentToWorkerMsg::AddNeighbor
+        let server_msg = DhcpServerParentToWorkerMsg::AddNeighbor {
+            ip_address: Ipv4Addr::new(192, 168, 1, 10),
+            mac_address: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+        };
+        send_msg(&mut w2, &server_msg).await.unwrap();
+        let received: DhcpServerParentToWorkerMsg = recv_msg(&mut r1).await.unwrap().unwrap();
+        assert_eq!(received, server_msg);
+
+        // 4. DnsParentToWorkerMsg::SetUpstreamResolvers
+        let dns_msg = DnsParentToWorkerMsg::SetUpstreamResolvers {
+            servers: vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(1, 0, 0, 1)],
+        };
+        send_msg(&mut w1, &dns_msg).await.unwrap();
+        let received: DnsParentToWorkerMsg = recv_msg(&mut r2).await.unwrap().unwrap();
+        assert_eq!(received, dns_msg);
+
+        // 5. SntpClientToParentMsg::SetSystemTime
+        let sntp_msg = SntpClientToParentMsg::SetSystemTime {
+            seconds: 1724515200,
+            nanoseconds: 500_000,
+        };
+        send_msg(&mut w2, &sntp_msg).await.unwrap();
+        let received: SntpClientToParentMsg = recv_msg(&mut r1).await.unwrap().unwrap();
+        assert_eq!(received, sntp_msg);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_recv_eof_returns_none() {
+        let (sock1, sock2) = UnixStream::pair().unwrap();
+        let (mut r1, _w1) = sock1.into_split();
+        drop(sock2); // Close writer socket immediately
+
+        let res: Option<DhcpClientToParentMsg> = recv_msg(&mut r1).await.unwrap();
+        assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ipc_recv_corrupted_payload_returns_err() {
+        let (sock1, sock2) = UnixStream::pair().unwrap();
+        let (mut r1, _w1) = sock1.into_split();
+        let (_r2, mut w2) = sock2.into_split();
+
+        // Write a 4-byte length prefix of 3 bytes, followed by invalid postcard payload
+        let len: u32 = 3;
+        w2.write_all(&len.to_be_bytes()).await.unwrap();
+        w2.write_all(&[0xff, 0xff, 0xff]).await.unwrap();
+        w2.flush().await.unwrap();
+
+        let res: Result<Option<DhcpClientToParentMsg>, std::io::Error> = recv_msg(&mut r1).await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+}

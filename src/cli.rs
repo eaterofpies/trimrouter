@@ -311,4 +311,73 @@ mod tests {
         ];
         assert!(Cli::try_parse_from(&exe_short_args).is_ok());
     }
+
+    #[test]
+    fn test_worker_service_arg_strings_and_child_fds() {
+        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (s3, _s4) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (s5, _s6) = std::os::unix::net::UnixStream::pair().unwrap();
+
+        let fd1 = CliFd(s1.into());
+        let fd2 = CliFd(s3.into());
+        let fd3 = CliFd(s5.into());
+
+        let raw1 = fd1.as_raw_fd().to_string();
+        let raw2 = fd2.as_raw_fd().to_string();
+        let raw3 = fd3.as_raw_fd().to_string();
+
+        // SntpClient
+        let sntp = WorkerService::SntpClient { ipc_fd: fd1 };
+        assert_eq!(sntp.to_args(), vec![raw1]);
+        assert_eq!(sntp.child_fds().len(), 1);
+
+        // DhcpClient
+        let (dc1, dc2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (dc_raw1, dc_raw2) = (dc1.as_raw_fd().to_string(), dc2.as_raw_fd().to_string());
+        let dhcp_cli = WorkerService::DhcpClient {
+            ipc_fd: CliFd(dc1.into()),
+            raw_socket_fd: CliFd(dc2.into()),
+            wan_interface: "wan0".to_string(),
+        };
+        assert_eq!(
+            dhcp_cli.to_args(),
+            vec![dc_raw1, dc_raw2, "wan0".to_string()]
+        );
+        assert_eq!(dhcp_cli.child_fds().len(), 2);
+
+        // DhcpServer
+        let (ds1, ds2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (ds_raw1, ds_raw2) = (ds1.as_raw_fd().to_string(), ds2.as_raw_fd().to_string());
+        let dhcp_srv = WorkerService::DhcpServer {
+            ipc_fd: CliFd(ds1.into()),
+            raw_socket_fd: CliFd(ds2.into()),
+            wan_interface: "lan0".to_string(),
+            lan_ip: "192.168.1.1/24".to_string(),
+        };
+        assert_eq!(
+            dhcp_srv.to_args(),
+            vec![
+                ds_raw1,
+                ds_raw2,
+                "lan0".to_string(),
+                "192.168.1.1/24".to_string()
+            ]
+        );
+        assert_eq!(dhcp_srv.child_fds().len(), 2);
+
+        // DnsForwarder
+        let dns = WorkerService::DnsForwarder {
+            ipc_fd: CliFd(std::os::unix::net::UnixStream::pair().unwrap().0.into()),
+            dns_socket_fd: fd2,
+            upstream_socket_fd: fd3,
+        };
+        assert_eq!(dns.child_fds().len(), 3);
+        assert_eq!(dns.to_args()[1], raw2);
+        assert_eq!(dns.to_args()[2], raw3);
+    }
+
+    #[test]
+    fn test_parse_cli_fd_invalid() {
+        assert!(parse_cli_fd("not-a-number").is_err());
+    }
 }

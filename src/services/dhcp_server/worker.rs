@@ -748,4 +748,54 @@ mod tests {
         assert_ne!(ip1, server_ip);
         assert_ne!(ip2, server_ip);
     }
+
+    #[test]
+    fn test_validate_and_confirm_unspecified_zero_ip_rejected() {
+        let config = make_config("192.168.1.1/24");
+        let mut leases = LeaseTable::new();
+        let client = MacAddr::new(1, 2, 3, 4, 5, 6);
+
+        let res = leases.validate_and_confirm(
+            client,
+            Some(Ipv4Addr::UNSPECIFIED),
+            config.server_ip,
+            config.net,
+            Duration::from_secs(3600),
+        );
+        assert_eq!(res, None);
+    }
+
+    #[test]
+    fn test_validate_and_confirm_broadcast_ip_rejected() {
+        let config = make_config("192.168.1.1/24");
+        let mut leases = LeaseTable::new();
+        let client = MacAddr::new(1, 2, 3, 4, 5, 6);
+
+        let broadcast_ip = config.net.broadcast();
+        let res = leases.validate_and_confirm(
+            client,
+            Some(broadcast_ip),
+            config.server_ip,
+            config.net,
+            Duration::from_secs(3600),
+        );
+        assert_eq!(res, None);
+    }
+
+    #[test]
+    fn test_validate_and_confirm_network_ip_rejected() {
+        let config = make_config("192.168.1.1/24");
+        let mut leases = LeaseTable::new();
+        let client = MacAddr::new(1, 2, 3, 4, 5, 6);
+
+        let network_ip = config.net.network();
+        let res = leases.validate_and_confirm(
+            client,
+            Some(network_ip),
+            config.server_ip,
+            config.net,
+            Duration::from_secs(3600),
+        );
+        assert_eq!(res, None);
+    }
 }

@@ -54,11 +54,13 @@ impl std::fmt::Display for DhcpError {
 
 impl std::error::Error for DhcpError {}
 
+#[derive(Clone, Debug)]
 struct DhcpOffer {
     offered_ip: Ipv4Addr,
     server_ip: Option<Ipv4Addr>,
 }
 
+#[derive(Clone, Debug)]
 struct DhcpAck {
     ip: Ipv4Addr,
     mask: Ipv4Addr,
@@ -445,23 +447,7 @@ impl DhcpClientInternal {
     }
 
     async fn send_discover(&self, xid: u32) {
-        let mut discover = Message::default();
-        discover.set_opcode(Opcode::BootRequest);
-        discover.set_xid(xid);
-        discover.set_flags(Flags::default().set_broadcast());
-        discover.set_chaddr(&self.mac.octets());
-
-        discover
-            .opts_mut()
-            .insert(DhcpOption::MessageType(MessageType::Discover));
-        discover
-            .opts_mut()
-            .insert(DhcpOption::ParameterRequestList(vec![
-                OptionCode::SubnetMask,
-                OptionCode::Router,
-                OptionCode::DomainNameServer,
-            ]));
-
+        let discover = build_discover_message(self.mac, xid);
         let dest_ip = Ipv4Addr::BROADCAST;
         if let Err(e) = self.send_dhcp_message(discover, dest_ip).await {
             error!("[dhcp-client] Failed to send DHCPDISCOVER: {}", e);
@@ -478,26 +464,7 @@ impl DhcpClientInternal {
         ciaddr: Ipv4Addr,
         dest_ip: Ipv4Addr,
     ) {
-        let mut request = Message::default();
-        request.set_opcode(Opcode::BootRequest);
-        request.set_xid(xid);
-        request.set_ciaddr(ciaddr);
-        request.set_chaddr(&self.mac.octets());
-
-        if ciaddr.is_unspecified() {
-            request.set_flags(Flags::default().set_broadcast());
-            request
-                .opts_mut()
-                .insert(DhcpOption::RequestedIpAddress(requested_ip));
-            if let Some(srv) = server_ip {
-                request.opts_mut().insert(DhcpOption::ServerIdentifier(srv));
-            }
-        }
-
-        request
-            .opts_mut()
-            .insert(DhcpOption::MessageType(MessageType::Request));
-
+        let request = build_request_message(self.mac, xid, requested_ip, server_ip, ciaddr);
         if let Err(e) = self.send_dhcp_message(request, dest_ip).await {
             error!("[dhcp-client] Failed to send DHCPREQUEST: {}", e);
         } else {
@@ -507,6 +474,57 @@ impl DhcpClientInternal {
             );
         }
     }
+}
+
+fn build_discover_message(mac: MacAddr, xid: u32) -> Message {
+    let mut discover = Message::default();
+    discover.set_opcode(Opcode::BootRequest);
+    discover.set_xid(xid);
+    discover.set_flags(Flags::default().set_broadcast());
+    discover.set_chaddr(&mac.octets());
+
+    discover
+        .opts_mut()
+        .insert(DhcpOption::MessageType(MessageType::Discover));
+    discover
+        .opts_mut()
+        .insert(DhcpOption::ParameterRequestList(vec![
+            OptionCode::SubnetMask,
+            OptionCode::Router,
+            OptionCode::DomainNameServer,
+        ]));
+
+    discover
+}
+
+fn build_request_message(
+    mac: MacAddr,
+    xid: u32,
+    requested_ip: Ipv4Addr,
+    server_ip: Option<Ipv4Addr>,
+    ciaddr: Ipv4Addr,
+) -> Message {
+    let mut request = Message::default();
+    request.set_opcode(Opcode::BootRequest);
+    request.set_xid(xid);
+    request.set_ciaddr(ciaddr);
+    request.set_chaddr(&mac.octets());
+
+    if ciaddr.is_unspecified() {
+        request.set_flags(Flags::default().set_broadcast());
+        request
+            .opts_mut()
+            .insert(DhcpOption::RequestedIpAddress(requested_ip));
+        if let Some(srv) = server_ip {
+            request.opts_mut().insert(DhcpOption::ServerIdentifier(srv));
+        }
+    }
+
+    request
+        .opts_mut()
+        .insert(DhcpOption::MessageType(MessageType::Request));
+
+    request
 }
 
 pub async fn run_dhcp_client_worker(
@@ -757,5 +775,187 @@ mod tests {
         assert_eq!(opts.gateway, None);
         assert!(opts.dns_servers.is_empty());
         assert_eq!(opts.lease_secs, DEFAULT_LEASE_SECS);
+    }
+
+    #[test]
+    fn test_parse_offer_wrong_msg_type_returns_none() {
+        let mut msg = Message::default();
+        msg.set_xid(0x12345678);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Discover));
+        msg.set_yiaddr(MOCK_CLIENT_IP);
+
+        let res = parse_offer(&msg, 0x12345678);
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_parse_ack_nak_mismatched_xid_returns_none() {
+        let mut msg = Message::default();
+        msg.set_xid(0x1111);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Ack));
+
+        let res = parse_ack_nak(&msg, 0x2222);
+        assert!(matches!(res, ParseAckResult::None));
+    }
+
+    #[test]
+    fn test_parse_ack_nak_wrong_message_type_returns_none() {
+        let mut msg = Message::default();
+        msg.set_xid(0x3333);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Discover));
+
+        let res = parse_ack_nak(&msg, 0x3333);
+        assert!(matches!(res, ParseAckResult::None));
+    }
+
+    #[test]
+    fn test_parse_ack_nak_missing_message_type_returns_none() {
+        let mut msg = Message::default();
+        msg.set_xid(0x4444);
+
+        let res = parse_ack_nak(&msg, 0x4444);
+        assert!(matches!(res, ParseAckResult::None));
+    }
+
+    #[test]
+    fn test_build_discover_message() {
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let xid = 0xabcdef01;
+        let msg = build_discover_message(mac, xid);
+
+        assert_eq!(msg.opcode(), Opcode::BootRequest);
+        assert_eq!(msg.xid(), xid);
+        assert_eq!(msg.chaddr(), &mac.octets());
+        assert!(msg.flags().broadcast());
+
+        let msg_type = msg.opts().get(OptionCode::MessageType);
+        assert_eq!(
+            msg_type,
+            Some(&DhcpOption::MessageType(MessageType::Discover))
+        );
+
+        let params = msg.opts().get(OptionCode::ParameterRequestList);
+        assert_eq!(
+            params,
+            Some(&DhcpOption::ParameterRequestList(vec![
+                OptionCode::SubnetMask,
+                OptionCode::Router,
+                OptionCode::DomainNameServer,
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_build_request_message_selecting() {
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let xid = 0x12345678;
+        let requested_ip = Ipv4Addr::new(10, 0, 2, 15);
+        let server_ip = Ipv4Addr::new(10, 0, 2, 2);
+
+        let msg = build_request_message(
+            mac,
+            xid,
+            requested_ip,
+            Some(server_ip),
+            Ipv4Addr::UNSPECIFIED,
+        );
+
+        assert_eq!(msg.opcode(), Opcode::BootRequest);
+        assert_eq!(msg.xid(), xid);
+        assert_eq!(msg.ciaddr(), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(msg.chaddr(), &mac.octets());
+        assert!(msg.flags().broadcast());
+
+        assert_eq!(
+            msg.opts().get(OptionCode::MessageType),
+            Some(&DhcpOption::MessageType(MessageType::Request))
+        );
+        assert_eq!(
+            msg.opts().get(OptionCode::RequestedIpAddress),
+            Some(&DhcpOption::RequestedIpAddress(requested_ip))
+        );
+        assert_eq!(
+            msg.opts().get(OptionCode::ServerIdentifier),
+            Some(&DhcpOption::ServerIdentifier(server_ip))
+        );
+    }
+
+    #[test]
+    fn test_build_request_message_renewing() {
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let xid = 0x87654321;
+        let client_ip = Ipv4Addr::new(10, 0, 2, 15);
+
+        let msg = build_request_message(mac, xid, client_ip, None, client_ip);
+
+        assert_eq!(msg.opcode(), Opcode::BootRequest);
+        assert_eq!(msg.xid(), xid);
+        assert_eq!(msg.ciaddr(), client_ip);
+        assert_eq!(msg.chaddr(), &mac.octets());
+        assert!(!msg.flags().broadcast());
+
+        assert_eq!(
+            msg.opts().get(OptionCode::MessageType),
+            Some(&DhcpOption::MessageType(MessageType::Request))
+        );
+        // In RENEWING, Requested IP Address and Server ID should not be set in options
+        assert_eq!(msg.opts().get(OptionCode::RequestedIpAddress), None);
+        assert_eq!(msg.opts().get(OptionCode::ServerIdentifier), None);
+    }
+
+    #[test]
+    fn test_calculate_next_delay() {
+        assert_eq!(calculate_next_delay(2), 4);
+        assert_eq!(calculate_next_delay(32), 64);
+        assert_eq!(calculate_next_delay(40), MAX_RETRY_DELAY_SECS);
+        assert_eq!(
+            calculate_next_delay(MAX_RETRY_DELAY_SECS),
+            MAX_RETRY_DELAY_SECS
+        );
+    }
+
+    #[test]
+    fn test_calculate_renewal_params() {
+        let server_ip = Ipv4Addr::new(10, 0, 2, 2);
+        let lease_secs = 3600;
+        let t2_secs = 3150;
+
+        // T1 renewal phase (unicast to server)
+        let (interval, dest_ip, rebinding) =
+            calculate_renewal_params(1800, t2_secs, lease_secs, Some(server_ip));
+        assert!(!rebinding);
+        assert_eq!(dest_ip, server_ip);
+        assert_eq!(interval, (t2_secs - 1800) / 2);
+
+        // T2 rebinding phase (broadcast)
+        let (interval, dest_ip, rebinding) =
+            calculate_renewal_params(3200, t2_secs, lease_secs, Some(server_ip));
+        assert!(rebinding);
+        assert_eq!(dest_ip, Ipv4Addr::BROADCAST);
+        assert_eq!(interval, (lease_secs - 3200) / 2);
+    }
+
+    #[test]
+    fn test_handle_ack_result() {
+        let ack_data = DhcpAck {
+            ip: MOCK_CLIENT_IP,
+            mask: DEFAULT_MASK,
+            gateway: Some(MOCK_SERVER_IP),
+            dns_servers: vec![],
+            lease_secs: 1800,
+            server_ip: Some(MOCK_SERVER_IP),
+        };
+
+        let ok_res = handle_ack_result(ParseAckResult::Ack(ack_data.clone()));
+        assert!(matches!(ok_res, Some(Ok(_))));
+
+        let nak_res = handle_ack_result(ParseAckResult::Nak);
+        assert!(matches!(nak_res, Some(Err(DhcpError::Nak))));
+
+        let none_res = handle_ack_result(ParseAckResult::None);
+        assert!(none_res.is_none());
     }
 }

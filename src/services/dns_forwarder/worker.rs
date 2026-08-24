@@ -408,4 +408,37 @@ mod tests {
         let resolvers = get_upstream_resolvers(&[primary, secondary]);
         assert_eq!(resolvers, vec![primary, secondary]);
     }
+
+    #[test]
+    fn test_get_cache_key_empty_bytes_returns_none() {
+        assert_eq!(get_cache_key(&[]), None);
+    }
+
+    #[test]
+    fn test_get_cache_key_zero_qdcount_returns_none() {
+        let query = vec![0u8; DNS_HEADER_SIZE]; // QDCount is 0 by default
+        assert_eq!(get_cache_key(&query), None);
+    }
+
+    #[test]
+    fn test_get_cache_key_corrupted_label_length_returns_none() {
+        let mut query = vec![0u8; DNS_HEADER_SIZE];
+        query[5] = 1; // QDCount = 1
+        query.extend_from_slice(&[255, b'a', b'b']); // Corrupted label length pointing way beyond buffer
+
+        assert_eq!(get_cache_key(&query), None);
+    }
+
+    #[test]
+    fn test_insert_cache_corrupted_response_not_cached() {
+        let mut corrupted_resp = vec![0u8; DNS_HEADER_SIZE];
+        corrupted_resp[5] = 1; // QDCount = 1
+        corrupted_resp[7] = 1; // ANCount = 1
+        corrupted_resp.extend_from_slice(&[0xff, 0xff, 0xff]); // Garbage payload
+
+        let mut cache = HashMap::new();
+        insert_cache(b"corrupted_key".to_vec(), corrupted_resp, &mut cache);
+
+        assert!(!cache.contains_key(&b"corrupted_key".to_vec()[..]));
+    }
 }

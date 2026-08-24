@@ -121,6 +121,8 @@ impl LeaseTable {
     ) -> Option<Ipv4Addr> {
         let target_ip = requested_ip.or_else(|| self.get(&client_mac).map(|l| l.ip))?;
         if target_ip == server_ip
+            || target_ip == net.network()
+            || target_ip == net.broadcast()
             || !net.contains(&target_ip)
             || self.is_ip_taken_by_other(target_ip, client_mac)
         {

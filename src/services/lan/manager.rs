@@ -242,3 +242,105 @@ async fn check_and_resolve(
         shift_lan_subnet(lan_interface, current_ip, new_ip, dhcp_server).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::utils::WanLease;
+    use rtnetlink::packet_core::NetlinkPayload;
+    use rtnetlink::packet_route::RouteNetlinkMessage;
+    use rtnetlink::packet_route::address::AddressMessage;
+    use rtnetlink::packet_route::link::LinkMessage;
+    use rtnetlink::packet_route::route::RouteMessage;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn test_is_address_or_link_event_new_link_returns_true() {
+        let msg = RouteNetlinkMessage::NewLink(LinkMessage::default());
+        let payload = NetlinkPayload::InnerMessage(msg);
+        assert!(is_address_or_link_event(&payload));
+    }
+
+    #[test]
+    fn test_is_address_or_link_event_del_address_returns_true() {
+        let msg = RouteNetlinkMessage::DelAddress(AddressMessage::default());
+        let payload = NetlinkPayload::InnerMessage(msg);
+        assert!(is_address_or_link_event(&payload));
+    }
+
+    #[test]
+    fn test_is_address_or_link_event_unrelated_returns_false() {
+        let msg = RouteNetlinkMessage::NewRoute(RouteMessage::default());
+        let payload = NetlinkPayload::InnerMessage(msg);
+        assert!(!is_address_or_link_event(&payload));
+    }
+
+    #[tokio::test]
+    async fn test_check_and_resolve_no_wan_lease_no_shift() {
+        let (_tx, lease_rx) = tokio::sync::watch::channel(WanLease::default());
+        let mut current_ip = "192.168.1.1/24".to_string();
+        let backup_ip = "10.0.0.1/24";
+        let mut dhcp_server = DhcpServer::new("lan".to_string(), current_ip.clone());
+
+        check_and_resolve(
+            "lan",
+            &mut current_ip,
+            backup_ip,
+            &lease_rx,
+            &mut dhcp_server,
+        )
+        .await;
+
+        assert_eq!(current_ip, "192.168.1.1/24");
+    }
+
+    #[tokio::test]
+    async fn test_check_and_resolve_disjoint_subnets_no_shift() {
+        let lease = WanLease {
+            ip: Some(Ipv4Addr::new(10, 0, 2, 15)),
+            mask: Some(Ipv4Addr::new(255, 255, 255, 0)),
+            gateway: Some(Ipv4Addr::new(10, 0, 2, 2)),
+            dns_servers: vec![],
+        };
+        let (_tx, lease_rx) = tokio::sync::watch::channel(lease);
+        let mut current_ip = "192.168.1.1/24".to_string();
+        let backup_ip = "10.0.0.1/24";
+        let mut dhcp_server = DhcpServer::new("lan".to_string(), current_ip.clone());
+
+        check_and_resolve(
+            "lan",
+            &mut current_ip,
+            backup_ip,
+            &lease_rx,
+            &mut dhcp_server,
+        )
+        .await;
+
+        assert_eq!(current_ip, "192.168.1.1/24");
+    }
+
+    #[tokio::test]
+    async fn test_check_and_resolve_invalid_wan_mask_no_shift() {
+        let lease = WanLease {
+            ip: Some(Ipv4Addr::new(192, 168, 1, 50)),
+            mask: Some(Ipv4Addr::new(255, 0, 255, 0)), // Non-contiguous mask
+            gateway: None,
+            dns_servers: vec![],
+        };
+        let (_tx, lease_rx) = tokio::sync::watch::channel(lease);
+        let mut current_ip = "192.168.1.1/24".to_string();
+        let backup_ip = "10.0.0.1/24";
+        let mut dhcp_server = DhcpServer::new("lan".to_string(), current_ip.clone());
+
+        check_and_resolve(
+            "lan",
+            &mut current_ip,
+            backup_ip,
+            &lease_rx,
+            &mut dhcp_server,
+        )
+        .await;
+
+        assert_eq!(current_ip, "192.168.1.1/24");
+    }
+}

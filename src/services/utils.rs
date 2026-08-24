@@ -397,7 +397,15 @@ pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, Stri
         Err(_) => return Err("DNS query timed out".to_string()),
     };
 
-    let packet = dns_parser::Packet::parse(&buf[..len])
+    parse_dns_a_record_response(&buf[..len], query_id, host)
+}
+
+pub fn parse_dns_a_record_response(
+    buf: &[u8],
+    query_id: u16,
+    host: &str,
+) -> Result<Ipv4Addr, String> {
+    let packet = dns_parser::Packet::parse(buf)
         .map_err(|e| format!("Failed to parse DNS response: {}", e))?;
 
     if packet.header.id != query_id {
@@ -683,5 +691,62 @@ mod tests {
         let proceed = handle_supervisor_restart_delay("test-service", &mut attempt, &mut rx).await;
         assert!(proceed);
         assert_eq!(attempt, 1);
+    }
+
+    #[test]
+    fn test_parse_dhcp_payload_truncated_packet_returns_none() {
+        let truncated = [0u8; 10];
+        assert!(parse_dhcp_payload(&truncated, 67).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_payload_non_ipv4_returns_none() {
+        // Ethernet header with ARP ethertype 0x0806
+        let mut frame = vec![0u8; 60];
+        frame[12] = 0x08;
+        frame[13] = 0x06; // ARP
+        assert!(parse_dhcp_payload(&frame, 67).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_payload_non_udp_returns_none() {
+        // Ethernet header (IPv4 0x0800) + IPv4 header with TCP protocol (6)
+        let mut frame = vec![0u8; 60];
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4
+        frame[14] = 0x45; // Version 4, IHL 5
+        frame[23] = 6; // Protocol = TCP
+        assert!(parse_dhcp_payload(&frame, 67).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_payload_wrong_destination_port_returns_none() {
+        // Ethernet (14) + IPv4 (20) + UDP (8) with destination port 80
+        let mut frame = vec![0u8; 60];
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4
+        frame[14] = 0x45; // Version 4, IHL 5
+        frame[23] = 17; // Protocol = UDP
+        frame[36] = 0x00;
+        frame[37] = 80; // Dest port 80
+        assert!(parse_dhcp_payload(&frame, 67).is_none());
+    }
+
+    #[test]
+    fn test_parse_dns_response_corrupted_returns_err() {
+        let corrupted = [0u8; 5];
+        let res = parse_dns_a_record_response(&corrupted, 0x1234, "google.com");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_parse_dns_response_xid_mismatch_returns_err() {
+        let mut dns_resp = vec![0u8; 12];
+        dns_resp[0] = 0x11;
+        dns_resp[1] = 0x11; // ID = 0x1111
+
+        let res = parse_dns_a_record_response(&dns_resp, 0x2222, "google.com");
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "Transaction ID mismatch");
     }
 }
