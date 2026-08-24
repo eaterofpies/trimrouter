@@ -22,7 +22,6 @@ use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
-use tokio::sync::watch::Receiver;
 use tokio::time::timeout;
 
 pub const CHROOT_JAIL_PATH: &str = "/run/empty";
@@ -406,17 +405,6 @@ pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, Stri
     }
 
     find_first_a_record(packet.answers).ok_or_else(|| format!("No A record resolved for {}", host))
-}
-
-pub async fn wait_shutdown(shutdown_rx: &mut Receiver<bool>) {
-    if *shutdown_rx.borrow() {
-        return;
-    }
-    while shutdown_rx.changed().await.is_ok() {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-    }
 }
 
 pub async fn wait_ipc_eof(reader: &mut tokio::net::unix::OwnedReadHalf) {

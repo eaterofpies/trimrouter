@@ -5,8 +5,6 @@ use std::time::{Duration, Instant};
 use pnet::util::MacAddr;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::services::utils::wait_shutdown;
-
 const LEASE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const CANDIDATE_HOLD_DURATION: Duration = Duration::from_secs(10);
 const NEIGHBOR_HOLD_DURATION: Duration = Duration::from_secs(300);
@@ -326,21 +324,17 @@ impl LeaseHandle {
     }
 }
 
-pub fn spawn_lease_actor(shutdown_rx: tokio::sync::watch::Receiver<bool>) -> LeaseHandle {
+pub fn spawn_lease_actor() -> LeaseHandle {
     let (tx, rx) = mpsc::channel(LEASE_CHANNEL_CAPACITY);
-    tokio::spawn(run_lease_actor_loop(rx, shutdown_rx));
+    tokio::spawn(run_lease_actor_loop(rx));
     LeaseHandle { sender: tx }
 }
 
-async fn run_lease_actor_loop(
-    mut rx: mpsc::Receiver<LeaseCommand>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
+async fn run_lease_actor_loop(mut rx: mpsc::Receiver<LeaseCommand>) {
     let mut leases = LeaseTable::new();
     let mut cleanup_interval = tokio::time::interval(LEASE_CLEANUP_INTERVAL);
     loop {
         tokio::select! {
-            _ = wait_shutdown(&mut shutdown_rx) => break,
             _ = cleanup_interval.tick() => {
                 leases.evict_expired();
             }

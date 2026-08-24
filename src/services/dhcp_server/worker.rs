@@ -2,7 +2,7 @@ use crate::packet::build_raw_packet;
 use crate::services::ipc::{DhcpServerParentToWorkerMsg, recv_msg};
 use crate::services::utils::{
     DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload, read_raw_packet,
-    run_sandboxed_worker, send_raw_packet, wait_shutdown,
+    run_sandboxed_worker, send_raw_packet,
 };
 use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode, OptionCode};
 use dhcproto::{Encodable, Encoder};
@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::net::unix::OwnedReadHalf;
-use tokio::sync::watch::Receiver;
 
 use super::lease_table::{LeaseHandle, spawn_lease_actor};
 
@@ -65,8 +64,7 @@ pub async fn run_dhcp_server_worker(
         ipc_fd,
         |ipc| async move {
             let _keep_writer = ipc.writer;
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            let leases = spawn_lease_actor(shutdown_rx.clone());
+            let leases = spawn_lease_actor();
 
             let config = Arc::new(ServerConfig {
                 server_ip,
@@ -76,9 +74,7 @@ pub async fn run_dhcp_server_worker(
             });
 
             let async_sock_shared = Arc::new(async_sock);
-            let _ =
-                run_server_loop(async_sock_shared, config, leases, ipc.reader, shutdown_rx).await;
-            let _ = shutdown_tx.send(true);
+            let _ = run_server_loop(async_sock_shared, config, leases, ipc.reader).await;
             Ok(())
         },
     )
@@ -90,12 +86,10 @@ async fn run_server_loop(
     config: Arc<ServerConfig>,
     leases: LeaseHandle,
     mut ipc_reader: OwnedReadHalf,
-    mut shutdown_rx: Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 2048];
     loop {
         tokio::select! {
-            _ = wait_shutdown(&mut shutdown_rx) => break,
             ipc_msg = recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut ipc_reader) => {
                 match ipc_msg {
                     Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
@@ -601,8 +595,7 @@ mod tests {
     async fn test_discover_reoffers_existing_lease_ip() {
         let net: ipnet::Ipv4Net = "192.168.1.1/24".parse().unwrap();
         let server_ip = net.addr();
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let leases = spawn_lease_actor(shutdown_rx);
+        let leases = spawn_lease_actor();
         let client = MacAddr::new(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF);
 
         let ip_first = leases
@@ -710,8 +703,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_arp_conflict_detects_conflict() {
         let config = make_config("192.168.1.1/24");
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let leases = spawn_lease_actor(shutdown_rx);
+        let leases = spawn_lease_actor();
 
         let client_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
         let owner_mac = MacAddr::new(0x52, 0x54, 0x00, 0x12, 0x34, 0x56);
@@ -739,8 +731,7 @@ mod tests {
     async fn test_concurrent_discover_allocations_no_duplicates() {
         let net: ipnet::Ipv4Net = "192.168.1.1/24".parse().unwrap();
         let server_ip = net.addr();
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let leases = spawn_lease_actor(shutdown_rx);
+        let leases = spawn_lease_actor();
 
         let mac1 = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x01);
         let mac2 = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x02);

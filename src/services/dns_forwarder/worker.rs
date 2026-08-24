@@ -1,7 +1,6 @@
 use crate::services::ipc::{DnsParentToWorkerMsg, recv_msg};
 use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_udp_socket, run_sandboxed_worker,
-    wait_shutdown,
 };
 use log::{info, warn};
 use std::collections::HashMap;
@@ -11,7 +10,6 @@ use std::os::unix::io::OwnedFd;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::net::unix::OwnedReadHalf;
-use tokio::sync::watch::Receiver;
 
 // =========================================================================
 // DNS Constants & Config
@@ -57,9 +55,7 @@ pub async fn run_dns_forwarder_worker(
         ipc_fd,
         |ipc| async move {
             let _ipc_writer = ipc.writer;
-            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-            run_forwarder_loop(dns_socket, upstream_socket, ipc.reader, shutdown_rx).await;
+            run_forwarder_loop(dns_socket, upstream_socket, ipc.reader).await;
             Ok(())
         },
     )
@@ -70,7 +66,6 @@ async fn run_forwarder_loop(
     dns_socket: UdpSocket,
     upstream_socket: UdpSocket,
     mut ipc_reader: OwnedReadHalf,
-    mut shutdown_rx: Receiver<bool>,
 ) {
     let mut cache = HashMap::<Vec<u8>, CacheEntry>::new();
     let mut pending_queries = HashMap::<u16, PendingQuery>::new();
@@ -81,7 +76,6 @@ async fn run_forwarder_loop(
 
     loop {
         tokio::select! {
-            _ = wait_shutdown(&mut shutdown_rx) => break,
             _ = cleanup_timer.tick() => {
                 evict_expired_cache(&mut cache);
                 check_pending_timeouts(&mut pending_queries, &upstream_socket).await;

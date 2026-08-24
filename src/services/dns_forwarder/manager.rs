@@ -1,11 +1,12 @@
 use crate::services::ipc::{DnsParentToWorkerMsg, async_unix_stream, send_msg};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
-use crate::services::utils::{DNS_PORT, WanLeaseReceiver, create_ipc_fds, terminate_worker};
+use crate::services::utils::{
+    DNS_PORT, WanLeaseReceiver, create_ipc_fds, terminate_worker, wait_ipc_eof,
+};
 use log::info;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::unix::io::OwnedFd;
-use tokio::io::AsyncReadExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
@@ -40,7 +41,6 @@ async fn run_parent_dns_monitor(
         child_pid
     );
 
-    let mut eof_buf = [0u8; 1];
     let mut last_dns_servers: Vec<Ipv4Addr> = Vec::new();
 
     // 1. Initial sync on startup (marks version as seen)
@@ -56,14 +56,9 @@ async fn run_parent_dns_monitor(
     while !*shutdown_rx.borrow() {
         tokio::select! {
             _ = shutdown_rx.changed() => break,
-            res = ipc_reader.read(&mut eof_buf) => {
-                match res {
-                    Ok(0) | Err(_) => {
-                        info!("[dns-forwarder-parent] Worker closed IPC. Shutting down monitor.");
-                        break;
-                    }
-                    Ok(_) => {}
-                }
+            _ = wait_ipc_eof(&mut ipc_reader) => {
+                info!("[dns-forwarder-parent] Worker closed IPC. Shutting down monitor.");
+                break;
             }
             res = lease_rx.changed() => {
                 if res.is_err() {

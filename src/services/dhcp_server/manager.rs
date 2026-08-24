@@ -1,14 +1,15 @@
 use crate::services::ipc::{DhcpServerParentToWorkerMsg, async_unix_stream, send_msg};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
-use crate::services::utils::{setup_worker_sockets, terminate_worker};
+use crate::services::utils::{setup_worker_sockets, terminate_worker, wait_ipc_eof};
 use futures_util::{Stream, StreamExt};
 use log::{error, info};
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
+use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
-use tokio::net::unix::OwnedWriteHalf;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 
@@ -38,7 +39,7 @@ fn start_parent_arp_listener(
     shutdown_rx: Receiver<bool>,
 ) -> Result<JoinHandle<()>, ServiceError> {
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
-    let (_, ipc_writer) = ipc_stream.into_split();
+    let (ipc_reader, ipc_writer) = ipc_stream.into_split();
 
     let connection_fut = rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]);
     let (connection, _handle, messages) = match connection_fut {
@@ -56,6 +57,7 @@ fn start_parent_arp_listener(
         child_pid,
         messages,
         ipc_writer,
+        ipc_reader,
         shutdown_rx,
     ));
 
@@ -66,6 +68,7 @@ async fn run_parent_dhcp_server_monitor<S, A>(
     child_pid: u32,
     mut messages: S,
     mut ipc_writer: OwnedWriteHalf,
+    mut ipc_reader: OwnedReadHalf,
     mut shutdown_rx: Receiver<bool>,
 ) where
     S: Stream<Item = (NetlinkMessage<RouteNetlinkMessage>, A)> + Unpin + Send + 'static,
@@ -77,40 +80,23 @@ async fn run_parent_dhcp_server_monitor<S, A>(
     );
     loop {
         tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    break;
-                }
+            _ = shutdown_rx.changed() => break,
+            _ = wait_ipc_eof(&mut ipc_reader) => {
+                info!("[dhcp-server-parent] Worker closed IPC. Shutting down monitor.");
+                break;
             }
             Some((message, _addr)) = messages.next() => {
-                if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg)) = message.payload {
-                    let mut ip_opt = None;
-                    let mut mac_opt = None;
-                    for nla in msg.attributes {
-                        match nla {
-                            NeighbourAttribute::Destination(NeighbourAddress::Inet(ip)) => {
-                                ip_opt = Some(ip);
-                            }
-                            NeighbourAttribute::LinkLayerAddress(mac_bytes) => {
-                                if let Ok(bytes) = mac_bytes.try_into() {
-                                    mac_opt = Some(bytes);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let (Some(ip), Some(mac)) = (ip_opt, mac_opt) {
-                        let ipc_msg = DhcpServerParentToWorkerMsg::AddNeighbor {
-                            ip_address: ip,
-                            mac_address: mac,
-                        };
-                        if let Err(e) = send_msg(&mut ipc_writer, &ipc_msg).await {
-                            error!(
-                                "[dhcp-server-parent] Failed to send neighbor update over IPC: {}",
-                                e
-                            );
-                            break;
-                        }
+                if let Some((ip, mac)) = parse_neighbor_update(&message.payload) {
+                    let ipc_msg = DhcpServerParentToWorkerMsg::AddNeighbor {
+                        ip_address: ip,
+                        mac_address: mac,
+                    };
+                    if let Err(e) = send_msg(&mut ipc_writer, &ipc_msg).await {
+                        error!(
+                            "[dhcp-server-parent] Failed to send neighbor update over IPC: {}",
+                            e
+                        );
+                        break;
                     }
                 }
             }
@@ -118,6 +104,30 @@ async fn run_parent_dhcp_server_monitor<S, A>(
     }
 
     terminate_worker(child_pid).await;
+}
+
+fn parse_neighbor_update(
+    payload: &NetlinkPayload<RouteNetlinkMessage>,
+) -> Option<(Ipv4Addr, [u8; 6])> {
+    let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg)) = payload else {
+        return None;
+    };
+    let mut ip_opt = None;
+    let mut mac_opt = None;
+    for nla in &msg.attributes {
+        match nla {
+            NeighbourAttribute::Destination(NeighbourAddress::Inet(ip)) => {
+                ip_opt = Some(*ip);
+            }
+            NeighbourAttribute::LinkLayerAddress(mac_bytes) => {
+                if let Ok(bytes) = mac_bytes.as_slice().try_into() {
+                    mac_opt = Some(bytes);
+                }
+            }
+            _ => {}
+        }
+    }
+    ip_opt.zip(mac_opt)
 }
 
 fn setup_dhcp_server_attempt(
