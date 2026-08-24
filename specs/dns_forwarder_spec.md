@@ -66,7 +66,7 @@ The forwarder maintains an in-memory cache to reduce external latency and DNS tr
     *   Parses response packets using the `dns-parser` crate.
     *   Finds the minimum TTL among all resource records in the answer section.
     *   Caps the cache entry duration to a maximum of 3600 seconds (`MAX_TTL_SECS`) and a minimum fallback of 30 seconds (`DEFAULT_TTL_SECS`).
-*   **Cache Cleanup**: Spawns a background task running every 60 seconds (`CLEANUP_INTERVAL`) to prune expired cache entries.
+*   **Cache Cleanup**: The unified event loop periodically ticks on `CLEANUP_INTERVAL` to prune expired cache entries and check pending query timeouts.
 
 ---
 

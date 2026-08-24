@@ -41,7 +41,7 @@ When the server receives a message from a client, it processes it according to t
 1.  Filters and checks if the client MAC already has an active lease. If yes, offers that IP address.
 2.  If no lease exists, calls `next_available_ip()` to find a candidate host IP in the LAN subnet (excluding the server's own gateway IP).
 3.  **Active Verification**: Performs active verification using kernel-assisted ARP probing by sending a dummy UDP packet to target the IP and sleeping for 100ms.
-    *   **Dynamic Netlink Watcher**: A long-running background task subscribes to the kernel's `MulticastGroup::Neigh` Netlink group. It reactively parses neighbor (`NewNeighbour`) events to register IP/MAC mappings directly into the shared lease table.
+    *   **Dynamic Netlink Watcher**: The parent supervisor subscribes to the kernel's `MulticastGroup::Neigh` Netlink group and sends `AddNeighbor` IPC events to the worker to register discovered IP/MAC mappings directly into the lease table.
     *   If a conflict is detected (the IP is resolved under a different MAC in the lease table), the candidate IP is marked as temporarily reserved (5-minute hold), and the search continues for the next available IP.
     *   If no conflict is detected, the IP is offered.
 4.  Returns a `DHCPOFFER` to the client.
