@@ -1,10 +1,10 @@
 use crate::services::ipc::{DhcpServerParentToWorkerMsg, async_unix_stream, send_msg};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{setup_worker_sockets, terminate_worker, wait_ipc_eof};
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use log::{error, info};
 use rtnetlink::MulticastGroup;
-use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
+use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
 use std::net::Ipv4Addr;
@@ -41,21 +41,8 @@ fn start_parent_arp_listener(
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
 
-    let connection_fut = rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]);
-    let (connection, _handle, messages) = match connection_fut {
-        Ok(res) => res,
-        Err(e) => {
-            return Err(ServiceError::FailedToStart(format!(
-                "Failed to start Netlink ARP listener connection: {}",
-                e
-            )));
-        }
-    };
-    tokio::spawn(connection);
-
     let handle = tokio::spawn(run_parent_dhcp_server_monitor(
         child_pid,
-        messages,
         ipc_writer,
         ipc_reader,
         shutdown_rx,
@@ -64,16 +51,26 @@ fn start_parent_arp_listener(
     Ok(handle)
 }
 
-async fn run_parent_dhcp_server_monitor<S, A>(
+async fn run_parent_dhcp_server_monitor(
     child_pid: u32,
-    mut messages: S,
     mut ipc_writer: OwnedWriteHalf,
     mut ipc_reader: OwnedReadHalf,
     mut shutdown_rx: Receiver<bool>,
-) where
-    S: Stream<Item = (NetlinkMessage<RouteNetlinkMessage>, A)> + Unpin + Send + 'static,
-    A: Send + 'static,
-{
+) {
+    let (connection, _handle, mut messages) =
+        match rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]) {
+            Ok(res) => res,
+            Err(e) => {
+                error!(
+                    "[dhcp-server-parent] Failed to start Netlink ARP listener: {}",
+                    e
+                );
+                terminate_worker(child_pid).await;
+                return;
+            }
+        };
+    tokio::spawn(connection);
+
     info!(
         "[dhcp-server-parent] Supervising DHCP server worker (PID {})",
         child_pid
