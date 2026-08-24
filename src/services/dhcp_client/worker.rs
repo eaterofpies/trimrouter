@@ -3,7 +3,6 @@ use crate::services::ipc::{DhcpClientToParentMsg, send_msg};
 use crate::services::utils::{
     CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, get_interface_mac,
     mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload, run_sandboxed_worker,
-    wait_shutdown,
 };
 use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
 use dhcproto::{Encodable, Encoder};
@@ -12,6 +11,7 @@ use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
 use tokio::io::AsyncReadExt;
+use tokio::net::unix::OwnedReadHalf;
 
 const DEFAULT_LEASE_SECS: u32 = 3600;
 const MAX_RETRY_DELAY_SECS: u32 = 64;
@@ -158,21 +158,19 @@ struct DhcpClientInternal {
 }
 
 impl DhcpClientInternal {
-    async fn run(&mut self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    async fn run(&mut self, mut ipc_reader: OwnedReadHalf) {
         loop {
-            if *shutdown_rx.borrow() {
-                self.deconfigure().await;
-                break;
-            }
-
             tokio::select! {
-                _ = wait_shutdown(&mut shutdown_rx) => {
+                _ = wait_ipc_eof(&mut ipc_reader) => {
+                    info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
                     self.deconfigure().await;
                     break;
                 }
                 phase_res = self.execute_phases() => {
-                    if let Err(e) = phase_res {
-                        self.handle_phase_failure(e, &mut shutdown_rx).await;
+                    if let Err(e) = phase_res
+                        && !self.handle_phase_failure(e, &mut ipc_reader).await
+                    {
+                        break;
                     }
                 }
             }
@@ -186,19 +184,18 @@ impl DhcpClientInternal {
         Ok(())
     }
 
-    async fn handle_phase_failure(
-        &mut self,
-        e: DhcpError,
-        shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
-    ) {
+    async fn handle_phase_failure(&mut self, e: DhcpError, ipc_reader: &mut OwnedReadHalf) -> bool {
         warn!(
             "[dhcp-client] Phase failed: {}. Retrying in {}s...",
             e, SOCKET_RESTART_DELAY_SECS
         );
         self.deconfigure().await;
         tokio::select! {
-            _ = wait_shutdown(shutdown_rx) => {}
-            _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => {}
+            _ = wait_ipc_eof(ipc_reader) => {
+                info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
+                false
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => true,
         }
     }
 
@@ -512,18 +509,13 @@ impl DhcpClientInternal {
     }
 }
 
-async fn monitor_parent_ipc(
-    mut reader: tokio::net::unix::OwnedReadHalf,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-) {
-    let mut buf = [0u8; 1024];
+async fn wait_ipc_eof(reader: &mut OwnedReadHalf) {
+    let mut buf = [0u8; 128];
     while let Ok(n) = reader.read(&mut buf).await {
         if n == 0 {
             break;
         }
     }
-    info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
-    let _ = shutdown_tx.send(true);
 }
 
 pub async fn run_dhcp_client_worker(
@@ -552,10 +544,7 @@ pub async fn run_dhcp_client_worker(
                 ipc_writer: Some(ipc.writer),
             };
 
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(monitor_parent_ipc(ipc.reader, shutdown_tx));
-
-            client.run(shutdown_rx).await;
+            client.run(ipc.reader).await;
             Ok(())
         },
     )
