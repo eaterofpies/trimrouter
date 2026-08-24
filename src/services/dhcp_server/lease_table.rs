@@ -1,8 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pnet::util::MacAddr;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::services::utils::wait_shutdown;
+
+const LEASE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const CANDIDATE_HOLD_DURATION: Duration = Duration::from_secs(10);
+const NEIGHBOR_HOLD_DURATION: Duration = Duration::from_secs(300);
+const LEASE_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ClientLease {
@@ -101,5 +109,340 @@ impl LeaseTable {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.by_mac.is_empty()
+    }
+}
+
+pub enum LeaseCommand {
+    GetExistingIp {
+        client_mac: MacAddr,
+        reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
+    },
+    AllocateCandidate {
+        client_mac: MacAddr,
+        net: ipnet::Ipv4Net,
+        server_ip: Ipv4Addr,
+        reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
+    },
+    ConfirmLease {
+        client_mac: MacAddr,
+        ip: Ipv4Addr,
+        duration: Duration,
+    },
+    ValidateAndConfirmRequest {
+        client_mac: MacAddr,
+        requested_ip: Option<Ipv4Addr>,
+        server_ip: Ipv4Addr,
+        net: ipnet::Ipv4Net,
+        duration: Duration,
+        reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
+    },
+    CheckConflict {
+        target_ip: Ipv4Addr,
+        client_mac: MacAddr,
+        reply_tx: oneshot::Sender<bool>,
+    },
+    RecordConflict {
+        ip: Ipv4Addr,
+        duration: Duration,
+    },
+    Release {
+        client_mac: MacAddr,
+        reply_tx: Option<oneshot::Sender<Option<Ipv4Addr>>>,
+    },
+    AddNeighbor {
+        mac: MacAddr,
+        ip: Ipv4Addr,
+    },
+}
+
+#[derive(Clone)]
+pub struct LeaseHandle {
+    sender: mpsc::Sender<LeaseCommand>,
+}
+
+impl LeaseHandle {
+    pub async fn get_existing_ip(&self, client_mac: MacAddr) -> Option<Ipv4Addr> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(LeaseCommand::GetExistingIp {
+                client_mac,
+                reply_tx,
+            })
+            .await
+            .ok()?;
+        reply_rx.await.ok()?
+    }
+
+    pub async fn allocate_candidate(
+        &self,
+        client_mac: MacAddr,
+        net: ipnet::Ipv4Net,
+        server_ip: Ipv4Addr,
+    ) -> Option<Ipv4Addr> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(LeaseCommand::AllocateCandidate {
+                client_mac,
+                net,
+                server_ip,
+                reply_tx,
+            })
+            .await
+            .ok()?;
+        reply_rx.await.ok()?
+    }
+
+    pub async fn confirm_lease(&self, client_mac: MacAddr, ip: Ipv4Addr, duration: Duration) {
+        let _ = self
+            .sender
+            .send(LeaseCommand::ConfirmLease {
+                client_mac,
+                ip,
+                duration,
+            })
+            .await;
+    }
+
+    pub async fn validate_and_confirm_request(
+        &self,
+        client_mac: MacAddr,
+        requested_ip: Option<Ipv4Addr>,
+        server_ip: Ipv4Addr,
+        net: ipnet::Ipv4Net,
+        duration: Duration,
+    ) -> Option<Ipv4Addr> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(LeaseCommand::ValidateAndConfirmRequest {
+                client_mac,
+                requested_ip,
+                server_ip,
+                net,
+                duration,
+                reply_tx,
+            })
+            .await
+            .ok()?;
+        reply_rx.await.ok()?
+    }
+
+    pub async fn check_conflict(&self, target_ip: Ipv4Addr, client_mac: MacAddr) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(LeaseCommand::CheckConflict {
+                target_ip,
+                client_mac,
+                reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
+    }
+
+    pub async fn record_conflict(&self, ip: Ipv4Addr, duration: Duration) {
+        let _ = self
+            .sender
+            .send(LeaseCommand::RecordConflict { ip, duration })
+            .await;
+    }
+
+    pub async fn release(&self, client_mac: MacAddr) -> Option<Ipv4Addr> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(LeaseCommand::Release {
+                client_mac,
+                reply_tx: Some(reply_tx),
+            })
+            .await
+            .ok()?;
+        reply_rx.await.ok()?
+    }
+
+    pub async fn add_neighbor(&self, mac: MacAddr, ip: Ipv4Addr) {
+        let _ = self
+            .sender
+            .send(LeaseCommand::AddNeighbor { mac, ip })
+            .await;
+    }
+}
+
+pub fn spawn_lease_actor(shutdown_rx: tokio::sync::watch::Receiver<bool>) -> LeaseHandle {
+    let (tx, rx) = mpsc::channel(LEASE_CHANNEL_CAPACITY);
+    tokio::spawn(run_lease_actor_loop(rx, shutdown_rx));
+    LeaseHandle { sender: tx }
+}
+
+async fn run_lease_actor_loop(
+    mut rx: mpsc::Receiver<LeaseCommand>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut leases = LeaseTable::new();
+    let mut cleanup_interval = tokio::time::interval(LEASE_CLEANUP_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = wait_shutdown(&mut shutdown_rx) => break,
+            _ = cleanup_interval.tick() => {
+                leases.evict_expired();
+            }
+            cmd = rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                handle_lease_command(cmd, &mut leases);
+            }
+        }
+    }
+}
+
+fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
+    match cmd {
+        LeaseCommand::GetExistingIp {
+            client_mac,
+            reply_tx,
+        } => {
+            let _ = reply_tx.send(leases.get(&client_mac).map(|l| l.ip));
+        }
+        LeaseCommand::AllocateCandidate {
+            client_mac,
+            net,
+            server_ip,
+            reply_tx,
+        } => {
+            handle_allocate_candidate(client_mac, net, server_ip, leases, reply_tx);
+        }
+        LeaseCommand::ConfirmLease {
+            client_mac,
+            ip,
+            duration,
+        } => {
+            leases.insert(
+                client_mac,
+                ClientLease {
+                    ip,
+                    expiry: Instant::now() + duration,
+                },
+            );
+        }
+        LeaseCommand::ValidateAndConfirmRequest {
+            client_mac,
+            requested_ip,
+            server_ip,
+            net,
+            duration,
+            reply_tx,
+        } => {
+            handle_validate_and_confirm(
+                client_mac,
+                requested_ip,
+                server_ip,
+                net,
+                duration,
+                leases,
+                reply_tx,
+            );
+        }
+        LeaseCommand::CheckConflict {
+            target_ip,
+            client_mac,
+            reply_tx,
+        } => {
+            let is_conflict = leases
+                .get_mac_by_ip(target_ip)
+                .is_some_and(|mac| mac != client_mac);
+            let _ = reply_tx.send(is_conflict);
+        }
+        LeaseCommand::RecordConflict { ip, duration } => {
+            leases.insert(
+                MacAddr::zero(),
+                ClientLease {
+                    ip,
+                    expiry: Instant::now() + duration,
+                },
+            );
+        }
+        LeaseCommand::Release {
+            client_mac,
+            reply_tx,
+        } => {
+            let removed = leases.remove(&client_mac).map(|l| l.ip);
+            if let Some(tx) = reply_tx {
+                let _ = tx.send(removed);
+            }
+        }
+        LeaseCommand::AddNeighbor { mac, ip } => {
+            update_lease_from_neighbor(mac, ip, leases);
+        }
+    }
+}
+
+fn handle_allocate_candidate(
+    client_mac: MacAddr,
+    net: ipnet::Ipv4Net,
+    server_ip: Ipv4Addr,
+    leases: &mut LeaseTable,
+    reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
+) {
+    let ip = leases.next_available_ip(net, server_ip);
+    if let Some(allocated_ip) = ip {
+        leases.insert(
+            client_mac,
+            ClientLease {
+                ip: allocated_ip,
+                expiry: Instant::now() + CANDIDATE_HOLD_DURATION,
+            },
+        );
+    }
+    let _ = reply_tx.send(ip);
+}
+
+fn handle_validate_and_confirm(
+    client_mac: MacAddr,
+    requested_ip: Option<Ipv4Addr>,
+    server_ip: Ipv4Addr,
+    net: ipnet::Ipv4Net,
+    duration: Duration,
+    leases: &mut LeaseTable,
+    reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
+) {
+    let target_ip = requested_ip.or_else(|| leases.get(&client_mac).map(|l| l.ip));
+    let valid_ip = target_ip.filter(|&ip| {
+        ip != server_ip && net.contains(&ip) && !leases.is_ip_taken_by_other(ip, client_mac)
+    });
+    if let Some(ip) = valid_ip {
+        leases.insert(
+            client_mac,
+            ClientLease {
+                ip,
+                expiry: Instant::now() + duration,
+            },
+        );
+    }
+    let _ = reply_tx.send(valid_ip);
+}
+
+pub fn update_lease_from_neighbor(mac: MacAddr, ip: Ipv4Addr, leases: &mut LeaseTable) {
+    if mac == MacAddr::zero() || mac == MacAddr::broadcast() {
+        return;
+    }
+    if let Some(existing) = leases.get(&mac) {
+        if existing.ip != ip {
+            leases.insert(
+                mac,
+                ClientLease {
+                    ip,
+                    expiry: Instant::now() + NEIGHBOR_HOLD_DURATION,
+                },
+            );
+        }
+    } else {
+        leases.insert(
+            mac,
+            ClientLease {
+                ip,
+                expiry: Instant::now() + NEIGHBOR_HOLD_DURATION,
+            },
+        );
     }
 }
