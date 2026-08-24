@@ -20,6 +20,7 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::watch::Receiver;
 use tokio::time::timeout;
@@ -413,6 +414,15 @@ pub async fn wait_shutdown(shutdown_rx: &mut Receiver<bool>) {
     }
     while shutdown_rx.changed().await.is_ok() {
         if *shutdown_rx.borrow() {
+            break;
+        }
+    }
+}
+
+pub async fn wait_ipc_eof(reader: &mut tokio::net::unix::OwnedReadHalf) {
+    let mut buf = [0u8; 128];
+    while let Ok(n) = reader.read(&mut buf).await {
+        if n == 0 {
             break;
         }
     }

@@ -5,7 +5,7 @@ use crate::services::utils::{WanLeaseReceiver, create_ipc_fds, terminate_worker}
 use log::{error, info};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};
-use tokio::net::unix::OwnedReadHalf;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch::{Receiver, Sender, channel};
 use tokio::task::JoinHandle;
 
@@ -26,7 +26,7 @@ impl SntpClient {
 }
 
 async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: Receiver<bool>) {
-    let mut active_child: Option<(u32, OwnedReadHalf)> = None;
+    let mut active_child: Option<(u32, OwnedReadHalf, OwnedWriteHalf)> = None;
 
     // 1. Initial check on startup
     if lease_rx.borrow_and_update().ip.is_some() {
@@ -47,7 +47,7 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
                 if has_wan && active_child.is_none() {
                     info!("[sntp-client-parent] WAN lease acquired. Spawning worker.");
                     active_child = spawn_sntp_worker().ok();
-                } else if !has_wan && let Some((pid, _)) = active_child.take() {
+                } else if !has_wan && let Some((pid, _, _)) = active_child.take() {
                     info!("[sntp-client-parent] WAN lease lost. Stopping worker.");
                     terminate_worker(pid).await;
                 }
@@ -56,7 +56,7 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
             // Branch B: Process IPC time updates from child (only active when child is running)
             msg = async {
                 match active_child.as_mut() {
-                    Some((_, reader)) => recv_msg::<SntpClientToParentMsg, _>(reader).await,
+                    Some((_, reader, _)) => recv_msg::<SntpClientToParentMsg, _>(reader).await,
                     None => std::future::pending().await,
                 }
             } => {
@@ -65,7 +65,7 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
                         set_system_clock(seconds, nanoseconds);
                     }
                     _ => {
-                        if let Some((pid, _)) = active_child.take() {
+                        if let Some((pid, _, _)) = active_child.take() {
                             terminate_worker(pid).await;
                         }
                     }
@@ -74,15 +74,15 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
         }
     }
 
-    if let Some((pid, _)) = active_child.take() {
+    if let Some((pid, _, _)) = active_child.take() {
         terminate_worker(pid).await;
     }
 }
 
-fn spawn_sntp_worker() -> Result<(u32, OwnedReadHalf), ServiceError> {
+fn spawn_sntp_worker() -> Result<(u32, OwnedReadHalf, OwnedWriteHalf), ServiceError> {
     let (parent_ipc, child_ipc) = create_ipc_fds()?;
     let ipc_stream = async_unix_stream(parent_ipc).map_err(ServiceError::Io)?;
-    let (ipc_reader, _) = ipc_stream.into_split();
+    let (ipc_reader, ipc_writer) = ipc_stream.into_split();
 
     let worker_service = WorkerService::SntpClient {
         ipc_fd: child_ipc.into(),
@@ -99,7 +99,7 @@ fn spawn_sntp_worker() -> Result<(u32, OwnedReadHalf), ServiceError> {
         "[sntp-client-parent] Spawned SNTP worker process PID {}",
         child_pid
     );
-    Ok((child_pid, ipc_reader))
+    Ok((child_pid, ipc_reader, ipc_writer))
 }
 
 fn set_system_clock(seconds: i64, nanoseconds: i64) {

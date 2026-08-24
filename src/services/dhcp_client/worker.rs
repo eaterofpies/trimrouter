@@ -3,6 +3,7 @@ use crate::services::ipc::{DhcpClientToParentMsg, send_msg};
 use crate::services::utils::{
     CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, get_interface_mac,
     mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload, run_sandboxed_worker,
+    wait_ipc_eof,
 };
 use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
 use dhcproto::{Encodable, Encoder};
@@ -10,7 +11,6 @@ use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
-use tokio::io::AsyncReadExt;
 use tokio::net::unix::OwnedReadHalf;
 
 const DEFAULT_LEASE_SECS: u32 = 3600;
@@ -505,15 +505,6 @@ impl DhcpClientInternal {
                 "[dhcp-client] Sent DHCPREQUEST (ciaddr: {}, dest_ip: {}).",
                 ciaddr, dest_ip
             );
-        }
-    }
-}
-
-async fn wait_ipc_eof(reader: &mut OwnedReadHalf) {
-    let mut buf = [0u8; 128];
-    while let Ok(n) = reader.read(&mut buf).await {
-        if n == 0 {
-            break;
         }
     }
 }

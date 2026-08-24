@@ -1,6 +1,6 @@
 use crate::services::ipc::{SntpClientToParentMsg, send_msg};
 use crate::services::utils::{
-    NTP_PORT, SNTP_GID, SNTP_UID, resolve_dns_a_record, run_sandboxed_worker, wait_shutdown,
+    NTP_PORT, SNTP_GID, SNTP_UID, resolve_dns_a_record, run_sandboxed_worker, wait_ipc_eof,
 };
 use chrono::{DateTime, Utc};
 use log::{error, info, warn};
@@ -8,8 +8,7 @@ use std::io::Error as IoError;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::io::OwnedFd;
 use std::time::Duration;
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::watch::{Receiver, channel};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
 const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
@@ -23,17 +22,18 @@ pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
         ipc_fd,
         |ipc| async move {
             let mut ipc_writer = ipc.writer;
-            let (_shutdown_tx, mut shutdown_rx) = channel(false);
+            let mut ipc_reader = ipc.reader;
             let mut current_retry_delay = RETRY_INTERVAL;
 
-            while !*shutdown_rx.borrow() {
+            loop {
                 if !handle_sntp_iteration(
                     &mut ipc_writer,
-                    &mut shutdown_rx,
+                    &mut ipc_reader,
                     &mut current_retry_delay,
                 )
                 .await
                 {
+                    info!("[sntp-client-worker] Parent closed IPC. Shutting down.");
                     break;
                 }
             }
@@ -46,11 +46,11 @@ pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
 
 async fn handle_sntp_iteration(
     ipc_writer: &mut OwnedWriteHalf,
-    shutdown_rx: &mut Receiver<bool>,
+    ipc_reader: &mut OwnedReadHalf,
     current_retry_delay: &mut Duration,
 ) -> bool {
     let sync_res = tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => return false,
+        _ = wait_ipc_eof(ipc_reader) => return false,
         res = sync_time() => res,
     };
 
@@ -62,7 +62,7 @@ async fn handle_sntp_iteration(
             );
             send_time_to_parent(ipc_writer, chrono_dt).await;
             *current_retry_delay = RETRY_INTERVAL;
-            sleep_or_shutdown(SYNC_INTERVAL, shutdown_rx).await
+            sleep_or_shutdown(SYNC_INTERVAL, ipc_reader).await
         }
         Err(e) => {
             warn!(
@@ -70,7 +70,7 @@ async fn handle_sntp_iteration(
                 e,
                 current_retry_delay.as_secs()
             );
-            let proceed = sleep_or_shutdown(*current_retry_delay, shutdown_rx).await;
+            let proceed = sleep_or_shutdown(*current_retry_delay, ipc_reader).await;
             *current_retry_delay = std::cmp::min(*current_retry_delay * 2, MAX_RETRY_INTERVAL);
             proceed
         }
@@ -90,9 +90,9 @@ async fn send_time_to_parent(ipc_writer: &mut OwnedWriteHalf, chrono_dt: DateTim
     }
 }
 
-async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut Receiver<bool>) -> bool {
+async fn sleep_or_shutdown(duration: Duration, ipc_reader: &mut OwnedReadHalf) -> bool {
     tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => false,
+        _ = wait_ipc_eof(ipc_reader) => false,
         _ = tokio::time::sleep(duration) => true,
     }
 }
@@ -124,27 +124,30 @@ async fn sync_time() -> Result<DateTime<Utc>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UnixStream;
 
     #[tokio::test]
     async fn test_sleep_or_shutdown_normal() {
-        let (_shutdown_tx, mut shutdown_rx) = channel(false);
-        // Sleep for a short duration
-        let result = sleep_or_shutdown(Duration::from_millis(10), &mut shutdown_rx).await;
-        assert!(result); // should return true (sleep completed)
+        let (sock1, _sock2) = UnixStream::pair().unwrap();
+        let (mut reader, _writer) = sock1.into_split();
+        let result = sleep_or_shutdown(Duration::from_millis(10), &mut reader).await;
+        assert!(result);
     }
 
     #[tokio::test]
     async fn test_sleep_or_shutdown_triggered() {
-        let (shutdown_tx, mut shutdown_rx) = channel(false);
+        let (sock1, sock2) = UnixStream::pair().unwrap();
+        let (mut reader, _writer) = sock1.into_split();
 
-        let handle = tokio::spawn(async move {
-            sleep_or_shutdown(Duration::from_secs(10), &mut shutdown_rx).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { sleep_or_shutdown(Duration::from_secs(10), &mut reader).await },
+            );
 
-        // Trigger shutdown
-        shutdown_tx.send(true).unwrap();
+        // Close sock2 to trigger EOF
+        drop(sock2);
 
         let result = handle.await.unwrap();
-        assert!(!result); // should return false (shutdown triggered)
+        assert!(!result);
     }
 }
