@@ -3,36 +3,29 @@ use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_udp_socket, run_sandboxed_worker,
     wait_shutdown,
 };
-use log::{debug, error, info, warn};
+use log::{info, warn};
 use std::collections::HashMap;
 use std::io::Error as IoError;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::OwnedFd;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::net::unix::OwnedReadHalf;
-use tokio::sync::watch::{Receiver, Sender, channel};
+use tokio::sync::watch::Receiver;
 
 // =========================================================================
 // DNS Constants & Config
 // =========================================================================
 const DNS_HEADER_SIZE: usize = 12;
-
 const DEFAULT_TTL_SECS: u32 = 30;
 const MAX_TTL_SECS: u32 = 3600;
-
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const RECV_BUF_SIZE: usize = 4096;
-
 const FALLBACK_DNS_SERVER: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_PENDING_QUERIES: usize = 4096;
 const MAX_CACHE_ENTRIES: usize = 4096;
 
-// =========================================================================
-// Cache Structure
-// =========================================================================
 #[derive(Debug, Clone)]
 struct CacheEntry {
     response: Vec<u8>,
@@ -40,12 +33,14 @@ struct CacheEntry {
 }
 
 struct PendingQuery {
-    tx: tokio::sync::oneshot::Sender<Vec<u8>>,
-    upstream_ip: Ipv4Addr,
+    client_addr: SocketAddr,
+    client_xid: u16,
+    cache_key: Vec<u8>,
+    query_payload: Vec<u8>,
+    upstream_servers: Vec<Ipv4Addr>,
+    current_server_idx: usize,
+    deadline: Instant,
 }
-
-type SharedCache = Arc<Mutex<HashMap<Vec<u8>, CacheEntry>>>;
-type PendingQueries = Arc<Mutex<HashMap<u16, PendingQuery>>>;
 
 pub async fn run_dns_forwarder_worker(
     ipc_fd: OwnedFd,
@@ -61,300 +56,225 @@ pub async fn run_dns_forwarder_worker(
         DNS_FORWARDER_GID,
         ipc_fd,
         |ipc| async move {
-            // Retain _ipc_writer in scope so the parent supervisor's EOF monitor does not detect premature closure.
             let _ipc_writer = ipc.writer;
-            let dns_socket = Arc::new(dns_socket);
-            let upstream_socket = Arc::new(upstream_socket);
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-            let cache: SharedCache = Arc::new(Mutex::new(HashMap::new()));
-            let pending_queries: PendingQueries = Arc::new(Mutex::new(HashMap::new()));
-            let (upstream_dns_tx, upstream_dns_rx) = channel(Vec::<Ipv4Addr>::new());
-
-            let (shutdown_tx, shutdown_rx) = channel(false);
-
-            // Spawn IPC monitor task to receive upstream DNS servers dynamically
-            tokio::spawn(run_dns_ipc_monitor(
-                ipc.reader,
-                upstream_dns_tx,
-                shutdown_tx.clone(),
-            ));
-
-            // Spawn the background receiver task for upstream replies.
-            let upstream_task = tokio::spawn(run_upstream_receiver(
-                upstream_socket.clone(),
-                pending_queries.clone(),
-                shutdown_rx.clone(),
-            ));
-
-            // Spawn periodic cleanup task to prune expired cache entries
-            let cleanup_task = tokio::spawn(run_cache_cleanup(cache.clone(), shutdown_rx.clone()));
-
-            // Run the main query forwarder loop
-            run_query_loop(
-                dns_socket,
-                upstream_socket,
-                cache,
-                pending_queries,
-                upstream_dns_rx,
-                shutdown_rx,
-            )
-            .await;
-
-            let _ = upstream_task.await;
-            let _ = cleanup_task.await;
+            run_forwarder_loop(dns_socket, upstream_socket, ipc.reader, shutdown_rx).await;
             Ok(())
         },
     )
     .await
 }
 
-async fn run_dns_ipc_monitor(
-    mut reader: OwnedReadHalf,
-    upstream_dns_tx: Sender<Vec<Ipv4Addr>>,
-    shutdown_tx: Sender<bool>,
-) {
-    loop {
-        match recv_msg::<DnsParentToWorkerMsg, _>(&mut reader).await {
-            Ok(Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })) => {
-                let _ = upstream_dns_tx.send(servers);
-            }
-            Ok(None) => {
-                info!("[dns-forwarder-worker] Parent closed IPC. Shutting down.");
-                let _ = shutdown_tx.send(true);
-                break;
-            }
-            Err(e) => {
-                error!(
-                    "[dns-forwarder-worker] IPC read error: {}. Shutting down.",
-                    e
-                );
-                let _ = shutdown_tx.send(true);
-                break;
-            }
-        }
-    }
-}
-
-fn dispatch_pending_query(
-    pending: PendingQuery,
-    from_addr: SocketAddr,
-    resp_buf: &[u8],
-    len: usize,
-    xid: u16,
-) {
-    if from_addr.ip() == IpAddr::V4(pending.upstream_ip) {
-        let _ = pending.tx.send(resp_buf[..len].to_vec());
-    } else {
-        warn!(
-            "[dns-forwarder] WARNING: Received DNS spoof attempt! IP {} mismatch for xid {}",
-            from_addr.ip(),
-            xid
-        );
-    }
-}
-
-async fn run_upstream_receiver(
-    upstream_socket: Arc<tokio::net::UdpSocket>,
-    pending_queries: PendingQueries,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    let mut resp_buf = [0u8; RECV_BUF_SIZE];
-    loop {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-
-        let recv_fut = upstream_socket.recv_from(&mut resp_buf);
-        let res = tokio::select! {
-            _ = wait_shutdown(&mut shutdown_rx) => {
-                break;
-            }
-            r = recv_fut => r,
-        };
-
-        let (len, from_addr) = match res {
-            Ok(res) => res,
-            Err(e) => {
-                handle_upstream_error(e, &mut shutdown_rx).await;
-                continue;
-            }
-        };
-
-        if len < DNS_HEADER_SIZE {
-            continue;
-        }
-        let xid = u16::from_be_bytes([resp_buf[0], resp_buf[1]]);
-
-        let pending = {
-            let mut lock = pending_queries.lock().unwrap();
-            lock.remove(&xid)
-        };
-
-        if let Some(p) = pending {
-            dispatch_pending_query(p, from_addr, &resp_buf, len, xid);
-        }
-    }
-}
-
-async fn handle_upstream_error(e: IoError, shutdown_rx: &mut Receiver<bool>) {
-    error!("[dns-forwarder] Upstream socket read error: {}", e);
-    tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => {}
-        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-    }
-}
-
-async fn run_cache_cleanup(cache: SharedCache, mut shutdown_rx: Receiver<bool>) {
-    loop {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-        tokio::select! {
-            _ = wait_shutdown(&mut shutdown_rx) => {
-                break;
-            }
-            _ = tokio::time::sleep(CLEANUP_INTERVAL) => {
-                let mut lock = cache.lock().unwrap();
-                let now = Instant::now();
-                lock.retain(|_, entry| entry.expiry > now);
-            }
-        }
-    }
-}
-
-async fn process_next_query(
-    socket: &Arc<UdpSocket>,
-    upstream_socket: &Arc<UdpSocket>,
-    cache: &SharedCache,
-    pending_queries: &PendingQueries,
-    upstream_dns: &Receiver<Vec<Ipv4Addr>>,
-    shutdown_rx: &mut Receiver<bool>,
-    buf: &mut [u8],
-) -> bool {
-    let recv_fut = socket.recv_from(buf);
-    let res = tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => {
-            return false;
-        }
-        r = recv_fut => r,
-    };
-
-    let (len, src) = match res {
-        Ok(res) => res,
-        Err(e) => {
-            handle_query_loop_error(e, shutdown_rx).await;
-            return true;
-        }
-    };
-
-    let query = buf[..len].to_vec();
-    let socket_clone = socket.clone();
-    let cache_clone = cache.clone();
-    let upstream_dns_clone = upstream_dns.clone();
-    let upstream_sock_clone = upstream_socket.clone();
-    let pending_queries_clone = pending_queries.clone();
-
-    tokio::spawn(async move {
-        handle_dns_query(
-            query,
-            src,
-            socket_clone,
-            cache_clone,
-            upstream_dns_clone,
-            upstream_sock_clone,
-            pending_queries_clone,
-        )
-        .await;
-    });
-    true
-}
-
-async fn run_query_loop(
-    socket: Arc<UdpSocket>,
-    upstream_socket: Arc<UdpSocket>,
-    cache: SharedCache,
-    pending_queries: PendingQueries,
-    upstream_dns: Receiver<Vec<Ipv4Addr>>,
+async fn run_forwarder_loop(
+    dns_socket: UdpSocket,
+    upstream_socket: UdpSocket,
+    mut ipc_reader: OwnedReadHalf,
     mut shutdown_rx: Receiver<bool>,
 ) {
-    let mut buf = [0u8; RECV_BUF_SIZE];
+    let mut cache = HashMap::<Vec<u8>, CacheEntry>::new();
+    let mut pending_queries = HashMap::<u16, PendingQuery>::new();
+    let mut upstream_servers = Vec::<Ipv4Addr>::new();
+    let mut client_buf = [0u8; RECV_BUF_SIZE];
+    let mut upstream_buf = [0u8; RECV_BUF_SIZE];
+    let mut cleanup_timer = tokio::time::interval(CLEANUP_INTERVAL);
+
     loop {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-        let proceed = process_next_query(
-            &socket,
-            &upstream_socket,
-            &cache,
-            &pending_queries,
-            &upstream_dns,
-            &mut shutdown_rx,
-            &mut buf,
-        )
-        .await;
-        if !proceed {
-            break;
+        tokio::select! {
+            _ = wait_shutdown(&mut shutdown_rx) => break,
+            _ = cleanup_timer.tick() => {
+                evict_expired_cache(&mut cache);
+                check_pending_timeouts(&mut pending_queries, &upstream_socket).await;
+            }
+            ipc_msg = recv_msg::<DnsParentToWorkerMsg, _>(&mut ipc_reader) => {
+                match ipc_msg {
+                    Ok(Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })) => {
+                        upstream_servers = servers;
+                    }
+                    Ok(None) | Err(_) => {
+                        info!("[dns-forwarder-worker] Parent IPC closed. Shutting down.");
+                        break;
+                    }
+                }
+            }
+            client_recv = dns_socket.recv_from(&mut client_buf) => {
+                if let Ok((len, src)) = client_recv {
+                    handle_client_query(
+                        &client_buf[..len],
+                        src,
+                        &dns_socket,
+                        &upstream_socket,
+                        &mut cache,
+                        &mut pending_queries,
+                        &upstream_servers,
+                    ).await;
+                }
+            }
+            upstream_recv = upstream_socket.recv_from(&mut upstream_buf) => {
+                if let Ok((len, from_addr)) = upstream_recv {
+                    handle_upstream_reply(
+                        &upstream_buf[..len],
+                        from_addr,
+                        &dns_socket,
+                        &mut cache,
+                        &mut pending_queries,
+                    ).await;
+                }
+            }
         }
     }
 }
 
-async fn handle_query_loop_error(e: IoError, shutdown_rx: &mut Receiver<bool>) {
-    warn!(
-        "[dns-forwarder] Socket receive error: {}. Retrying in 1s...",
-        e
-    );
-    tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => {}
-        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-    }
-}
-
-async fn handle_dns_query(
-    query: Vec<u8>,
+async fn handle_client_query(
+    query: &[u8],
     src: SocketAddr,
-    socket: Arc<UdpSocket>,
-    cache: SharedCache,
-    upstream_dns: Receiver<Vec<Ipv4Addr>>,
-    upstream_socket: Arc<UdpSocket>,
-    pending_queries: PendingQueries,
+    dns_socket: &UdpSocket,
+    upstream_socket: &UdpSocket,
+    cache: &mut HashMap<Vec<u8>, CacheEntry>,
+    pending: &mut HashMap<u16, PendingQuery>,
+    configured_servers: &[Ipv4Addr],
 ) {
     if query.len() < DNS_HEADER_SIZE {
         return;
     }
-
-    let cache_key = match get_cache_key(&query) {
-        Some(key) => key,
-        None => return,
+    let Some(cache_key) = get_cache_key(query) else {
+        return;
     };
 
-    if let Some(mut response) = lookup_cache(&cache_key, &cache) {
+    if let Some(mut response) = lookup_cache(&cache_key, cache) {
         response[0] = query[0];
         response[1] = query[1];
-        if let Err(e) = socket.send_to(&response, src).await {
-            debug!(
-                "[dns-forwarder] Failed to send cached DNS response to {}: {}",
-                src, e
-            );
-        }
+        let _ = dns_socket.send_to(&response, src).await;
         return;
     }
 
-    let upstream_servers = get_upstream_resolvers(&upstream_dns);
+    forward_new_client_query(
+        query,
+        src,
+        cache_key,
+        upstream_socket,
+        pending,
+        configured_servers,
+    )
+    .await;
+}
 
-    for upstream_ip in upstream_servers {
-        if let Some(response) =
-            forward_query(&query, upstream_ip, &upstream_socket, &pending_queries).await
-        {
-            insert_cache(cache_key, response.clone(), &cache);
-            if let Err(e) = socket.send_to(&response, src).await {
-                debug!(
-                    "[dns-forwarder] Failed to send DNS response to {}: {}",
-                    src, e
-                );
-            }
-            return;
+async fn forward_new_client_query(
+    query: &[u8],
+    src: SocketAddr,
+    cache_key: Vec<u8>,
+    upstream_socket: &UdpSocket,
+    pending: &mut HashMap<u16, PendingQuery>,
+    configured_servers: &[Ipv4Addr],
+) {
+    if pending.len() >= MAX_PENDING_QUERIES {
+        return;
+    }
+    let Some(upstream_xid) = allocate_unique_xid(pending) else {
+        return;
+    };
+
+    let client_xid = u16::from_be_bytes([query[0], query[1]]);
+    let upstream_servers = get_upstream_resolvers(configured_servers);
+    let target_server = upstream_servers[0];
+
+    let mut forwarded = query.to_vec();
+    let xid_bytes = upstream_xid.to_be_bytes();
+    forwarded[0] = xid_bytes[0];
+    forwarded[1] = xid_bytes[1];
+
+    let dest = SocketAddr::new(IpAddr::V4(target_server), DNS_PORT);
+    if upstream_socket.send_to(&forwarded, dest).await.is_ok() {
+        pending.insert(
+            upstream_xid,
+            PendingQuery {
+                client_addr: src,
+                client_xid,
+                cache_key,
+                query_payload: query.to_vec(),
+                upstream_servers,
+                current_server_idx: 0,
+                deadline: Instant::now() + UPSTREAM_TIMEOUT,
+            },
+        );
+    }
+}
+
+async fn handle_upstream_reply(
+    reply: &[u8],
+    from_addr: SocketAddr,
+    dns_socket: &UdpSocket,
+    cache: &mut HashMap<Vec<u8>, CacheEntry>,
+    pending: &mut HashMap<u16, PendingQuery>,
+) {
+    if reply.len() < DNS_HEADER_SIZE {
+        return;
+    }
+    let upstream_xid = u16::from_be_bytes([reply[0], reply[1]]);
+    let Some(query_meta) = pending.remove(&upstream_xid) else {
+        return;
+    };
+
+    let expected_ip = query_meta.upstream_servers[query_meta.current_server_idx];
+    if from_addr.ip() != IpAddr::V4(expected_ip) {
+        warn!(
+            "[dns-forwarder] WARNING: Received DNS spoof attempt! IP {} mismatch for xid {}",
+            from_addr.ip(),
+            upstream_xid
+        );
+        return;
+    }
+
+    insert_cache(query_meta.cache_key, reply.to_vec(), cache);
+
+    let mut client_response = reply.to_vec();
+    let client_xid_bytes = query_meta.client_xid.to_be_bytes();
+    client_response[0] = client_xid_bytes[0];
+    client_response[1] = client_xid_bytes[1];
+
+    let _ = dns_socket
+        .send_to(&client_response, query_meta.client_addr)
+        .await;
+}
+
+async fn check_pending_timeouts(
+    pending: &mut HashMap<u16, PendingQuery>,
+    upstream_socket: &UdpSocket,
+) {
+    let now = Instant::now();
+    let mut retry_list = Vec::new();
+
+    pending.retain(|&xid, query| {
+        if query.deadline > now {
+            return true;
+        }
+        if query.current_server_idx + 1 < query.upstream_servers.len() {
+            retry_list.push(xid);
+            return true;
+        }
+        false
+    });
+
+    for xid in retry_list {
+        if let Some(query) = pending.get_mut(&xid) {
+            query.current_server_idx += 1;
+            query.deadline = now + UPSTREAM_TIMEOUT;
+            let target_server = query.upstream_servers[query.current_server_idx];
+
+            let mut forwarded = query.query_payload.clone();
+            let xid_bytes = xid.to_be_bytes();
+            forwarded[0] = xid_bytes[0];
+            forwarded[1] = xid_bytes[1];
+
+            let dest = SocketAddr::new(IpAddr::V4(target_server), DNS_PORT);
+            let _ = upstream_socket.send_to(&forwarded, dest).await;
         }
     }
+}
+
+fn evict_expired_cache(cache: &mut HashMap<Vec<u8>, CacheEntry>) {
+    let now = Instant::now();
+    cache.retain(|_, entry| entry.expiry > now);
 }
 
 fn get_cache_key(query_bytes: &[u8]) -> Option<Vec<u8>> {
@@ -367,23 +287,18 @@ fn get_cache_key(query_bytes: &[u8]) -> Option<Vec<u8>> {
     Some(key.into_bytes())
 }
 
-fn lookup_cache(cache_key: &[u8], cache: &Mutex<HashMap<Vec<u8>, CacheEntry>>) -> Option<Vec<u8>> {
-    let mut lock = cache.lock().unwrap();
-    match lock.get(cache_key) {
+fn lookup_cache(cache_key: &[u8], cache: &mut HashMap<Vec<u8>, CacheEntry>) -> Option<Vec<u8>> {
+    match cache.get(cache_key) {
         Some(entry) if entry.expiry > Instant::now() => Some(entry.response.clone()),
         Some(_) => {
-            lock.remove(cache_key);
+            cache.remove(cache_key);
             None
         }
         None => None,
     }
 }
 
-fn insert_cache(
-    cache_key: Vec<u8>,
-    response: Vec<u8>,
-    cache: &Mutex<HashMap<Vec<u8>, CacheEntry>>,
-) {
+fn insert_cache(cache_key: Vec<u8>, response: Vec<u8>, cache: &mut HashMap<Vec<u8>, CacheEntry>) {
     if response.len() < DNS_HEADER_SIZE {
         return;
     }
@@ -403,105 +318,37 @@ fn insert_cache(
     let cache_ttl = std::cmp::min(MAX_TTL_SECS, ttl);
     let expiry = Instant::now() + Duration::from_secs(cache_ttl as u64);
 
-    let mut lock = cache.lock().unwrap();
-    if lock.len() >= MAX_CACHE_ENTRIES && !lock.contains_key(&cache_key) {
-        let now = Instant::now();
-        lock.retain(|_, entry| entry.expiry > now);
-        if lock.len() >= MAX_CACHE_ENTRIES
-            && let Some(oldest_key) = lock
+    if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&cache_key) {
+        evict_expired_cache(cache);
+        if cache.len() >= MAX_CACHE_ENTRIES
+            && let Some(oldest_key) = cache
                 .iter()
                 .min_by_key(|(_, entry)| entry.expiry)
                 .map(|(k, _)| k.clone())
         {
-            lock.remove(&oldest_key);
+            cache.remove(&oldest_key);
         }
     }
-    lock.insert(cache_key, CacheEntry { response, expiry });
+    cache.insert(cache_key, CacheEntry { response, expiry });
 }
 
-fn get_upstream_resolvers(upstream_dns: &Receiver<Vec<Ipv4Addr>>) -> Vec<Ipv4Addr> {
-    let servers = upstream_dns.borrow();
-    if !servers.is_empty() {
-        servers.clone()
+fn get_upstream_resolvers(configured: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    if !configured.is_empty() {
+        configured.to_vec()
     } else {
         vec![FALLBACK_DNS_SERVER]
     }
 }
 
-// Forward query to the upstream DNS resolver using the shared socket.
-// To support concurrent requests over a single socket, we:
-// 1. Save the client's original transaction ID (xid).
-// 2. Generate a new, unique transaction ID and write it to the DNS query header.
-// 3. Register a oneshot channel mapping our unique transaction ID to the waiting task.
-// 4. Send the modified query upstream.
-// 5. Wait for the background loop to receive and dispatch the response payload, then restore
-//    the client's original transaction ID before returning.
-fn register_pending_query(
-    pending_queries: &PendingQueries,
-    upstream_dns: Ipv4Addr,
-) -> Option<(u16, tokio::sync::oneshot::Receiver<Vec<u8>>)> {
-    let mut lock = pending_queries.lock().unwrap();
-    if lock.len() >= MAX_PENDING_QUERIES {
+fn allocate_unique_xid(pending: &HashMap<u16, PendingQuery>) -> Option<u16> {
+    if pending.len() >= MAX_PENDING_QUERIES {
         return None;
     }
     let mut rng_xid = rand::random::<u16>();
-    while lock.contains_key(&rng_xid) {
+    while pending.contains_key(&rng_xid) {
         rng_xid = rand::random::<u16>();
     }
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    lock.insert(
-        rng_xid,
-        PendingQuery {
-            tx,
-            upstream_ip: upstream_dns,
-        },
-    );
-    Some((rng_xid, rx))
-}
-
-async fn forward_query(
-    query: &[u8],
-    upstream_dns: Ipv4Addr,
-    upstream_socket: &tokio::net::UdpSocket,
-    pending_queries: &PendingQueries,
-) -> Option<Vec<u8>> {
-    if query.len() < DNS_HEADER_SIZE {
-        return None;
-    }
-    let client_xid = u16::from_be_bytes([query[0], query[1]]);
-
-    let (rng_xid, rx) = register_pending_query(pending_queries, upstream_dns)?;
-
-    let mut forwarded_query = query.to_vec();
-    let xid_bytes = rng_xid.to_be_bytes();
-    forwarded_query[0] = xid_bytes[0];
-    forwarded_query[1] = xid_bytes[1];
-
-    let dest_addr = SocketAddr::new(IpAddr::V4(upstream_dns), DNS_PORT);
-    if let Err(e) = upstream_socket.send_to(&forwarded_query, dest_addr).await {
-        debug!(
-            "[dns-forwarder] Failed to forward DNS query to {}: {}",
-            upstream_dns, e
-        );
-        let mut lock = pending_queries.lock().unwrap();
-        lock.remove(&rng_xid);
-        return None;
-    }
-
-    let Ok(Ok(mut response)) = tokio::time::timeout(UPSTREAM_TIMEOUT, rx).await else {
-        let mut lock = pending_queries.lock().unwrap();
-        lock.remove(&rng_xid);
-        return None;
-    };
-
-    if response.len() >= DNS_HEADER_SIZE {
-        let client_xid_bytes = client_xid.to_be_bytes();
-        response[0] = client_xid_bytes[0];
-        response[1] = client_xid_bytes[1];
-        Some(response)
-    } else {
-        None
-    }
+    Some(rng_xid)
 }
 
 // =========================================================================
@@ -513,7 +360,6 @@ mod tests {
 
     #[test]
     fn test_get_cache_key_valid() {
-        // DNS header (12 bytes) + "google.com" question + Type A (2 bytes) + Class IN (2 bytes)
         let mut query = vec![0u8; DNS_HEADER_SIZE];
         query[5] = 1; // QDCount = 1
         query.extend_from_slice(&[
@@ -528,54 +374,36 @@ mod tests {
 
     #[test]
     fn test_get_cache_key_invalid() {
-        let query = vec![0u8; 10]; // Too short
+        let query = vec![0u8; 10];
         assert_eq!(get_cache_key(&query), None);
     }
 
     #[test]
     fn test_insert_cache_ttl() {
-        // Build a raw DNS response with answers having TTL 300 and 150
         let mut resp = vec![0u8; DNS_HEADER_SIZE];
-        // Question: "google.com", Type A, Class IN
         resp.extend_from_slice(&[
             6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
         ]);
         resp.extend_from_slice(&[0, 1]); // Type A
         resp.extend_from_slice(&[0, 1]); // Class IN
 
-        // Modify header to specify 1 question and 2 answers
         resp[5] = 1; // QDCount = 1
         resp[7] = 2; // ANCount = 2
 
-        // Answer 1: name compression pointer 0xc00c, Type A, Class IN, TTL 300, RDLength 4, IP 8.8.8.8
-        resp.extend_from_slice(&[0xc0, 0x0c]);
-        resp.extend_from_slice(&[0, 1]); // Type A
-        resp.extend_from_slice(&[0, 1]); // Class IN
-        resp.extend_from_slice(&[0, 0, 1, 0x2c]); // TTL = 300
-        resp.extend_from_slice(&[0, 4]); // RDLength
-        resp.extend_from_slice(&[8, 8, 8, 8]); // IP
+        resp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4, 8, 8, 8, 8]);
+        resp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0x96, 0, 4, 8, 8, 4, 4]);
 
-        // Answer 2: name compression pointer 0xc00c, Type A, Class IN, TTL 150, RDLength 4, IP 8.8.4.4
-        resp.extend_from_slice(&[0xc0, 0x0c]);
-        resp.extend_from_slice(&[0, 1]); // Type A
-        resp.extend_from_slice(&[0, 1]); // Class IN
-        resp.extend_from_slice(&[0, 0, 0, 0x96]); // TTL = 150
-        resp.extend_from_slice(&[0, 4]); // RDLength
-        resp.extend_from_slice(&[8, 8, 4, 4]); // IP
+        let mut cache = HashMap::new();
+        insert_cache(b"key".to_vec(), resp, &mut cache);
 
-        let cache = Mutex::new(HashMap::new());
-        insert_cache(b"key".to_vec(), resp, &cache);
-
-        let lock = cache.lock().unwrap();
-        let entry = lock.get(&b"key".to_vec()[..]).unwrap();
+        let entry = cache.get(&b"key".to_vec()[..]).unwrap();
         let cache_ttl = entry.expiry.duration_since(Instant::now()).as_secs();
         assert!((148..=150).contains(&cache_ttl));
     }
 
     #[test]
     fn test_get_upstream_resolvers_empty_fallback() {
-        let (_tx, rx) = tokio::sync::watch::channel(Vec::new());
-        let resolvers = get_upstream_resolvers(&rx);
+        let resolvers = get_upstream_resolvers(&[]);
         assert_eq!(resolvers, vec![FALLBACK_DNS_SERVER]);
     }
 
@@ -583,8 +411,7 @@ mod tests {
     fn test_get_upstream_resolvers_configured() {
         let primary = Ipv4Addr::new(1, 1, 1, 1);
         let secondary = Ipv4Addr::new(1, 0, 0, 1);
-        let (_tx, rx) = tokio::sync::watch::channel(vec![primary, secondary]);
-        let resolvers = get_upstream_resolvers(&rx);
+        let resolvers = get_upstream_resolvers(&[primary, secondary]);
         assert_eq!(resolvers, vec![primary, secondary]);
     }
 }

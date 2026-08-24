@@ -23,32 +23,31 @@ To support concurrent requests over a single socket safely, `trimrouter` impleme
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Forwarder (Query Loop)
-    participant Upstream Socket (Receiver)
+    participant Forwarder (Event Loop)
     participant DNS Server
 
-    Client->>Forwarder (Query Loop): DNS Query (Client XID)
-    Note over Forwarder (Query Loop): Check Cache (Hit/Miss)
-    Note over Forwarder (Query Loop): Generate Random Upstream XID
-    Forwarder (Query Loop)->>DNS Server: Forwarded Query (Upstream XID)
-    DNS Server->>Upstream Socket (Receiver): DNS Reply (Upstream XID)
-    Note over Upstream Socket (Receiver): Verify Upstream Source IP matches DNS Server
-    Note over Upstream Socket (Receiver): Restore Client XID
-    Upstream Socket (Receiver)->>Client: DNS Reply (Client XID)
+    Client->>Forwarder (Event Loop): DNS Query (Client XID)
+    Note over Forwarder (Event Loop): Check Cache (Hit/Miss)
+    Note over Forwarder (Event Loop): Generate Random Upstream XID & Record Pending
+    Forwarder (Event Loop)->>DNS Server: Forwarded Query (Upstream XID)
+    DNS Server->>Forwarder (Event Loop): DNS Reply (Upstream XID)
+    Note over Forwarder (Event Loop): Verify Upstream Source IP matches DNS Server
+    Note over Forwarder (Event Loop): Restore Client XID & Cache Response
+    Forwarder (Event Loop)->>Client: DNS Reply (Client XID)
 ```
 
 ### 2.1 Transaction ID (XID) Randomization
 For every query forwarded upstream:
-1.  The client's original transaction ID (XID) is saved.
+1.  The client's original transaction ID (XID) and destination address are saved.
 2.  A new, cryptographically random transaction ID is generated.
-3.  A oneshot channel is registered in the `PendingQueries` registry map, mapping the new transaction ID to the waiting client task.
+3.  A pending record is registered in the `pending_queries` map, mapping the new transaction ID to the client state and deadline.
 
 ### 2.2 Cache Poisoning & Spoofing Protection
-*   The background receiver loop listens on the upstream socket.
+*   The unified event loop selects over client and upstream sockets.
 *   Upon receiving an upstream response, it extracts the transaction ID and retrieves the pending record.
 *   **Verification**: Validates that the packet's sender IP address matches the expected upstream DNS server IP.
 *   **Discarding**: If the sender IP does not match, the packet is logged as a DNS spoofing attempt and discarded, protecting the local resolver cache from poisoning.
-*   If valid, the oneshot channel sends the response, the original transaction ID is restored, and the reply is returned to the client.
+*   If valid, the response is cached, the original transaction ID is restored, and the reply is returned to the client.
 
 ### 2.3 Upstream Target Selection & Fallback
 *   Retrieves the list of upstream DNS servers from the WAN interface's active `WanLease` configuration.
