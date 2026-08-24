@@ -8,7 +8,8 @@ description: Guidelines and instructions for running git commits securely and ob
 This skill provides the instructions for performing git commits securely and resolving git command permission errors.
 
 ## 1. Commit Guidelines
-* Always run a clean compilation check (`cargo check`) and unit tests (`cargo test`) before committing.
+* **Atomic & Working Commits**: Every individual commit must be self-contained, compile cleanly (`cargo check`), pass linter checks with zero warnings (`cargo clippy --all-targets`), and pass unit/integration tests (`cargo test`) independently. Never commit broken intermediate states that break `git bisect` or continuous integration.
+* Always run pre-commit validation (`cargo check`, `cargo fmt --check`, `cargo clippy --all-targets`, and `cargo test`) before executing any commit.
 * STRICT RULE: Never execute a git commit command without asking and obtaining explicit approval from the USER in the chat first.
 * Format commit messages using Conventional Commits:
   * `feat: ...` for new features.

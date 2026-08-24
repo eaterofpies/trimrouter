@@ -54,9 +54,11 @@ This skill provides code style and design standards for writing and modifying Ru
   * Avoid using fully qualified paths (e.g., `crate::error::RouterError`, `std::collections::HashSet`, `std::sync::Mutex`, `std::os::unix::io::RawFd`) repeatedly inside function signatures or bodies.
   * Inline qualification should only be used where necessary to resolve name collisions (e.g., distinguishing `std::fmt::Error` from `std::io::Error`), or when using imports/aliases is less readable.
 
-## 10. Pre-Commit Verification and Autoformatting
+## 10. Pre-Commit Verification, Autoformatting & Working Commits
+* **Working Commits Guarantee**: Every single git commit in a series must be self-contained and compile cleanly without errors or warnings. Never create intermediate commits that fail compilation or test suites.
 * Run `cargo fmt` to ensure the codebase is formatted according to the standard style before staging changes.
 * Run `cargo clippy --all-targets` and fix any warnings or errors before committing code. Warnings should be treated as errors where possible to maintain the highest code quality standards.
+* Run `cargo test` to verify all unit and integration tests succeed on every commit.
 
 ## 11. Clean Option Logging
 * **Avoid printing `Some(...)` in logs**: Whenever logging a message or diagnostic that contains an `Option` value, do not print it in its raw `Some(value)` representation.
