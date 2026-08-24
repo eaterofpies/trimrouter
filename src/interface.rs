@@ -84,7 +84,12 @@ impl ManagedInterface {
     /// Stops and terminates all running services bound to this interface.
     pub async fn stop_services(&mut self) {
         for service in &mut self.active_services {
-            let _ = service.stop().await;
+            if let Err(e) = service.stop().await {
+                error!(
+                    "[interface] Failed to stop service on interface {}: {}",
+                    self.name, e
+                );
+            }
         }
     }
 }

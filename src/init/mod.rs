@@ -36,7 +36,9 @@ pub async fn run_as_init(sys: Arc<RealSystem>) {
     let _ = sig_handle.await;
 
     info!("[init] Stopping services...");
-    let _ = dns_forwarder.stop().await;
+    if let Err(e) = dns_forwarder.stop().await {
+        error!("[init] Failed to stop DNS forwarder: {}", e);
+    }
 }
 
 fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {

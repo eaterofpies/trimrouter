@@ -83,7 +83,12 @@ async fn run_lan_manager_loop(
         Ok(res) => res,
         Err(e) => {
             error!("[lan-manager] Failed to create multicast netlink: {}", e);
-            let _ = dhcp_server.stop().await;
+            if let Err(stop_err) = dhcp_server.stop().await {
+                error!(
+                    "[lan-manager] Failed to stop LAN DHCP server on error: {}",
+                    stop_err
+                );
+            }
             return;
         }
     };

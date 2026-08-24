@@ -3,7 +3,7 @@ use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{
     DNS_PORT, WanLeaseReceiver, create_ipc_fds, terminate_worker, wait_ipc_eof,
 };
-use log::info;
+use log::{error, info};
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::unix::io::OwnedFd;
@@ -47,7 +47,12 @@ async fn run_parent_dns_monitor(
     {
         let initial_servers = lease_rx.borrow_and_update().dns_servers.clone();
         if !initial_servers.is_empty() {
-            let _ = update_upstream_resolvers(&mut ipc_writer, &initial_servers).await;
+            if let Err(e) = update_upstream_resolvers(&mut ipc_writer, &initial_servers).await {
+                error!(
+                    "[dns-forwarder-parent] Failed to send initial upstream resolvers: {}",
+                    e
+                );
+            }
             last_dns_servers = initial_servers;
         }
     }
