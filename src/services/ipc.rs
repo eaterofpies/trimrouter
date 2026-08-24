@@ -13,6 +13,12 @@ pub fn async_unix_stream(fd: OwnedFd) -> Result<UnixStream, std::io::Error> {
     UnixStream::from_std(std_stream)
 }
 
+/// Represents the bidirectional Unix domain socket IPC channel for a sandboxed worker.
+///
+/// NOTE: Both `reader` and `writer` (or the `IpcEndpoint` instance) must be kept alive in scope
+/// for the entire lifetime of the worker task. Dropping either half closes the Unix domain socket,
+/// causing the parent supervisor's EOF monitor (`read(&mut buf) -> 0`) to assume the worker has
+/// crashed or terminated and send `SIGTERM`.
 pub struct IpcEndpoint {
     pub reader: OwnedReadHalf,
     pub writer: Arc<Mutex<OwnedWriteHalf>>,

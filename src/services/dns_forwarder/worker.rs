@@ -61,20 +61,21 @@ pub async fn run_dns_forwarder_worker(
         DNS_FORWARDER_GID,
         ipc_fd,
         |ipc| async move {
+            // Retain _ipc_writer in scope so the parent supervisor's EOF monitor does not detect premature closure.
+            let _ipc_writer = ipc.writer;
             let dns_socket = Arc::new(dns_socket);
             let upstream_socket = Arc::new(upstream_socket);
 
             let cache: SharedCache = Arc::new(Mutex::new(HashMap::new()));
             let pending_queries: PendingQueries = Arc::new(Mutex::new(HashMap::new()));
-            let upstream_dns = Arc::new(Mutex::new(Vec::<Ipv4Addr>::new()));
+            let (upstream_dns_tx, upstream_dns_rx) = channel(Vec::<Ipv4Addr>::new());
 
             let (shutdown_tx, shutdown_rx) = channel(false);
 
             // Spawn IPC monitor task to receive upstream DNS servers dynamically
             tokio::spawn(run_dns_ipc_monitor(
                 ipc.reader,
-                ipc.writer,
-                upstream_dns.clone(),
+                upstream_dns_tx,
                 shutdown_tx.clone(),
             ));
 
@@ -94,7 +95,7 @@ pub async fn run_dns_forwarder_worker(
                 upstream_socket,
                 cache,
                 pending_queries,
-                upstream_dns,
+                upstream_dns_rx,
                 shutdown_rx,
             )
             .await;
@@ -109,15 +110,13 @@ pub async fn run_dns_forwarder_worker(
 
 async fn run_dns_ipc_monitor(
     mut reader: OwnedReadHalf,
-    _writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
+    upstream_dns_tx: Sender<Vec<Ipv4Addr>>,
     shutdown_tx: Sender<bool>,
 ) {
     loop {
         match recv_msg::<DnsParentToWorkerMsg, _>(&mut reader).await {
             Ok(Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })) => {
-                let mut lock = upstream_dns.lock().unwrap();
-                *lock = servers;
+                let _ = upstream_dns_tx.send(servers);
             }
             Ok(None) => {
                 info!("[dns-forwarder-worker] Parent closed IPC. Shutting down.");
@@ -228,7 +227,7 @@ async fn process_next_query(
     upstream_socket: &Arc<UdpSocket>,
     cache: &SharedCache,
     pending_queries: &PendingQueries,
-    upstream_dns: &Arc<Mutex<Vec<Ipv4Addr>>>,
+    upstream_dns: &Receiver<Vec<Ipv4Addr>>,
     shutdown_rx: &mut Receiver<bool>,
     buf: &mut [u8],
 ) -> bool {
@@ -275,7 +274,7 @@ async fn run_query_loop(
     upstream_socket: Arc<UdpSocket>,
     cache: SharedCache,
     pending_queries: PendingQueries,
-    upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
+    upstream_dns: Receiver<Vec<Ipv4Addr>>,
     mut shutdown_rx: Receiver<bool>,
 ) {
     let mut buf = [0u8; RECV_BUF_SIZE];
@@ -315,7 +314,7 @@ async fn handle_dns_query(
     src: SocketAddr,
     socket: Arc<UdpSocket>,
     cache: SharedCache,
-    upstream_dns: Arc<Mutex<Vec<Ipv4Addr>>>,
+    upstream_dns: Receiver<Vec<Ipv4Addr>>,
     upstream_socket: Arc<UdpSocket>,
     pending_queries: PendingQueries,
 ) {
@@ -420,8 +419,8 @@ fn insert_cache(
     lock.insert(cache_key, CacheEntry { response, expiry });
 }
 
-fn get_upstream_resolvers(upstream_dns: &Mutex<Vec<Ipv4Addr>>) -> Vec<Ipv4Addr> {
-    let servers = upstream_dns.lock().unwrap();
+fn get_upstream_resolvers(upstream_dns: &Receiver<Vec<Ipv4Addr>>) -> Vec<Ipv4Addr> {
+    let servers = upstream_dns.borrow();
     if !servers.is_empty() {
         servers.clone()
     } else {
@@ -478,23 +477,21 @@ async fn forward_query(
     forwarded_query[0] = xid_bytes[0];
     forwarded_query[1] = xid_bytes[1];
 
-    let upstream_addr = SocketAddr::new(IpAddr::V4(upstream_dns), DNS_PORT);
-    if upstream_socket
-        .send_to(&forwarded_query, upstream_addr)
-        .await
-        .is_err()
-    {
-        pending_queries.lock().unwrap().remove(&rng_xid);
+    let dest_addr = SocketAddr::new(IpAddr::V4(upstream_dns), DNS_PORT);
+    if let Err(e) = upstream_socket.send_to(&forwarded_query, dest_addr).await {
+        debug!(
+            "[dns-forwarder] Failed to forward DNS query to {}: {}",
+            upstream_dns, e
+        );
+        let mut lock = pending_queries.lock().unwrap();
+        lock.remove(&rng_xid);
         return None;
     }
 
-    let rx_res = tokio::time::timeout(UPSTREAM_TIMEOUT, rx).await;
-    let mut response = match rx_res {
-        Ok(Ok(resp)) => resp,
-        _ => {
-            pending_queries.lock().unwrap().remove(&rng_xid);
-            return None;
-        }
+    let Ok(Ok(mut response)) = tokio::time::timeout(UPSTREAM_TIMEOUT, rx).await else {
+        let mut lock = pending_queries.lock().unwrap();
+        lock.remove(&rng_xid);
+        return None;
     };
 
     if response.len() >= DNS_HEADER_SIZE {
@@ -577,8 +574,8 @@ mod tests {
 
     #[test]
     fn test_get_upstream_resolvers_empty_fallback() {
-        let upstream = Mutex::new(Vec::new());
-        let resolvers = get_upstream_resolvers(&upstream);
+        let (_tx, rx) = tokio::sync::watch::channel(Vec::new());
+        let resolvers = get_upstream_resolvers(&rx);
         assert_eq!(resolvers, vec![FALLBACK_DNS_SERVER]);
     }
 
@@ -586,8 +583,8 @@ mod tests {
     fn test_get_upstream_resolvers_configured() {
         let primary = Ipv4Addr::new(1, 1, 1, 1);
         let secondary = Ipv4Addr::new(1, 0, 0, 1);
-        let upstream = Mutex::new(vec![primary, secondary]);
-        let resolvers = get_upstream_resolvers(&upstream);
+        let (_tx, rx) = tokio::sync::watch::channel(vec![primary, secondary]);
+        let resolvers = get_upstream_resolvers(&rx);
         assert_eq!(resolvers, vec![primary, secondary]);
     }
 }

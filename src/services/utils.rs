@@ -542,6 +542,11 @@ pub fn drop_privileges(uid: u32, gid: u32) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Runs an asynchronous worker function in an unprivileged sandboxed process environment.
+///
+/// NOTE: The provided `IpcEndpoint` (specifically both `ipc.reader` and `ipc.writer`) must
+/// remain in scope for the worker's entire execution. Dropping either half closes that direction
+/// on the Unix socket, which the parent supervisor detects as EOF and terminates the worker.
 pub async fn run_sandboxed_worker<F, Fut>(
     service_name: &str,
     uid: u32,
