@@ -1,11 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::Mutex;
 
 pub fn async_unix_stream(fd: OwnedFd) -> Result<UnixStream, std::io::Error> {
     let std_stream = std::os::unix::net::UnixStream::from(fd);
@@ -21,17 +19,14 @@ pub fn async_unix_stream(fd: OwnedFd) -> Result<UnixStream, std::io::Error> {
 /// crashed or terminated and send `SIGTERM`.
 pub struct IpcEndpoint {
     pub reader: OwnedReadHalf,
-    pub writer: Arc<Mutex<OwnedWriteHalf>>,
+    pub writer: OwnedWriteHalf,
 }
 
 impl IpcEndpoint {
     pub fn from_owned_fd(fd: OwnedFd) -> Result<Self, std::io::Error> {
         let ipc_stream = async_unix_stream(fd)?;
         let (reader, writer) = ipc_stream.into_split();
-        Ok(Self {
-            reader,
-            writer: Arc::new(Mutex::new(writer)),
-        })
+        Ok(Self { reader, writer })
     }
 }
 

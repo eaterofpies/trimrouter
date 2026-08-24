@@ -144,7 +144,7 @@ pub async fn run_dhcp_server_worker(
 
 async fn run_dhcp_server_ipc_monitor(
     mut reader: OwnedReadHalf,
-    _writer: Arc<Mutex<OwnedWriteHalf>>,
+    _writer: OwnedWriteHalf,
     leases: Arc<Mutex<LeaseTable>>,
     shutdown_tx: Sender<bool>,
 ) {

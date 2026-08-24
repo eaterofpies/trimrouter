@@ -11,7 +11,6 @@ use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
-use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
 const DEFAULT_LEASE_SECS: u32 = 3600;
@@ -155,11 +154,11 @@ impl DhcpClientSocket {
 struct DhcpClientInternal {
     socket: DhcpClientSocket,
     mac: MacAddr,
-    ipc_writer: Option<Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>>,
+    ipc_writer: Option<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl DhcpClientInternal {
-    async fn run(&self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    async fn run(&mut self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
         loop {
             if *shutdown_rx.borrow() {
                 self.deconfigure().await;
@@ -180,7 +179,7 @@ impl DhcpClientInternal {
         }
     }
 
-    async fn execute_phases(&self) -> Result<(), DhcpError> {
+    async fn execute_phases(&mut self) -> Result<(), DhcpError> {
         let (xid, offer) = self.discover_phase().await?;
         let ack = self.request_phase(xid, offer).await?;
         self.bound_phase(ack).await?;
@@ -188,7 +187,7 @@ impl DhcpClientInternal {
     }
 
     async fn handle_phase_failure(
-        &self,
+        &mut self,
         e: DhcpError,
         shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     ) {
@@ -266,7 +265,7 @@ impl DhcpClientInternal {
         }
     }
 
-    async fn bound_phase(&self, mut ack: DhcpAck) -> Result<(), DhcpError> {
+    async fn bound_phase(&mut self, mut ack: DhcpAck) -> Result<(), DhcpError> {
         self.apply_lease_config(ack.ip, ack.mask, ack.gateway, &ack.dns_servers)
             .await?;
         let mut bound_at = std::time::Instant::now();
@@ -421,13 +420,13 @@ impl DhcpClientInternal {
     }
 
     async fn apply_lease_config(
-        &self,
+        &mut self,
         ip: Ipv4Addr,
         mask: Ipv4Addr,
         gateway: Option<Ipv4Addr>,
         dns_servers: &[Ipv4Addr],
     ) -> Result<(), DhcpError> {
-        let writer_mutex = self.ipc_writer.as_ref().ok_or_else(|| {
+        let writer = self.ipc_writer.as_mut().ok_or_else(|| {
             DhcpError::Io(std::io::Error::other("IPC writer unavailable in worker"))
         })?;
         let prefix_len = utils_mask_to_prefix_len(mask).unwrap_or(24);
@@ -437,16 +436,14 @@ impl DhcpClientInternal {
             gateway: gateway.unwrap_or(Ipv4Addr::UNSPECIFIED),
             dns_servers: dns_servers.to_vec(),
         };
-        let mut writer = writer_mutex.lock().await;
-        send_msg(&mut *writer, &msg).await.map_err(DhcpError::Io)?;
+        send_msg(writer, &msg).await.map_err(DhcpError::Io)?;
         Ok(())
     }
 
-    async fn deconfigure(&self) {
-        if let Some(ref writer_mutex) = self.ipc_writer {
+    async fn deconfigure(&mut self) {
+        if let Some(ref mut writer) = self.ipc_writer {
             let msg = DhcpClientToParentMsg::ClearWanLease;
-            let mut writer = writer_mutex.lock().await;
-            let _ = send_msg(&mut *writer, &msg).await;
+            let _ = send_msg(writer, &msg).await;
         }
     }
 
@@ -468,10 +465,11 @@ impl DhcpClientInternal {
                 OptionCode::DomainNameServer,
             ]));
 
-        if let Err(e) = self.send_dhcp_message(discover, Ipv4Addr::BROADCAST).await {
+        let dest_ip = Ipv4Addr::BROADCAST;
+        if let Err(e) = self.send_dhcp_message(discover, dest_ip).await {
             error!("[dhcp-client] Failed to send DHCPDISCOVER: {}", e);
         } else {
-            debug!("[dhcp-client] Sent DHCPDISCOVER.");
+            debug!("[dhcp-client] Sent DHCPDISCOVER (xid: {}).", xid);
         }
     }
 
@@ -548,7 +546,7 @@ pub async fn run_dhcp_client_worker(
         DHCP_CLIENT_GID,
         ipc_fd,
         |ipc| async move {
-            let client = DhcpClientInternal {
+            let mut client = DhcpClientInternal {
                 socket: client_socket,
                 mac,
                 ipc_writer: Some(ipc.writer),

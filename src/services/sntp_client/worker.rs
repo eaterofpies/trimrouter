@@ -7,10 +7,8 @@ use log::{error, info, warn};
 use std::io::Error as IoError;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::io::OwnedFd;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::watch::{Receiver, channel};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
@@ -24,13 +22,13 @@ pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
         SNTP_GID,
         ipc_fd,
         |ipc| async move {
-            let shared_ipc_writer = ipc.writer;
+            let mut ipc_writer = ipc.writer;
             let (_shutdown_tx, mut shutdown_rx) = channel(false);
             let mut current_retry_delay = RETRY_INTERVAL;
 
             while !*shutdown_rx.borrow() {
                 if !handle_sntp_iteration(
-                    &shared_ipc_writer,
+                    &mut ipc_writer,
                     &mut shutdown_rx,
                     &mut current_retry_delay,
                 )
@@ -47,7 +45,7 @@ pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
 }
 
 async fn handle_sntp_iteration(
-    ipc_writer: &Arc<TokioMutex<OwnedWriteHalf>>,
+    ipc_writer: &mut OwnedWriteHalf,
     shutdown_rx: &mut Receiver<bool>,
     current_retry_delay: &mut Duration,
 ) -> bool {
@@ -79,18 +77,14 @@ async fn handle_sntp_iteration(
     }
 }
 
-async fn send_time_to_parent(
-    ipc_writer: &Arc<TokioMutex<OwnedWriteHalf>>,
-    chrono_dt: DateTime<Utc>,
-) {
+async fn send_time_to_parent(ipc_writer: &mut OwnedWriteHalf, chrono_dt: DateTime<Utc>) {
     let duration = chrono_dt.signed_duration_since(DateTime::UNIX_EPOCH);
     if let Ok(std_duration) = duration.to_std() {
         let msg = SntpClientToParentMsg::SetSystemTime {
             seconds: std_duration.as_secs() as i64,
             nanoseconds: std_duration.subsec_nanos() as i64,
         };
-        let mut writer = ipc_writer.lock().await;
-        if let Err(e) = send_msg(&mut *writer, &msg).await {
+        if let Err(e) = send_msg(ipc_writer, &msg).await {
             error!("[sntp-client] Failed to send SetSystemTime IPC msg: {}", e);
         }
     }
