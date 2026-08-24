@@ -14,8 +14,8 @@ use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::watch::Sender;
+use tokio::net::unix::OwnedReadHalf;
+use tokio::sync::watch::Receiver;
 
 use super::lease_table::{LeaseHandle, spawn_lease_actor};
 
@@ -64,15 +64,9 @@ pub async fn run_dhcp_server_worker(
         DHCP_SERVER_GID,
         ipc_fd,
         |ipc| async move {
+            let _keep_writer = ipc.writer;
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let leases = spawn_lease_actor(shutdown_rx.clone());
-
-            tokio::spawn(run_dhcp_server_ipc_monitor(
-                ipc.reader,
-                ipc.writer,
-                leases.clone(),
-                shutdown_tx,
-            ));
 
             let config = Arc::new(ServerConfig {
                 server_ip,
@@ -82,88 +76,68 @@ pub async fn run_dhcp_server_worker(
             });
 
             let async_sock_shared = Arc::new(async_sock);
-            let mut shutdown_rx_clone = shutdown_rx.clone();
             let _ =
-                run_server_loop(async_sock_shared, config, leases, &mut shutdown_rx_clone).await;
+                run_server_loop(async_sock_shared, config, leases, ipc.reader, shutdown_rx).await;
+            let _ = shutdown_tx.send(true);
             Ok(())
         },
     )
     .await
 }
 
-async fn run_dhcp_server_ipc_monitor(
-    mut reader: OwnedReadHalf,
-    _writer: OwnedWriteHalf,
-    leases: LeaseHandle,
-    shutdown_tx: Sender<bool>,
-) {
-    let _keep_writer = _writer;
-    loop {
-        match recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut reader).await {
-            Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
-                ip_address,
-                mac_address,
-            })) => {
-                let mac = MacAddr::from(mac_address);
-                leases.add_neighbor(mac, ip_address).await;
-            }
-            Ok(None) | Err(_) => {
-                info!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
-                let _ = shutdown_tx.send(true);
-                break;
-            }
-        }
-    }
-}
-
-async fn receive_next_packet(
-    async_sock: &AsyncFd<OwnedFd>,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
-    buf: &mut [u8],
-) -> Result<Option<usize>, std::io::Error> {
-    let read_fut = read_raw_packet(async_sock, buf);
-    let res = tokio::select! {
-        _ = wait_shutdown(shutdown_rx) => {
-            return Ok(None);
-        }
-        r = read_fut => r,
-    };
-
-    match res {
-        Ok(n) => Ok(Some(n)),
-        Err(e) => {
-            error!("[dhcp-server] Socket read error: {}. Recreating socket.", e);
-            Err(e)
-        }
-    }
-}
-
 async fn run_server_loop(
     async_sock: Arc<AsyncFd<OwnedFd>>,
     config: Arc<ServerConfig>,
     leases: LeaseHandle,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    mut ipc_reader: OwnedReadHalf,
+    mut shutdown_rx: Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 2048];
     loop {
-        if *shutdown_rx.borrow() {
-            return Ok(());
+        tokio::select! {
+            _ = wait_shutdown(&mut shutdown_rx) => break,
+            ipc_msg = recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut ipc_reader) => {
+                match ipc_msg {
+                    Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
+                        ip_address,
+                        mac_address,
+                    })) => {
+                        let mac = MacAddr::from(mac_address);
+                        leases.add_neighbor(mac, ip_address).await;
+                    }
+                    Ok(None) | Err(_) => {
+                        info!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
+                        break;
+                    }
+                }
+            }
+            read_res = read_raw_packet(&async_sock, &mut buf) => {
+                match read_res {
+                    Ok(bytes_read) => {
+                        let pkt_data = buf[..bytes_read].to_vec();
+                        let async_sock_clone = Arc::clone(&async_sock);
+                        let config_clone = Arc::clone(&config);
+                        let leases_clone = leases.clone();
+
+                        tokio::spawn(async move {
+                            process_incoming_packet(
+                                pkt_data,
+                                async_sock_clone,
+                                config_clone,
+                                leases_clone,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(e) => {
+                        error!("[dhcp-server] Socket read error: {}. Recreating socket.", e);
+                        return Err(e);
+                    }
+                }
+            }
         }
-
-        let Some(bytes_read) = receive_next_packet(&async_sock, shutdown_rx, &mut buf).await?
-        else {
-            return Ok(());
-        };
-
-        let pkt_data = buf[..bytes_read].to_vec();
-        let async_sock_clone = Arc::clone(&async_sock);
-        let config_clone = Arc::clone(&config);
-        let leases_clone = leases.clone();
-
-        tokio::spawn(async move {
-            process_incoming_packet(pkt_data, async_sock_clone, config_clone, leases_clone).await;
-        });
     }
+    Ok(())
 }
 
 async fn process_incoming_packet(
