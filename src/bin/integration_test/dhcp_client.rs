@@ -1,16 +1,19 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
-use trimrouter::services::utils::SharedWanLease;
+use trimrouter::services::utils::{WanLeaseReceiver, WanLeaseSender};
 use trimrouter::services::{DhcpClient, Service};
 
-pub async fn test_dhcp_client_binding(lease_state: SharedWanLease) -> Result<DhcpClient, String> {
+pub async fn test_dhcp_client_binding(
+    lease_tx: WanLeaseSender,
+    mut lease_rx: WanLeaseReceiver,
+) -> Result<DhcpClient, String> {
     std::println!("[test] Starting DHCP Client binding test...");
 
     // 1. Tell host to start the WAN ISP mock
     std::println!("[test-control] START_WAN_ISP");
 
     // 2. Instantiate and start DHCP client on "wan"
-    let mut client = DhcpClient::new("wan".to_string(), lease_state.clone());
+    let mut client = DhcpClient::new("wan".to_string(), lease_tx);
     if let Err(e) = client.start().await {
         return Err(format!("Failed to start DHCP client: {}", e));
     }
@@ -19,14 +22,14 @@ pub async fn test_dhcp_client_binding(lease_state: SharedWanLease) -> Result<Dhc
     let start = std::time::Instant::now();
     let mut bound = false;
     while start.elapsed() < Duration::from_secs(30) {
-        {
-            let lease = lease_state.lock().unwrap();
-            if lease.ip == Some(Ipv4Addr::new(10, 0, 2, 15)) {
-                bound = true;
-                break;
-            }
+        if lease_rx.borrow().ip == Some(Ipv4Addr::new(10, 0, 2, 15)) {
+            bound = true;
+            break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = lease_rx.changed() => {}
+        }
     }
 
     if !bound {
@@ -43,7 +46,7 @@ pub async fn test_dhcp_client_binding(lease_state: SharedWanLease) -> Result<Dhc
     Ok(client)
 }
 
-pub async fn test_dhcp_renewal(lease_state: SharedWanLease) -> Result<(), String> {
+pub async fn test_dhcp_renewal(lease_rx: WanLeaseReceiver) -> Result<(), String> {
     std::println!("[test] Starting DHCP Client renewal test...");
 
     // With a lease time of 6 seconds, renewal (T1) happens at 3 seconds.
@@ -56,11 +59,8 @@ pub async fn test_dhcp_renewal(lease_state: SharedWanLease) -> Result<(), String
     // after the renewal window.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    {
-        let lease = lease_state.lock().unwrap();
-        if lease.ip == Some(Ipv4Addr::new(10, 0, 2, 15)) {
-            renewed = true;
-        }
+    if lease_rx.borrow().ip == Some(Ipv4Addr::new(10, 0, 2, 15)) {
+        renewed = true;
     }
 
     if !renewed {

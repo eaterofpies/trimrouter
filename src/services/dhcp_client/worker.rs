@@ -1,10 +1,9 @@
-use super::manager::{configure_wan, deconfigure_wan};
 use crate::packet::build_raw_packet;
 use crate::services::ipc::{DhcpClientToParentMsg, send_msg};
 use crate::services::utils::{
-    CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, SharedWanLease, WanLease,
-    get_interface_mac, mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload,
-    run_sandboxed_worker, wait_shutdown,
+    CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, get_interface_mac,
+    mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload, run_sandboxed_worker,
+    wait_shutdown,
 };
 use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
 use dhcproto::{Encodable, Encoder};
@@ -30,6 +29,18 @@ pub enum DhcpError {
     RtNetlink(rtnetlink::Error),
 }
 
+impl From<std::io::Error> for DhcpError {
+    fn from(e: std::io::Error) -> Self {
+        DhcpError::Io(e)
+    }
+}
+
+impl From<rtnetlink::Error> for DhcpError {
+    fn from(e: rtnetlink::Error) -> Self {
+        DhcpError::RtNetlink(e)
+    }
+}
+
 impl std::fmt::Display for DhcpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -43,18 +54,6 @@ impl std::fmt::Display for DhcpError {
 }
 
 impl std::error::Error for DhcpError {}
-
-impl From<std::io::Error> for DhcpError {
-    fn from(e: std::io::Error) -> Self {
-        DhcpError::Io(e)
-    }
-}
-
-impl From<rtnetlink::Error> for DhcpError {
-    fn from(e: rtnetlink::Error) -> Self {
-        DhcpError::RtNetlink(e)
-    }
-}
 
 struct DhcpOffer {
     offered_ip: Ipv4Addr,
@@ -156,8 +155,6 @@ impl DhcpClientSocket {
 struct DhcpClientInternal {
     socket: DhcpClientSocket,
     mac: MacAddr,
-    lease_state: SharedWanLease,
-    wan_interface: String,
     ipc_writer: Option<Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>>,
 }
 
@@ -430,40 +427,19 @@ impl DhcpClientInternal {
         gateway: Option<Ipv4Addr>,
         dns_servers: &[Ipv4Addr],
     ) -> Result<(), DhcpError> {
-        if let Some(ref writer_mutex) = self.ipc_writer {
-            let prefix_len = utils_mask_to_prefix_len(mask).unwrap_or(24);
-            let msg = DhcpClientToParentMsg::ApplyWanLease {
-                ip_address: ip,
-                prefix_len,
-                gateway: gateway.unwrap_or(Ipv4Addr::UNSPECIFIED),
-                dns_servers: dns_servers.to_vec(),
-            };
-            let mut writer = writer_mutex.lock().await;
-            send_msg(&mut *writer, &msg).await.map_err(DhcpError::Io)?;
-            Ok(())
-        } else {
-            let changed = {
-                let mut lease = self.lease_state.lock().unwrap();
-                let changed = lease.ip != Some(ip)
-                    || lease.mask != Some(mask)
-                    || lease.gateway != gateway
-                    || lease.dns_servers != dns_servers;
-
-                if changed {
-                    lease.ip = Some(ip);
-                    lease.mask = Some(mask);
-                    lease.gateway = gateway;
-                    lease.dns_servers = dns_servers.to_vec();
-                    info!("[dhcp-client] Lease parameters updated: {:?}", *lease);
-                }
-                changed
-            };
-
-            if changed {
-                configure_wan(&self.wan_interface, ip, mask, gateway).await?;
-            }
-            Ok(())
-        }
+        let writer_mutex = self.ipc_writer.as_ref().ok_or_else(|| {
+            DhcpError::Io(std::io::Error::other("IPC writer unavailable in worker"))
+        })?;
+        let prefix_len = utils_mask_to_prefix_len(mask).unwrap_or(24);
+        let msg = DhcpClientToParentMsg::ApplyWanLease {
+            ip_address: ip,
+            prefix_len,
+            gateway: gateway.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            dns_servers: dns_servers.to_vec(),
+        };
+        let mut writer = writer_mutex.lock().await;
+        send_msg(&mut *writer, &msg).await.map_err(DhcpError::Io)?;
+        Ok(())
     }
 
     async fn deconfigure(&self) {
@@ -471,24 +447,6 @@ impl DhcpClientInternal {
             let msg = DhcpClientToParentMsg::ClearWanLease;
             let mut writer = writer_mutex.lock().await;
             let _ = send_msg(&mut *writer, &msg).await;
-        } else {
-            let (ip, mask) = {
-                let mut lease = self.lease_state.lock().unwrap();
-                let ip = lease.ip;
-                let mask = lease.mask;
-                *lease = WanLease::default();
-                (ip, mask)
-            };
-
-            if let Some(ip) = ip
-                && let Some(mask) = mask
-                && let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await
-            {
-                error!(
-                    "[dhcp-client] Failed to deconfigure WAN interface via netlink: {}",
-                    e
-                );
-            }
         }
     }
 
@@ -590,12 +548,9 @@ pub async fn run_dhcp_client_worker(
         DHCP_CLIENT_GID,
         ipc_fd,
         |ipc| async move {
-            let dummy_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
             let client = DhcpClientInternal {
                 socket: client_socket,
                 mac,
-                lease_state: dummy_lease_state,
-                wan_interface: wan_interface.clone(),
                 ipc_writer: Some(ipc.writer),
             };
 

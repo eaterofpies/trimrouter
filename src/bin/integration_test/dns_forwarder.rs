@@ -1,13 +1,13 @@
 use std::net::UdpSocket;
 use std::time::Duration;
-use trimrouter::services::utils::SharedWanLease;
+use trimrouter::services::utils::WanLeaseReceiver;
 use trimrouter::services::{DnsForwarder, Service};
 
-pub async fn test_dns_forwarding(lease_state: SharedWanLease) -> Result<DnsForwarder, String> {
+pub async fn test_dns_forwarding(lease_rx: WanLeaseReceiver) -> Result<DnsForwarder, String> {
     std::println!("[test] Starting DNS Forwarder test...");
 
     // 1. Start DNS Forwarder
-    let mut dns_forwarder = DnsForwarder::new(lease_state);
+    let mut dns_forwarder = DnsForwarder::new(lease_rx);
     if let Err(e) = dns_forwarder.start().await {
         return Err(format!("Failed to start DNS Forwarder: {}", e));
     }

@@ -1,5 +1,5 @@
 use crate::network;
-use crate::services::utils::{SharedWanLease, mask_to_prefix_len};
+use crate::services::utils::{WanLeaseReceiver, mask_to_prefix_len};
 use crate::services::{DhcpServer, Service, ServiceError};
 use futures_util::StreamExt;
 use ipnet::Ipv4Net;
@@ -14,7 +14,7 @@ pub struct LanManager {
     lan_interface: String,
     initial_ip: String,
     backup_ip: String,
-    lease_state: SharedWanLease,
+    lease_rx: WanLeaseReceiver,
     shutdown_tx: Option<Sender<bool>>,
     task_handle: Option<JoinHandle<()>>,
 }
@@ -24,13 +24,13 @@ impl LanManager {
         lan_interface: String,
         initial_ip: String,
         backup_ip: String,
-        lease_state: SharedWanLease,
+        lease_rx: WanLeaseReceiver,
     ) -> Self {
         Self {
             lan_interface,
             initial_ip,
             backup_ip,
-            lease_state,
+            lease_rx,
             shutdown_tx: None,
             task_handle: None,
         }
@@ -45,17 +45,10 @@ impl Service for LanManager {
         let lan_interface = self.lan_interface.clone();
         let initial_ip = self.initial_ip.clone();
         let backup_ip = self.backup_ip.clone();
-        let lease_state = self.lease_state.clone();
+        let lease_rx = self.lease_rx.clone();
 
         let handle = tokio::spawn(async move {
-            run_lan_manager_loop(
-                lan_interface,
-                initial_ip,
-                backup_ip,
-                lease_state,
-                shutdown_rx,
-            )
-            .await;
+            run_lan_manager_loop(lan_interface, initial_ip, backup_ip, lease_rx, shutdown_rx).await;
         });
 
         self.task_handle = Some(handle);
@@ -75,7 +68,7 @@ async fn run_lan_manager_loop(
     lan_interface: String,
     initial_ip: String,
     backup_ip: String,
-    lease_state: SharedWanLease,
+    lease_rx: WanLeaseReceiver,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     info!(
@@ -113,7 +106,7 @@ async fn run_lan_manager_loop(
         &lan_interface,
         current_ip,
         &backup_ip,
-        &lease_state,
+        lease_rx,
         &mut dhcp_server,
         messages,
         shutdown_rx,
@@ -131,7 +124,7 @@ async fn listen_for_conflicts(
     lan_interface: &str,
     mut active_ip: String,
     backup_ip: &str,
-    lease_state: &SharedWanLease,
+    mut lease_rx: WanLeaseReceiver,
     dhcp_server: &mut DhcpServer,
     mut messages: impl futures_util::Stream<
         Item = (
@@ -145,7 +138,7 @@ async fn listen_for_conflicts(
         lan_interface,
         &mut active_ip,
         backup_ip,
-        lease_state,
+        &lease_rx,
         dhcp_server,
     )
     .await;
@@ -156,6 +149,19 @@ async fn listen_for_conflicts(
                 if *shutdown_rx.borrow() {
                     break;
                 }
+            }
+            res = lease_rx.changed() => {
+                if res.is_err() {
+                    break;
+                }
+                let _ = check_and_resolve(
+                    lan_interface,
+                    &mut active_ip,
+                    backup_ip,
+                    &lease_rx,
+                    dhcp_server,
+                )
+                .await;
             }
             Some((message, _addr)) = messages.next() => {
                 let should_check = if let NetlinkPayload::InnerMessage(rtnl_msg) = message.payload {
@@ -174,7 +180,7 @@ async fn listen_for_conflicts(
                         lan_interface,
                         &mut active_ip,
                         backup_ip,
-                        lease_state,
+                        &lease_rx,
                         dhcp_server,
                     )
                     .await;
@@ -232,11 +238,11 @@ async fn check_and_resolve(
     lan_interface: &str,
     current_ip: &mut String,
     backup_ip: &str,
-    lease_state: &SharedWanLease,
+    lease_rx: &WanLeaseReceiver,
     dhcp_server: &mut DhcpServer,
 ) -> bool {
     let wan_opt = {
-        let lease = lease_state.lock().unwrap();
+        let lease = lease_rx.borrow();
         lease.ip.zip(lease.mask)
     };
 

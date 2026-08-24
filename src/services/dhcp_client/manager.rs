@@ -2,7 +2,7 @@ use super::worker::DhcpError;
 use crate::services::ipc::{DhcpClientToParentMsg, async_unix_stream, recv_msg};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{
-    CleanOption, SharedWanLease, WanLease, mask_to_prefix_len, prefix_len_to_mask,
+    CleanOption, WanLease, WanLeaseSender, mask_to_prefix_len, prefix_len_to_mask,
     setup_worker_sockets, terminate_worker,
 };
 use log::{error, info, warn};
@@ -13,15 +13,15 @@ use tokio::task::JoinHandle;
 
 pub struct DhcpClient {
     pub(super) wan_interface: String,
-    pub(super) lease_state: SharedWanLease,
+    pub(super) lease_tx: WanLeaseSender,
     state: ExternalWorker,
 }
 
 impl DhcpClient {
-    pub fn new(wan_interface: String, lease_state: SharedWanLease) -> Self {
+    pub fn new(wan_interface: String, lease_tx: WanLeaseSender) -> Self {
         Self {
             wan_interface,
-            lease_state,
+            lease_tx,
             state: ExternalWorker::new("dhcp-client"),
         }
     }
@@ -32,46 +32,44 @@ impl DhcpClient {
 }
 
 async fn apply_parent_lease(
-    lease_state: &SharedWanLease,
+    lease_tx: &WanLeaseSender,
     wan_interface: &str,
     ip_address: Ipv4Addr,
     mask: Ipv4Addr,
     gateway: Ipv4Addr,
     dns_servers: Vec<Ipv4Addr>,
 ) {
-    let changed = {
-        let mut lease = lease_state.lock().unwrap();
-        let changed = lease.ip != Some(ip_address)
-            || lease.mask != Some(mask)
-            || lease.gateway != Some(gateway)
-            || lease.dns_servers != dns_servers;
-
-        if changed {
-            lease.ip = Some(ip_address);
-            lease.mask = Some(mask);
-            lease.gateway = Some(gateway);
-            lease.dns_servers = dns_servers;
-            info!(
-                "[dhcp-client-parent] Applied WAN lease configuration: {:?}",
-                *lease
-            );
-        }
-        changed
+    let new_lease = WanLease {
+        ip: Some(ip_address),
+        mask: Some(mask),
+        gateway: Some(gateway),
+        dns_servers: dns_servers.clone(),
     };
 
-    if changed && let Err(e) = configure_wan(wan_interface, ip_address, mask, Some(gateway)).await {
-        error!("[dhcp-client-parent] Failed to configure WAN: {}", e);
+    let changed = {
+        let current = lease_tx.borrow();
+        *current != new_lease
+    };
+
+    if changed {
+        info!(
+            "[dhcp-client-parent] Applied WAN lease configuration: {:?}",
+            new_lease
+        );
+        let _ = lease_tx.send(new_lease);
+        if let Err(e) = configure_wan(wan_interface, ip_address, mask, Some(gateway)).await {
+            error!("[dhcp-client-parent] Failed to configure WAN: {}", e);
+        }
     }
 }
 
-async fn clear_parent_lease(lease_state: &SharedWanLease, wan_interface: &str) {
+async fn clear_parent_lease(lease_tx: &WanLeaseSender, wan_interface: &str) {
     let (ip, mask) = {
-        let mut lease = lease_state.lock().unwrap();
-        let ip = lease.ip;
-        let mask = lease.mask;
-        *lease = WanLease::default();
-        (ip, mask)
+        let current = lease_tx.borrow();
+        (current.ip, current.mask)
     };
+
+    let _ = lease_tx.send(WanLease::default());
 
     if let Some(ip) = ip
         && let Some(mask) = mask
@@ -85,7 +83,7 @@ fn start_parent_supervisor_task(
     parent_ipc_fd: OwnedFd,
     child_pid: u32,
     wan_interface: String,
-    lease_state: SharedWanLease,
+    lease_tx: WanLeaseSender,
 ) -> Result<JoinHandle<()>, ServiceError> {
     let parent_ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
 
@@ -93,7 +91,7 @@ fn start_parent_supervisor_task(
         parent_ipc_stream,
         child_pid,
         wan_interface,
-        lease_state,
+        lease_tx,
     ));
 
     Ok(handle)
@@ -103,7 +101,7 @@ async fn run_parent_dhcp_monitor(
     mut parent_ipc_stream: UnixStream,
     child_pid: u32,
     wan_interface: String,
-    lease_state: SharedWanLease,
+    lease_tx: WanLeaseSender,
 ) {
     info!(
         "[dhcp-client-parent] Supervising DHCP client worker (PID {})",
@@ -119,7 +117,7 @@ async fn run_parent_dhcp_monitor(
             })) => {
                 let mask = prefix_len_to_mask(prefix_len);
                 apply_parent_lease(
-                    &lease_state,
+                    &lease_tx,
                     &wan_interface,
                     ip_address,
                     mask,
@@ -129,7 +127,7 @@ async fn run_parent_dhcp_monitor(
                 .await;
             }
             Ok(Some(DhcpClientToParentMsg::ClearWanLease)) => {
-                clear_parent_lease(&lease_state, &wan_interface).await;
+                clear_parent_lease(&lease_tx, &wan_interface).await;
             }
             Ok(None) => {
                 info!("[dhcp-client-parent] Worker IPC socket closed.");
@@ -164,7 +162,7 @@ impl Service for DhcpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
         let wan_interface = self.wan_interface.clone();
         let wan_interface_setup = wan_interface.clone();
-        let lease_state = self.lease_state.clone();
+        let lease_tx = self.lease_tx.clone();
 
         self.state.start_supervised(
             move || setup_dhcp_client_attempt(&wan_interface_setup),
@@ -173,7 +171,7 @@ impl Service for DhcpClient {
                     parent_ipc_fd,
                     child_pid,
                     wan_interface.clone(),
-                    lease_state.clone(),
+                    lease_tx.clone(),
                 )
             },
         )

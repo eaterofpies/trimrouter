@@ -176,14 +176,14 @@ async fn configure_networking_and_services(
 ) -> services::DnsForwarder {
     setup_loopback_and_firewall(sys.as_ref()).await;
 
-    let lease_state = Arc::new(std::sync::Mutex::new(services::WanLease::default()));
+    let (lease_tx, lease_rx) = tokio::sync::watch::channel(services::WanLease::default());
 
-    let mut dns_forwarder = services::DnsForwarder::new(lease_state.clone());
+    let mut dns_forwarder = services::DnsForwarder::new(lease_rx.clone());
     if let Err(e) = dns_forwarder.start().await {
         error!("[init] Failed to start DNS forwarder: {}", e);
     }
 
-    let managed_ifaces = build_managed_interfaces(&config, &lease_state);
+    let managed_ifaces = build_managed_interfaces(&config, lease_tx, lease_rx);
     tokio::spawn(interface::monitor_interfaces(managed_ifaces));
 
     info!("[init] System startup completed successfully. Entering main event loop.");
@@ -206,14 +206,15 @@ async fn setup_loopback_and_firewall(sys: &RealSystem) {
 
 fn build_managed_interfaces(
     config: &RouterConfig,
-    lease_state: &Arc<std::sync::Mutex<services::WanLease>>,
+    lease_tx: services::WanLeaseSender,
+    lease_rx: services::WanLeaseReceiver,
 ) -> Vec<interface::ManagedInterface> {
     let wan_services = vec![
         interface::RouterService::DhcpClient(services::DhcpClient::new(
             network::WAN_INTERFACE.to_string(),
-            lease_state.clone(),
+            lease_tx,
         )),
-        interface::RouterService::SntpClient(services::SntpClient::new(lease_state.clone())),
+        interface::RouterService::SntpClient(services::SntpClient::new(lease_rx.clone())),
     ];
     let wan_iface = interface::ManagedInterface::new(
         network::WAN_INTERFACE.to_string(),
@@ -226,7 +227,7 @@ fn build_managed_interfaces(
             network::LAN_INTERFACE.to_string(),
             config.lan_ip.clone(),
             config.backup_lan_ip.clone(),
-            lease_state.clone(),
+            lease_rx,
         ),
     )];
     let lan_iface = interface::ManagedInterface::new(

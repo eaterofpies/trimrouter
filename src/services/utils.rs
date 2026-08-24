@@ -19,7 +19,6 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, OwnedFd};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::watch::Receiver;
@@ -48,13 +47,16 @@ pub const NTP_PORT: u16 = 123;
 // =========================================================================
 // Shared WAN Lease Info
 // =========================================================================
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct WanLease {
     pub ip: Option<Ipv4Addr>,
     pub mask: Option<Ipv4Addr>,
     pub gateway: Option<Ipv4Addr>,
     pub dns_servers: Vec<Ipv4Addr>,
 }
+
+pub type WanLeaseSender = tokio::sync::watch::Sender<WanLease>;
+pub type WanLeaseReceiver = tokio::sync::watch::Receiver<WanLease>;
 
 pub struct CleanOption<'a, T>(pub &'a Option<T>);
 
@@ -83,8 +85,6 @@ impl std::fmt::Debug for WanLease {
             .finish()
     }
 }
-
-pub type SharedWanLease = Arc<Mutex<WanLease>>;
 
 pub fn mask_to_prefix_len(mask: Ipv4Addr) -> Result<u8, RouterError> {
     let mask_u32 = u32::from(mask);

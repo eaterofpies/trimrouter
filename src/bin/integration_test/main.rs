@@ -177,24 +177,25 @@ async fn main() {
     std::println!("[test] Running integration tests...");
 
     // Shared state for the DHCP lease obtained on WAN
-    let lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
+    let (lease_tx, lease_rx) = tokio::sync::watch::channel(WanLease::default());
 
     // Test 1: DHCP Client Binding
-    let mut dhcp_client = match dhcp_client::test_dhcp_client_binding(lease_state.clone()).await {
-        Ok(client) => {
-            std::println!("[test-control] TEST_PASSED dhcp_client_binding");
-            passed += 1;
-            Some(client)
-        }
-        Err(e) => {
-            std::println!("[test-control] TEST_FAILED dhcp_client_binding {}", e);
-            failed += 1;
-            None
-        }
-    };
+    let mut dhcp_client =
+        match dhcp_client::test_dhcp_client_binding(lease_tx.clone(), lease_rx.clone()).await {
+            Ok(client) => {
+                std::println!("[test-control] TEST_PASSED dhcp_client_binding");
+                passed += 1;
+                Some(client)
+            }
+            Err(e) => {
+                std::println!("[test-control] TEST_FAILED dhcp_client_binding {}", e);
+                failed += 1;
+                None
+            }
+        };
     // Test 8: LAN DHCP Server Handshake
     let mut lan_manager = None;
-    match lan_manager::test_lan_dhcp_handshake(lease_state.clone()).await {
+    match lan_manager::test_lan_dhcp_handshake(lease_rx.clone()).await {
         Ok(manager) => {
             std::println!("[test-control] TEST_PASSED lan_dhcp_handshake");
             passed += 1;
@@ -209,7 +210,7 @@ async fn main() {
     // Test 2: DNS Forwarding (Only run if client bound successfully)
     let mut dns_forwarder = None;
     if dhcp_client.is_some() {
-        match dns_forwarder::test_dns_forwarding(lease_state.clone()).await {
+        match dns_forwarder::test_dns_forwarding(lease_rx.clone()).await {
             Ok(forwarder) => {
                 std::println!("[test-control] TEST_PASSED dns_forwarding");
                 passed += 1;
@@ -240,7 +241,7 @@ async fn main() {
     // Test 3: SNTP Client Time Sync (Only run if DNS forwarding is available)
     let mut sntp_client = None;
     if dns_forwarder.is_some() {
-        match sntp::test_sntp_sync(lease_state.clone()).await {
+        match sntp::test_sntp_sync(lease_rx.clone()).await {
             Ok(client) => {
                 std::println!("[test-control] TEST_PASSED sntp_sync");
                 passed += 1;
@@ -289,7 +290,7 @@ async fn main() {
 
     // Test 6: DHCP Renewal (Only run if client bound successfully)
     if dhcp_client.is_some() {
-        match dhcp_client::test_dhcp_renewal(lease_state.clone()).await {
+        match dhcp_client::test_dhcp_renewal(lease_rx.clone()).await {
             Ok(_) => {
                 std::println!("[test-control] TEST_PASSED dhcp_renewal");
                 passed += 1;
@@ -340,8 +341,8 @@ async fn main() {
     }
 
     // Test 7: LAN/WAN Subnet Overlap
-    let conflict_lease_state = Arc::new(std::sync::Mutex::new(WanLease::default()));
-    match lan_manager::test_lan_wan_conflict(conflict_lease_state).await {
+    let (conflict_lease_tx, conflict_lease_rx) = tokio::sync::watch::channel(WanLease::default());
+    match lan_manager::test_lan_wan_conflict(conflict_lease_tx, conflict_lease_rx).await {
         Ok(_) => {
             std::println!("[test-control] TEST_PASSED lan_wan_conflict");
             passed += 1;

@@ -1,13 +1,13 @@
 use chrono::Datelike;
 use std::time::Duration;
-use trimrouter::services::utils::SharedWanLease;
+use trimrouter::services::utils::WanLeaseReceiver;
 use trimrouter::services::{Service, SntpClient};
 
-pub async fn test_sntp_sync(lease_state: SharedWanLease) -> Result<SntpClient, String> {
+pub async fn test_sntp_sync(lease_rx: WanLeaseReceiver) -> Result<SntpClient, String> {
     std::println!("[test] Starting SNTP Client test...");
 
     // 1. Start SNTP Client
-    let mut sntp_client = SntpClient::new(lease_state);
+    let mut sntp_client = SntpClient::new(lease_rx);
     if let Err(e) = sntp_client.start().await {
         return Err(format!("Failed to start SNTP Client: {}", e));
     }

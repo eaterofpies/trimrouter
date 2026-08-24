@@ -1,28 +1,26 @@
 use crate::services::ipc::{DnsParentToWorkerMsg, async_unix_stream, send_msg};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
-use crate::services::utils::{DNS_PORT, SharedWanLease, create_ipc_fds, terminate_worker};
+use crate::services::utils::{DNS_PORT, WanLeaseReceiver, create_ipc_fds, terminate_worker};
 use log::info;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
-use tokio::time::interval;
 
 pub struct DnsForwarder {
-    lease_state: SharedWanLease,
+    lease_rx: WanLeaseReceiver,
     state: ExternalWorker,
 }
 
 impl DnsForwarder {
-    pub fn new(lease_state: SharedWanLease) -> Self {
+    pub fn new(lease_rx: WanLeaseReceiver) -> Self {
         Self {
-            lease_state,
+            lease_rx,
             state: ExternalWorker::new("dns-forwarder"),
         }
     }
@@ -36,7 +34,7 @@ async fn run_parent_dns_monitor(
     mut ipc_reader: OwnedReadHalf,
     shared_ipc_writer: Arc<Mutex<OwnedWriteHalf>>,
     child_pid: u32,
-    lease_state: SharedWanLease,
+    mut lease_rx: WanLeaseReceiver,
     mut shutdown_rx: Receiver<bool>,
 ) {
     info!(
@@ -44,13 +42,22 @@ async fn run_parent_dns_monitor(
         child_pid
     );
 
-    let mut last_dns_servers: Vec<Ipv4Addr> = Vec::new();
-    let mut interval_timer = interval(Duration::from_secs(1));
     let mut eof_buf = [0u8; 1];
+    let mut last_dns_servers: Vec<Ipv4Addr> = Vec::new();
 
+    // 1. Initial sync on startup (marks version as seen)
+    {
+        let initial_servers = lease_rx.borrow_and_update().dns_servers.clone();
+        if !initial_servers.is_empty() {
+            let _ = update_upstream_resolvers(&shared_ipc_writer, &initial_servers).await;
+            last_dns_servers = initial_servers;
+        }
+    }
+
+    // 2. Reactive loop: wake up immediately when lease updates without polling timers
     while !*shutdown_rx.borrow() {
         tokio::select! {
-            _ = shutdown_rx.changed() => {}
+            _ = shutdown_rx.changed() => break,
             res = ipc_reader.read(&mut eof_buf) => {
                 match res {
                     Ok(0) | Err(_) => {
@@ -60,12 +67,11 @@ async fn run_parent_dns_monitor(
                     Ok(_) => {}
                 }
             }
-            _ = interval_timer.tick() => {
-                let current_servers = {
-                    let lease = lease_state.lock().unwrap();
-                    lease.dns_servers.clone()
-                };
-
+            res = lease_rx.changed() => {
+                if res.is_err() {
+                    break;
+                }
+                let current_servers = lease_rx.borrow_and_update().dns_servers.clone();
                 if current_servers != last_dns_servers {
                     if update_upstream_resolvers(&shared_ipc_writer, &current_servers).await.is_err() {
                         break;
@@ -97,7 +103,7 @@ async fn update_upstream_resolvers(
 fn start_parent_dns_monitor(
     parent_ipc_fd: OwnedFd,
     child_pid: u32,
-    lease_state: SharedWanLease,
+    lease_rx: WanLeaseReceiver,
     shutdown_rx: Receiver<bool>,
 ) -> Result<JoinHandle<()>, ServiceError> {
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
@@ -108,7 +114,7 @@ fn start_parent_dns_monitor(
         ipc_reader,
         shared_ipc_writer,
         child_pid,
-        lease_state,
+        lease_rx,
         shutdown_rx,
     ));
 
@@ -132,12 +138,12 @@ fn setup_dns_forwarder_attempt() -> Result<(crate::cli::WorkerService, OwnedFd),
 
 impl Service for DnsForwarder {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        let lease_state = self.lease_state.clone();
+        let lease_rx = self.lease_rx.clone();
 
         self.state.start_supervised(
             setup_dns_forwarder_attempt,
             move |parent_ipc_fd, child_pid, shutdown_rx| {
-                start_parent_dns_monitor(parent_ipc_fd, child_pid, lease_state.clone(), shutdown_rx)
+                start_parent_dns_monitor(parent_ipc_fd, child_pid, lease_rx.clone(), shutdown_rx)
             },
         )
     }

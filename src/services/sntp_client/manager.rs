@@ -2,29 +2,27 @@ use crate::services::ipc::{
     SntpClientToParentMsg, SntpParentToWorkerMsg, async_unix_stream, recv_msg, send_msg,
 };
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
-use crate::services::utils::{SharedWanLease, create_ipc_fds, terminate_worker};
+use crate::services::utils::{WanLeaseReceiver, create_ipc_fds, terminate_worker};
 use log::{error, info};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};
 use std::io::Error as IoError;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
-use tokio::time::interval;
 
 pub struct SntpClient {
-    lease_state: SharedWanLease,
+    lease_rx: WanLeaseReceiver,
     state: ExternalWorker,
 }
 
 impl SntpClient {
-    pub fn new(lease_state: SharedWanLease) -> Self {
+    pub fn new(lease_rx: WanLeaseReceiver) -> Self {
         Self {
-            lease_state,
+            lease_rx,
             state: ExternalWorker::new("sntp-client"),
         }
     }
@@ -35,18 +33,30 @@ impl SntpClient {
 }
 
 async fn run_wan_status_monitor(
-    lease_state: SharedWanLease,
+    mut lease_rx: WanLeaseReceiver,
     shared_ipc_writer: Arc<Mutex<OwnedWriteHalf>>,
     mut shutdown_rx: Receiver<bool>,
 ) {
     let mut last_wan_status = false;
-    let mut interval_timer = interval(Duration::from_secs(1));
 
+    // 1. Initial sync on startup
+    {
+        let has_wan = lease_rx.borrow_and_update().ip.is_some();
+        if has_wan {
+            let _ = update_wan_status(&shared_ipc_writer, true).await;
+            last_wan_status = true;
+        }
+    }
+
+    // 2. Reactive loop: wake up immediately when WAN lease updates
     while !*shutdown_rx.borrow() {
         tokio::select! {
-            _ = shutdown_rx.changed() => {}
-            _ = interval_timer.tick() => {
-                let has_wan = lease_state.lock().unwrap().ip.is_some();
+            _ = shutdown_rx.changed() => break,
+            res = lease_rx.changed() => {
+                if res.is_err() {
+                    break;
+                }
+                let has_wan = lease_rx.borrow_and_update().ip.is_some();
                 if has_wan != last_wan_status {
                     if update_wan_status(&shared_ipc_writer, has_wan).await.is_err() {
                         break;
@@ -123,7 +133,7 @@ fn set_system_clock(seconds: i64, nanoseconds: i64) {
 fn start_parent_sntp_monitor(
     parent_ipc_fd: OwnedFd,
     child_pid: u32,
-    lease_state: SharedWanLease,
+    lease_rx: WanLeaseReceiver,
     shutdown_rx: Receiver<bool>,
 ) -> Result<JoinHandle<()>, ServiceError> {
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
@@ -133,7 +143,7 @@ fn start_parent_sntp_monitor(
     // Spawn WAN status monitor task
     let shutdown_rx_clone = shutdown_rx.clone();
     tokio::spawn(run_wan_status_monitor(
-        lease_state,
+        lease_rx,
         shared_ipc_writer,
         shutdown_rx_clone,
     ));
@@ -155,17 +165,12 @@ fn setup_sntp_attempt() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceE
 
 impl Service for SntpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
-        let lease_state = self.lease_state.clone();
+        let lease_rx = self.lease_rx.clone();
 
         self.state.start_supervised(
             setup_sntp_attempt,
             move |parent_ipc_fd, child_pid, shutdown_rx| {
-                start_parent_sntp_monitor(
-                    parent_ipc_fd,
-                    child_pid,
-                    lease_state.clone(),
-                    shutdown_rx,
-                )
+                start_parent_sntp_monitor(parent_ipc_fd, child_pid, lease_rx.clone(), shutdown_rx)
             },
         )
     }
