@@ -346,5 +346,7 @@ pub fn setup_log_partition<S: MountOps>(
     }
 
     info!("[init] Log partition mounted successfully on /var/log.");
+    // Reopen active log file immediately now that /var/log partition is mounted
+    crate::logging::get_logger().lock().unwrap().open_log_file();
     Ok(())
 }

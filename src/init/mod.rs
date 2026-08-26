@@ -138,6 +138,11 @@ fn load_and_apply_config(sys: &RealSystem) -> RouterConfig {
         }
     };
     crate::logging::init_logging(config.logging.max_log_size_mb, config.logging.level);
+    info!(
+        "[init] trimrouter starting (git: {}, built: {})",
+        env!("VERGEN_GIT_SHA"),
+        env!("VERGEN_BUILD_TIMESTAMP")
+    );
     let delay_val = match config.reboot_delay {
         None => -1,
         Some(d) => d as i32,

@@ -37,6 +37,9 @@ fatfs = "0.3.6"
 mbrman = "0.6"
 log = { version = "0.4", features = ["serde"] }
 
+[build-dependencies]
+vergen-gitcl = { version = "9.0", features = ["build"] }
+
 
 
 
