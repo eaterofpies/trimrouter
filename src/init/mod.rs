@@ -43,6 +43,7 @@ pub async fn run_as_init(sys: Arc<RealSystem>) {
 
 fn early_boot(sys: Arc<RealSystem>) -> RouterConfig {
     setup_console_io(sys.as_ref());
+    crate::logging::init_early_logging();
 
     info!("====================================================");
     info!("Starting trimrouter (PID 1 Init Daemon)");

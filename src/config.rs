@@ -71,16 +71,71 @@ struct LoggingSection {
     level: Option<String>,
 }
 
+fn is_valid_unicast_mac(mac: &MacAddr) -> bool {
+    if mac.is_zero() || mac.is_broadcast() {
+        return false;
+    }
+    (mac.0 & 0x01) == 0
+}
+
 fn parse_mac_addresses(net: &NetworkSection) -> Result<(MacAddr, MacAddr), RouterError> {
     let wan_mac = MacAddr::from_str(&net.wan_mac)
         .map_err(|_| RouterError::Generic("wan_mac must be a valid MAC address".to_string()))?;
+    if !is_valid_unicast_mac(&wan_mac) {
+        return Err(RouterError::Generic(format!(
+            "wan_mac {} must be a valid non-zero, non-multicast unicast MAC address",
+            wan_mac
+        )));
+    }
+
     let lan_mac = MacAddr::from_str(&net.lan_mac)
         .map_err(|_| RouterError::Generic("lan_mac must be a valid MAC address".to_string()))?;
+    if !is_valid_unicast_mac(&lan_mac) {
+        return Err(RouterError::Generic(format!(
+            "lan_mac {} must be a valid non-zero, non-multicast unicast MAC address",
+            lan_mac
+        )));
+    }
+
+    if wan_mac == lan_mac {
+        return Err(RouterError::Generic(
+            "wan_mac and lan_mac must be distinct MAC addresses".to_string(),
+        ));
+    }
+
     Ok((wan_mac, lan_mac))
 }
 
+fn validate_lan_subnet(name: &str, cidr: &str) -> Result<ipnet::Ipv4Net, RouterError> {
+    let net = ipnet::Ipv4Net::from_str(cidr)
+        .map_err(|e| RouterError::Generic(format!("Invalid {} CIDR '{}': {}", name, cidr, e)))?;
+    if net.prefix_len() < 8 || net.prefix_len() > 30 {
+        return Err(RouterError::Generic(format!(
+            "Invalid {} prefix length /{} (must be between /8 and /30)",
+            name,
+            net.prefix_len()
+        )));
+    }
+    if net.addr() == net.network() {
+        return Err(RouterError::Generic(format!(
+            "{} '{}' cannot use the network address as the router host IP",
+            name, cidr
+        )));
+    }
+    if net.addr() == net.broadcast() {
+        return Err(RouterError::Generic(format!(
+            "{} '{}' cannot use the broadcast address as the router host IP",
+            name, cidr
+        )));
+    }
+    Ok(net)
+}
+
 fn parse_logging_config(logging: Option<&LoggingSection>) -> Result<LoggingConfig, RouterError> {
-    let max_log_size_mb = logging.and_then(|l| l.max_log_size_mb).unwrap_or(100);
+    let max_log_size_mb = logging
+        .and_then(|l| l.max_log_size_mb)
+        .unwrap_or(100)
+        .max(1);
 
     let level = match logging.and_then(|l| l.level.as_deref()) {
         Some(lvl_str) => log::LevelFilter::from_str(lvl_str).map_err(|_| {
@@ -123,6 +178,16 @@ impl RouterConfig {
             .network
             .backup_lan_ip
             .unwrap_or_else(|| "10.0.0.1/24".to_string());
+
+        let lan_net = validate_lan_subnet("lan_ip", &lan_ip)?;
+        let backup_net = validate_lan_subnet("backup_lan_ip", &backup_lan_ip)?;
+
+        if lan_net.contains(&backup_net.network()) || backup_net.contains(&lan_net.network()) {
+            return Err(RouterError::Generic(format!(
+                "lan_ip ({}) and backup_lan_ip ({}) must not overlap with each other",
+                lan_ip, backup_lan_ip
+            )));
+        }
 
         let reboot_delay = parsed.system.and_then(|s| s.reboot_delay);
         let logging = parse_logging_config(parsed.logging.as_ref())?;
@@ -201,13 +266,13 @@ mod tests {
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
             lan_ip = "10.0.0.1/24"
-            backup_lan_ip = "10.0.0.1/24"
+            backup_lan_ip = "172.16.0.1/24"
         "#
         .to_string();
 
         let config = RouterConfig::parse(&sys).unwrap();
         assert_eq!(config.lan_ip, "10.0.0.1/24");
-        assert_eq!(config.backup_lan_ip, "10.0.0.1/24");
+        assert_eq!(config.backup_lan_ip, "172.16.0.1/24");
         assert_eq!(
             config.wan_mac,
             MacAddr::from_str("52:54:00:12:34:56").unwrap()
@@ -234,6 +299,152 @@ mod tests {
         let config = RouterConfig::parse(&sys).unwrap();
         assert_eq!(config.lan_ip, "192.168.1.1/24");
         assert_eq!(config.backup_lan_ip, "172.16.0.1/24");
+    }
+
+    #[test]
+    fn test_config_parsing_zero_mac_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "00:00:00:00:00:00"
+            lan_mac = "52:54:00:12:34:57"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("must be a valid non-zero")
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_broadcast_mac_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "FF:FF:FF:FF:FF:FF"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("must be a valid non-zero")
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_multicast_mac_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "01:00:5E:00:00:01"
+            lan_mac = "52:54:00:12:34:57"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("non-multicast"));
+    }
+
+    #[test]
+    fn test_config_parsing_identical_macs_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:56"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("distinct MAC"));
+    }
+
+    #[test]
+    fn test_config_parsing_invalid_cidr_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/invalid"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_prefix_out_of_bounds_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/32"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("must be between /8 and /30")
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_network_or_broadcast_lan_ip_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.0/24"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("cannot use the network address")
+        );
+
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.255/24"
+        "#
+        .to_string();
+        let res2 = RouterConfig::parse(&sys);
+        assert!(res2.is_err());
+        assert!(
+            res2.unwrap_err()
+                .to_string()
+                .contains("cannot use the broadcast address")
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_overlapping_lan_and_backup_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+            backup_lan_ip = "192.168.1.100/24"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("must not overlap"));
     }
 
     #[test]

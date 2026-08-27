@@ -140,6 +140,7 @@ fn log_panic_info(info: &std::panic::PanicHookInfo<'_>) {
         error!("Location: {}:{}:{}", loc.file(), loc.line(), loc.column());
     }
     error!("====================================================");
+    crate::logging::flush();
 }
 
 fn halt_on_panic<S: PowerOps + ProcessOps>(sys: &S) {

@@ -94,11 +94,13 @@ If the `[logging]` section or any key is absent, defaults are used (`max_log_siz
 
 ---
 
-## 5. Console Fallback
+## 5. Early Boot Logging & Console Fallback
 
-If the log partition is not mounted (mount failure at boot), PID 1 falls back to writing all captured output directly to its own stdout (the system console), preserving the same `[timestamp] [service] message` format.
-
-Log rotation and reclamation are disabled in console-only mode.
+PID 1 initializes early logging (`init_early_logging`) at the start of early boot:
+1. **Early Boot**: Prior to mounting storage, log messages stream directly to the system console (`/dev/console`).
+2. **Log File Attachment**: As soon as the log partition is formatted/mounted to `/var/log`, `attach_log_file` opens `/var/log/system.log` in append mode. All subsequent init events, configuration parsing warnings, and fatal errors stream concurrently to both `/dev/console` and `/var/log/system.log`.
+3. **Panic Logging**: The custom panic hook formats the critical panic trace, writes it via the logging subsystem, and explicitly calls `flush` to sync the error to `/var/log/system.log` prior to system halt or reboot.
+4. **Console Fallback**: If the log partition fails to mount, logging continues seamlessly in console-only mode without crashing PID 1. Log rotation and reclamation are disabled in console-only mode.
 
 ---
 

@@ -110,7 +110,7 @@ backup_lan_ip = "10.0.0.1/24"   # Optional — defaults to "10.0.0.1/24"
 reboot_delay = 10               # Optional — seconds before reboot on panic (omit for infinite hang)
 ```
 
-If `wan_mac` or `lan_mac` is missing, or the file cannot be read, PID 1 prints a configuration error and panics.
+If `wan_mac` or `lan_mac` is missing, invalid (e.g. zero, broadcast, multicast, or identical MACs), if `lan_ip`/`backup_lan_ip` are invalid CIDRs (or overlap with each other), or if the configuration file cannot be read, PID 1 prints a descriptive configuration error and halts.
 
 ---
 

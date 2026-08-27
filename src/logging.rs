@@ -100,16 +100,18 @@ pub fn configure_vm_writeback() {
     }
 }
 
+pub fn init_early_logging() {
+    let _ = log::set_logger(&ROUTER_LOGGER);
+    log::set_max_level(LevelFilter::Info);
+}
+
 pub fn init_logging(max_size_mb: u64, level: LevelFilter) {
     configure_vm_writeback();
-    let mut logger = get_logger().lock().unwrap();
-    *logger = Logger::new(
-        Path::new(DEFAULT_LOG_DIR),
-        Path::new(DEFAULT_LOG_FILE),
-        max_size_mb,
-        level,
-    );
-    logger.open_log_file();
+    if let Ok(mut logger) = get_logger().lock() {
+        logger.max_size_bytes = max_size_mb.saturating_mul(BYTES_PER_MB);
+        logger.level = level;
+        logger.open_log_file();
+    }
     let _ = log::set_logger(&ROUTER_LOGGER);
     log::set_max_level(level);
 }
