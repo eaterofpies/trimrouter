@@ -65,9 +65,8 @@ fn find_module_recursive(dir: &Path, base_name: &str) -> Option<PathBuf> {
 
 fn find_module_file(name: &str) -> Option<PathBuf> {
     // Raw modaliases contain subsystem prefixes with colons (e.g. `acpi:PNP0A03:`, `platform:alarmtimer`).
-    // Real module file names never contain colons. Returning None immediately avoids expensive
-    // recursive disk directory scans for non-existent module files when a modalias has no match.
-    if name.contains(':') {
+    // Real module file names never contain colons, slashes, directory traversals, or null bytes.
+    if name.contains(':') || name.contains('/') || name.contains("..") || name.contains('\0') {
         return None;
     }
     let normalized = name.replace('_', "-");
@@ -172,12 +171,31 @@ fn parse_modules_dep(
     map
 }
 
+pub const MAX_DEP_RECURSION_DEPTH: usize = 64;
+
 fn resolve_deps_recursive(
     mod_name: &str,
     dep_map: &HashMap<String, (PathBuf, Vec<String>)>,
     resolved: &mut Vec<PathBuf>,
     visited: &mut HashSet<String>,
 ) {
+    resolve_deps_recursive_internal(mod_name, dep_map, resolved, visited, 0);
+}
+
+fn resolve_deps_recursive_internal(
+    mod_name: &str,
+    dep_map: &HashMap<String, (PathBuf, Vec<String>)>,
+    resolved: &mut Vec<PathBuf>,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_DEP_RECURSION_DEPTH {
+        warn!(
+            "[init] Maximum dependency recursion depth ({}) exceeded while resolving {}",
+            MAX_DEP_RECURSION_DEPTH, mod_name
+        );
+        return;
+    }
     let normalized = mod_name.replace('_', "-");
     if visited.contains(&normalized) {
         return;
@@ -186,7 +204,7 @@ fn resolve_deps_recursive(
 
     if let Some((path, deps)) = dep_map.get(&normalized) {
         for dep in deps {
-            resolve_deps_recursive(dep, dep_map, resolved, visited);
+            resolve_deps_recursive_internal(dep, dep_map, resolved, visited, depth + 1);
         }
         resolved.push(path.clone());
     }
@@ -398,27 +416,31 @@ pub fn load_required_modules() {
 }
 
 fn wildcard_match(pattern: &[char], input: &[char]) -> bool {
-    if pattern.is_empty() {
-        return input.is_empty();
-    }
-    if pattern[0] == '*' {
-        if pattern.len() == 1 {
-            return true;
+    let (mut p_idx, mut s_idx) = (0, 0);
+    let (mut star_idx, mut match_idx) = (None, 0);
+
+    while s_idx < input.len() {
+        if p_idx < pattern.len() && (pattern[p_idx] == '?' || pattern[p_idx] == input[s_idx]) {
+            p_idx += 1;
+            s_idx += 1;
+        } else if p_idx < pattern.len() && pattern[p_idx] == '*' {
+            star_idx = Some(p_idx);
+            p_idx += 1;
+            match_idx = s_idx;
+        } else if let Some(star) = star_idx {
+            p_idx = star + 1;
+            match_idx += 1;
+            s_idx = match_idx;
+        } else {
+            return false;
         }
-        for i in 0..=input.len() {
-            if wildcard_match(&pattern[1..], &input[i..]) {
-                return true;
-            }
-        }
-        return false;
     }
-    if input.is_empty() {
-        return false;
+
+    while p_idx < pattern.len() && pattern[p_idx] == '*' {
+        p_idx += 1;
     }
-    if pattern[0] == '?' || pattern[0] == input[0] {
-        return wildcard_match(&pattern[1..], &input[1..]);
-    }
-    false
+
+    p_idx == pattern.len()
 }
 
 fn parse_modules_alias_line(line: &str) -> Option<(Vec<char>, String)> {
@@ -683,5 +705,52 @@ alias usb:v045Ep* usbnet\n\
         assert_eq!(test_resolve("crc32c"), "crc32c_generic");
         assert_eq!(test_resolve("usb:v045Ep00DB"), "usbnet");
         assert_eq!(test_resolve("other_mod"), "other_mod");
+    }
+
+    #[test]
+    fn test_wildcard_match_catastrophic_backtracking_safety() {
+        // Adversarial pattern that triggers exponential backtracking in naive recursive algorithms
+        let pattern: Vec<char> = "*a*a*a*a*a*a*a*a*b".chars().collect();
+        let input: Vec<char> = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".chars().collect();
+        assert!(!wildcard_match(&pattern, &input));
+
+        let matching_input: Vec<char> = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab".chars().collect();
+        assert!(wildcard_match(&pattern, &matching_input));
+    }
+
+    #[test]
+    fn test_resolve_deps_recursive_cycle_and_depth_protection() {
+        let mut dep_map = HashMap::new();
+        // Circular dependency: mod_a -> mod_b -> mod_a
+        dep_map.insert(
+            "mod-a".to_string(),
+            (
+                PathBuf::from("/lib/modules/mod-a.ko"),
+                vec!["mod-b".to_string()],
+            ),
+        );
+        dep_map.insert(
+            "mod-b".to_string(),
+            (
+                PathBuf::from("/lib/modules/mod-b.ko"),
+                vec!["mod-a".to_string()],
+            ),
+        );
+
+        let mut resolved = Vec::new();
+        let mut visited = HashSet::new();
+        resolve_deps_recursive("mod_a", &dep_map, &mut resolved, &mut visited);
+
+        // Circular resolution finishes without stack overflow / infinite loop
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn test_find_module_file_sanitization() {
+        // Paths with traversal, slashes, or null bytes are rejected
+        assert_eq!(find_module_file("../etc/passwd"), None);
+        assert_eq!(find_module_file("drivers/net/e1000"), None);
+        assert_eq!(find_module_file("evil\0module"), None);
+        assert_eq!(find_module_file("pci:v00008086d0000100E"), None);
     }
 }
