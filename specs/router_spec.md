@@ -68,6 +68,7 @@ Creates an IPv4 table named `trimrouter` containing two chains:
 - Masquerade rule: matches outbound traffic on the WAN interface (`oif`) and applies `masquerade`.
 
 **`filter_input`** — type `filter`, hook `input`, priority `0`, policy `drop`:
+- Drop `ct state invalid`
 - Accept `iif == lo`
 - Accept `iif == lan`
 - Accept UDP `dport 68` on WAN (DHCP client replies)
