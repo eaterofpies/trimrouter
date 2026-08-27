@@ -16,7 +16,7 @@ use tokio::net::unix::OwnedReadHalf;
 // =========================================================================
 const DNS_HEADER_SIZE: usize = 12;
 const DEFAULT_TTL_SECS: u32 = 30;
-const MAX_TTL_SECS: u32 = 3600;
+const MAX_TTL_SECS: u32 = 3600; // 1 hour max cache duration
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const RECV_BUF_SIZE: usize = 4096;
 const FALLBACK_DNS_SERVER: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
@@ -210,11 +210,11 @@ async fn handle_upstream_reply(
     };
 
     let expected_ip = query_meta.upstream_servers[query_meta.current_server_idx];
-    if from_addr.ip() != IpAddr::V4(expected_ip) {
+    let expected_addr = SocketAddr::new(IpAddr::V4(expected_ip), DNS_PORT);
+    if from_addr != expected_addr {
         warn!(
-            "[dns-forwarder] WARNING: Received DNS spoof attempt! IP {} mismatch for xid {}",
-            from_addr.ip(),
-            upstream_xid
+            "[dns-forwarder] WARNING: Received DNS spoof attempt! Address {} mismatch for xid {} (expected {})",
+            from_addr, upstream_xid, expected_addr
         );
         return;
     }
@@ -273,7 +273,7 @@ fn evict_expired_cache(cache: &mut HashMap<Vec<u8>, CacheEntry>) {
 
 fn get_cache_key(query_bytes: &[u8]) -> Option<Vec<u8>> {
     let packet = dns_parser::Packet::parse(query_bytes).ok()?;
-    if packet.questions.is_empty() {
+    if packet.questions.is_empty() || packet.header.opcode != dns_parser::Opcode::StandardQuery {
         return None;
     }
     let q = &packet.questions[0];
@@ -300,16 +300,16 @@ fn insert_cache(cache_key: Vec<u8>, response: Vec<u8>, cache: &mut HashMap<Vec<u
         Ok(p) => p,
         Err(_) => return,
     };
-    let ttl = packet
+    let raw_ttl = packet
         .answers
         .iter()
         .map(|ans| ans.ttl)
         .min()
         .unwrap_or(DEFAULT_TTL_SECS);
-    if ttl == 0 {
+    if raw_ttl == 0 {
         return;
     }
-    let cache_ttl = std::cmp::min(MAX_TTL_SECS, ttl);
+    let cache_ttl = std::cmp::min(MAX_TTL_SECS, raw_ttl);
     let expiry = Instant::now() + Duration::from_secs(cache_ttl as u64);
 
     if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&cache_key) {
@@ -326,9 +326,18 @@ fn insert_cache(cache_key: Vec<u8>, response: Vec<u8>, cache: &mut HashMap<Vec<u
     cache.insert(cache_key, CacheEntry { response, expiry });
 }
 
+fn is_valid_upstream_resolver(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_loopback()
+}
+
 fn get_upstream_resolvers(configured: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
-    if !configured.is_empty() {
-        configured.to_vec()
+    let valid: Vec<Ipv4Addr> = configured
+        .iter()
+        .copied()
+        .filter(|&ip| is_valid_upstream_resolver(ip))
+        .collect();
+    if !valid.is_empty() {
+        valid
     } else {
         vec![FALLBACK_DNS_SERVER]
     }
@@ -339,7 +348,7 @@ fn allocate_unique_xid(pending: &HashMap<u16, PendingQuery>) -> Option<u16> {
         return None;
     }
     let mut rng_xid = rand::random::<u16>();
-    while pending.contains_key(&rng_xid) {
+    while rng_xid == 0 || pending.contains_key(&rng_xid) {
         rng_xid = rand::random::<u16>();
     }
     Some(rng_xid)
@@ -440,5 +449,112 @@ mod tests {
         insert_cache(b"corrupted_key".to_vec(), corrupted_resp, &mut cache);
 
         assert!(!cache.contains_key(&b"corrupted_key".to_vec()[..]));
+    }
+
+    #[test]
+    fn test_is_valid_upstream_resolver_filters_loopback_and_special() {
+        assert!(is_valid_upstream_resolver(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(is_valid_upstream_resolver(Ipv4Addr::new(1, 1, 1, 1)));
+
+        // Unspecified, broadcast, and loopback are rejected (CVE-2014-0472 protection)
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::UNSPECIFIED));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::BROADCAST));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(127, 0, 0, 53)));
+    }
+
+    #[test]
+    fn test_get_upstream_resolvers_filters_invalid_and_falls_back() {
+        let invalid_servers = vec![
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+        ];
+        let resolvers = get_upstream_resolvers(&invalid_servers);
+        assert_eq!(resolvers, vec![FALLBACK_DNS_SERVER]);
+
+        let mixed_servers = vec![
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(9, 9, 9, 9),
+            Ipv4Addr::UNSPECIFIED,
+        ];
+        let resolvers = get_upstream_resolvers(&mixed_servers);
+        assert_eq!(resolvers, vec![Ipv4Addr::new(9, 9, 9, 9)]);
+    }
+
+    #[test]
+    fn test_insert_cache_ttl_rfc2181_behavior() {
+        let mut resp = vec![0u8; DNS_HEADER_SIZE];
+        resp.extend_from_slice(&[
+            6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        resp.extend_from_slice(&[0, 1, 0, 1]); // Type A, Class IN
+        resp[5] = 1; // QDCount = 1
+        resp[7] = 1; // ANCount = 1
+
+        // TTL == 0: RFC 2181 behavior - must NOT be cached
+        let mut resp_zero = resp.clone();
+        resp_zero.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 8, 8, 8, 8]);
+        let mut cache = HashMap::new();
+        insert_cache(b"zero_key".to_vec(), resp_zero, &mut cache);
+        assert!(!cache.contains_key(&b"zero_key".to_vec()[..]));
+
+        // Low TTL (e.g. 10s): RFC 2181 honors exact low TTL without artificial minimum floor
+        let mut resp_low = resp.clone();
+        resp_low.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 10, 0, 4, 8, 8, 8, 8]);
+        insert_cache(b"low_key".to_vec(), resp_low, &mut cache);
+        let entry_low = cache.get(&b"low_key".to_vec()[..]).unwrap();
+        let cache_ttl_low = entry_low.expiry.duration_since(Instant::now()).as_secs();
+        assert!((9..=10).contains(&cache_ttl_low));
+
+        // High TTL (e.g. 1,000,000s): caps at max_ttl (3600s / 1 hour)
+        let mut resp_max = resp.clone();
+        resp_max.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 8, 8, 8, 8]);
+        let offset = resp_max.len() - 16;
+        resp_max[offset + 6..offset + 10].copy_from_slice(&1_000_000u32.to_be_bytes());
+        insert_cache(b"max_key".to_vec(), resp_max, &mut cache);
+
+        let entry_max = cache.get(&b"max_key".to_vec()[..]).unwrap();
+        let cache_ttl_max = entry_max.expiry.duration_since(Instant::now()).as_secs();
+        assert!((3598..=3600).contains(&cache_ttl_max));
+    }
+
+    #[test]
+    fn test_get_cache_key_rejects_non_standard_opcode() {
+        let mut query = vec![0u8; DNS_HEADER_SIZE];
+        query[2] = 0x28; // Opcode 5 (Status/Update) instead of StandardQuery (0)
+        query[5] = 1; // QDCount = 1
+        query.extend_from_slice(&[
+            6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query.extend_from_slice(&[0, 1, 0, 1]); // Type A, Class IN
+
+        assert_eq!(get_cache_key(&query), None);
+    }
+
+    #[test]
+    fn test_allocate_unique_xid_never_zero() {
+        let pending = HashMap::new();
+        for _ in 0..100 {
+            let xid = allocate_unique_xid(&pending);
+            assert!(xid.is_some());
+            assert_ne!(xid.unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn test_lookup_cache_expired_entry_evicted_on_lookup() {
+        let mut cache = HashMap::new();
+        let key = b"expired_key".to_vec();
+        cache.insert(
+            key.clone(),
+            CacheEntry {
+                response: vec![1, 2, 3],
+                expiry: Instant::now() - Duration::from_secs(1), // Already expired
+            },
+        );
+
+        assert_eq!(lookup_cache(&key, &mut cache), None);
+        assert!(!cache.contains_key(&key)); // Purged
     }
 }

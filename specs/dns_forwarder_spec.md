@@ -45,14 +45,15 @@ For every query forwarded upstream:
 ### 2.2 Cache Poisoning & Spoofing Protection
 *   The unified event loop selects over client and upstream sockets.
 *   Upon receiving an upstream response, it extracts the transaction ID and retrieves the pending record.
-*   **Verification**: Validates that the packet's sender IP address matches the expected upstream DNS server IP.
-*   **Discarding**: If the sender IP does not match, the packet is logged as a DNS spoofing attempt and discarded, protecting the local resolver cache from poisoning.
+*   **Verification**: Validates that the packet's sender IP and port match the expected upstream DNS server socket (`IP:53`).
+*   **Discarding**: If the sender address does not match or the transaction ID is unrequested, the packet is logged as a DNS spoofing attempt and discarded, protecting the local resolver cache from poisoning.
 *   If valid, the response is cached, the original transaction ID is restored, and the reply is returned to the client.
 
 ### 2.3 Upstream Target Selection & Fallback
 *   Retrieves the list of upstream DNS servers from the WAN interface's active `WanLease` configuration.
-*   Attempts resolution sequentially across the configured upstream resolvers. If an upstream resolver times out or fails to respond, it automatically attempts the next resolver in the list.
-*   If the WAN lease has no DNS servers or is inactive, falls back to `8.8.8.8` (Google DNS).
+*   **Resolver Sanitization**: Filters out loopback (`127.0.0.0/8`), unspecified (`0.0.0.0`), and broadcast (`255.255.255.255`) addresses to prevent amplification loops (CVE-2014-0472).
+*   Attempts resolution sequentially across the configured valid upstream resolvers. If an upstream resolver times out or fails to respond, it automatically attempts the next resolver in the list.
+*   If the WAN lease has no valid DNS servers or is inactive, falls back to `8.8.8.8` (Google DNS).
 
 ---
 
@@ -60,13 +61,13 @@ For every query forwarded upstream:
 
 The forwarder maintains an in-memory cache to reduce external latency and DNS traffic:
 
-*   **Cache Key**: Structured as `domain_name:query_type:query_class` (e.g., `google.com:A:IN`).
+*   **Cache Key**: Structured as `domain_name:query_type:query_class` (e.g., `google.com:A:IN`). Queries with non-standard opcodes or zero questions are rejected.
 *   **Bounded Capacity**: The cache is bounded to a maximum of 4096 entries (`MAX_CACHE_ENTRIES`). When full, the entry with the earliest expiry is evicted upon inserting a new entry.
 *   **TTL Calculation**:
     *   Parses response packets using the `dns-parser` crate.
     *   Finds the minimum TTL among all resource records in the answer section.
-    *   Caps the cache entry duration to a maximum of 3600 seconds (`MAX_TTL_SECS`) and a minimum fallback of 30 seconds (`DEFAULT_TTL_SECS`).
-*   **Cache Cleanup**: The unified event loop periodically ticks on `CLEANUP_INTERVAL` to prune expired cache entries and check pending query timeouts.
+    *   **RFC 2181 TTL Semantics**: If `TTL == 0`, the response is returned to the client and never cached. Non-zero TTLs are capped at a maximum of 3600 seconds (`MAX_TTL_SECS` / 1 hour), with a fallback of 30 seconds (`DEFAULT_TTL_SECS`) for empty answers.
+*   **Cache Cleanup**: The unified event loop periodically ticks on `CLEANUP_INTERVAL` to prune expired cache entries and check pending query timeouts. Expired entries are also purged upon lookup.
 
 ---
 
