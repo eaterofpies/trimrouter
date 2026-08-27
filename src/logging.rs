@@ -278,6 +278,10 @@ impl Logger {
             return;
         }
 
+        if self.active_log_path.is_symlink() {
+            let _ = fs::remove_file(&self.active_log_path);
+        }
+
         if let Ok((total, _)) = get_partition_space(&self.log_dir)
             && total > 0
             && self.max_size_bytes >= total
@@ -382,6 +386,10 @@ impl Logger {
         let rotated_name = format!("system.{}.log", timestamp_suffix);
         let rotated_path = self.log_dir.join(rotated_name);
 
+        if rotated_path.is_symlink() {
+            let _ = fs::remove_file(&rotated_path);
+        }
+
         if self.active_log_path.exists()
             && let Err(e) = fs::rename(&self.active_log_path, &rotated_path)
         {
@@ -426,20 +434,21 @@ fn list_rotated_log_files(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
     let entries = fs::read_dir(dir)?;
     let mut files = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
+        if let Ok(file_type) = entry.file_type() {
+            if file_type.is_dir() {
+                continue;
+            }
+        } else {
             continue;
         }
+
+        let path = entry.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && name.starts_with("system.")
-            && name.ends_with(".log")
-            && name != "system.log"
+            && let Some(rest) = name.strip_prefix("system.")
+            && let Some(ts) = rest.strip_suffix(".log")
+            && !ts.is_empty()
         {
-            let ts = name
-                .trim_start_matches("system.")
-                .trim_end_matches(".log")
-                .to_string();
-            files.push((ts, path));
+            files.push((ts.to_string(), path));
         }
     }
     Ok(files)
@@ -573,6 +582,55 @@ mod tests {
             !old_file.exists(),
             "Oldest rotated file must be deleted first"
         );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_list_rotated_log_files_and_symlink_reclamation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("trimrouter_symlink_test_{}", rand::random::<u64>()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Real rotated file
+        let valid_file = temp_dir.join("system.2026-08-15T120000Z.log");
+        fs::write(&valid_file, "valid content").unwrap();
+
+        // 2. Subdirectory named like a rotated file (must be ignored)
+        let fake_dir = temp_dir.join("system.2026-08-16T120000Z.log");
+        fs::create_dir_all(&fake_dir).unwrap();
+
+        // 3. Symlink pointing to an external target file
+        let target_file = temp_dir.join("real_target.txt");
+        fs::write(&target_file, "secret").unwrap();
+        let symlink_file = temp_dir.join("system.2026-08-17T120000Z.log");
+        let _ = std::os::unix::fs::symlink(&target_file, &symlink_file);
+
+        let rotated = list_rotated_log_files(&temp_dir).unwrap();
+        // Discovers both valid file and symlink (for reclamation), but ignores subdirectory
+        assert_eq!(rotated.len(), 2);
+
+        // 4. Run reclamation: symlink is unlinked/removed, but target_file remains untouched
+        let active_path = temp_dir.join("system.log");
+        let mut logger = Logger::new(&temp_dir, &active_path, 1, LevelFilter::Info);
+        logger.max_size_bytes = 1000;
+        logger = logger.with_space_checker(|_| Ok(100)); // Low free space triggers reclamation
+        logger.reclaim_space();
+
+        assert!(!symlink_file.exists());
+        assert!(!valid_file.exists());
+        assert!(target_file.exists()); // External target file was NOT deleted!
+
+        // 5. Test open_log_file cleans up active log symlink
+        let active_target = temp_dir.join("active_target.txt");
+        fs::write(&active_target, "active secret").unwrap();
+        let _ = std::os::unix::fs::symlink(&active_target, &active_path);
+        assert!(active_path.is_symlink());
+
+        logger.open_log_file();
+        assert!(!active_path.is_symlink()); // Symlink was unlinked
+        assert!(active_target.exists()); // Target was not truncated or modified
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
