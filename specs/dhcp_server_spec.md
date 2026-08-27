@@ -24,6 +24,7 @@ To ensure reliability, the DHCP server maintains an in-memory database of active
 *   **Data Structures**:
     *   `by_mac`: A hash map mapping client `MacAddr` to `ClientLease` (containing the assigned `Ipv4Addr` and expiration `Instant`).
     *   `allocated_ips`: A hash set containing currently leased IP addresses for O(1) lookup.
+    *   `conflicts`: A hash map tracking temporary conflict holds on IPs independently from client leases.
 *   **Atomicity Guarantees**:
     *   An IP is in `allocated_ips` if and only if there is a corresponding active lease in `by_mac`.
     *   Every insertion, replacement, or removal operation modifies both the mapping and the set index inside a single atomic operation within the `LeaseTable` module boundaries.
@@ -47,7 +48,7 @@ When the server receives a message from a client, it processes it according to t
 4.  Returns a `DHCPOFFER` to the client.
 
 ### 3.2 REQUEST Processing
-1.  **Request Type Validation**: Inspects the requested IP address and the Server Identifier (Option 54).
+1.  **Request Type Validation**: Inspects the requested IP address and the Server Identifier (Option 54). If Option 54 is present and points to a different DHCP server, the request is ignored per RFC 2131 Section 4.3.2.
 2.  **Conflict Validation**:
     *   Verifies the requested IP is within the LAN subnet scope.
     *   Verifies the requested IP does not conflict with the server's own gateway IP address.

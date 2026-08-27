@@ -10,7 +10,7 @@ const CANDIDATE_HOLD_DURATION: Duration = Duration::from_secs(10);
 const NEIGHBOR_HOLD_DURATION: Duration = Duration::from_secs(300);
 const LEASE_CHANNEL_CAPACITY: usize = 64;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientLease {
     pub ip: Ipv4Addr,
     pub expiry: Instant,
@@ -26,6 +26,8 @@ pub struct LeaseTable {
     by_mac: HashMap<MacAddr, ClientLease>,
     /// O(1) index of currently allocated IPs. Always kept in sync with `by_mac`.
     allocated_ips: HashSet<Ipv4Addr>,
+    /// Active temporary conflict holds on IPs.
+    conflicts: HashMap<Ipv4Addr, Instant>,
 }
 
 impl LeaseTable {
@@ -54,9 +56,21 @@ impl LeaseTable {
         Some(lease)
     }
 
-    /// Returns `true` if `ip` is not currently held by any client.
+    /// Returns `true` if `ip` is not currently held by any client or under a conflict hold.
     pub fn is_ip_available(&self, ip: Ipv4Addr) -> bool {
-        !self.allocated_ips.contains(&ip)
+        !self.allocated_ips.contains(&ip) && !self.is_conflict_active(ip)
+    }
+
+    /// Returns `true` if `ip` is currently under an active conflict hold.
+    pub fn is_conflict_active(&self, ip: Ipv4Addr) -> bool {
+        self.conflicts
+            .get(&ip)
+            .is_some_and(|&expiry| expiry > Instant::now())
+    }
+
+    /// Records a conflict hold on `ip` for `duration`.
+    pub fn record_conflict(&mut self, ip: Ipv4Addr, duration: Duration) {
+        self.conflicts.insert(ip, Instant::now() + duration);
     }
 
     /// Returns `true` if `ip` is actively leased to a MAC *other* than `client_mac`.
@@ -66,10 +80,11 @@ impl LeaseTable {
             .any(|(mac, l)| l.ip == ip && l.expiry > Instant::now() && *mac != client_mac)
     }
 
-    /// Evicts all expired leases and returns their IPs to the available pool.
+    /// Evicts all expired leases and conflict holds, returning their IPs to the available pool.
     pub fn evict_expired(&mut self) {
         self.by_mac.retain(|_, l| l.expiry > Instant::now());
         self.allocated_ips = self.by_mac.values().map(|l| l.ip).collect();
+        self.conflicts.retain(|_, expiry| *expiry > Instant::now());
     }
 
     /// Evicts expired leases, then finds the first available host IP in
@@ -401,13 +416,7 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             let _ = reply_tx.send(is_conflict);
         }
         LeaseCommand::RecordConflict { ip, duration } => {
-            leases.insert(
-                MacAddr::zero(),
-                ClientLease {
-                    ip,
-                    expiry: Instant::now() + duration,
-                },
-            );
+            leases.record_conflict(ip, duration);
         }
         LeaseCommand::Release {
             client_mac,

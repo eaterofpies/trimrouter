@@ -149,10 +149,9 @@ async fn process_incoming_packet(
         return;
     }
 
-    let chaddr = dhcp.chaddr();
-    let client_mac = match <[u8; 6]>::try_from(&chaddr[..dhcp.hlen() as usize]) {
-        Ok(bytes) => MacAddr::from(bytes),
-        Err(_) => return,
+    let client_mac = match extract_client_mac(&dhcp) {
+        Some(mac) => mac,
+        None => return,
     };
 
     // Server-side anti-spoofing MAC check
@@ -161,7 +160,7 @@ async fn process_incoming_packet(
         None => return,
     };
     let src_mac = eth.get_source();
-    if dhcp.giaddr().is_unspecified() && src_mac != client_mac {
+    if is_spoofed_l2_packet(src_mac, client_mac, dhcp.giaddr()) {
         warn!(
             "[dhcp-server] WARNING: Dropping spoofed DHCP packet: L2 source MAC ({}) does not match chaddr ({})!",
             src_mac, client_mac
@@ -195,6 +194,33 @@ async fn process_incoming_packet(
             }
         }
         _ => {}
+    }
+}
+
+fn extract_client_mac(dhcp: &Message) -> Option<MacAddr> {
+    if dhcp.hlen() != 6 {
+        return None;
+    }
+    let chaddr = dhcp.chaddr();
+    if chaddr.len() < 6 {
+        return None;
+    }
+    let bytes: [u8; 6] = chaddr[..6].try_into().ok()?;
+    let mac = MacAddr::from(bytes);
+    if mac.is_zero() || mac == MacAddr::broadcast() {
+        return None;
+    }
+    Some(mac)
+}
+
+fn is_spoofed_l2_packet(eth_src: MacAddr, client_mac: MacAddr, giaddr: Ipv4Addr) -> bool {
+    giaddr.is_unspecified() && eth_src != client_mac
+}
+
+fn should_process_request_server_id(dhcp: &Message, server_ip: Ipv4Addr) -> bool {
+    match dhcp.opts().get(OptionCode::ServerIdentifier) {
+        Some(DhcpOption::ServerIdentifier(id)) => *id == server_ip,
+        _ => true,
     }
 }
 
@@ -439,6 +465,14 @@ async fn handle_dhcp_request(
         "[dhcp-server] Received DHCPREQUEST from client MAC: {}",
         client_mac
     );
+
+    if !should_process_request_server_id(dhcp, config.server_ip) {
+        debug!(
+            "[dhcp-server] DHCPREQUEST ServerIdentifier does not match server IP {}. Ignoring.",
+            config.server_ip
+        );
+        return;
+    }
 
     let requested_ip_opt = match dhcp.opts().get(OptionCode::RequestedIpAddress) {
         Some(DhcpOption::RequestedIpAddress(ip)) => Some(*ip),
@@ -797,5 +831,148 @@ mod tests {
             Duration::from_secs(3600),
         );
         assert_eq!(res, None);
+    }
+
+    #[test]
+    fn test_extract_client_mac_valid_and_invalid() {
+        use dhcproto::{Decodable, Decoder};
+
+        // Valid 6-byte Ethernet MAC
+        let mut msg_valid = Message::default();
+        msg_valid.set_chaddr(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(
+            extract_client_mac(&msg_valid),
+            Some(MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55))
+        );
+
+        // hlen = 0 (invalid)
+        let mut msg_zero_len = Message::default();
+        msg_zero_len.set_chaddr(&[]);
+        assert_eq!(extract_client_mac(&msg_zero_len), None);
+
+        // hlen = 16 (invalid non-Ethernet hlen)
+        let mut msg_long_len = Message::default();
+        msg_long_len.set_chaddr(&[0x00; 16]);
+        assert_eq!(extract_client_mac(&msg_long_len), None);
+
+        // All-zero MAC (00:00:00:00:00:00) should be rejected
+        let mut msg_zero_mac = Message::default();
+        msg_zero_mac.set_chaddr(&[0x00; 6]);
+        assert_eq!(extract_client_mac(&msg_zero_mac), None);
+
+        // Broadcast MAC (FF:FF:FF:FF:FF:FF) should be rejected
+        let mut msg_bcast_mac = Message::default();
+        msg_bcast_mac.set_chaddr(&[0xFF; 6]);
+        assert_eq!(extract_client_mac(&msg_bcast_mac), None);
+
+        // Corrupted packet with hlen = 255 (CVE-2016-2774 out-of-bounds guard: must not panic)
+        let mut raw_bytes = vec![0u8; 300];
+        raw_bytes[0] = 1; // BootRequest
+        raw_bytes[1] = 1; // Ethernet
+        raw_bytes[2] = 255; // hlen = 255
+        // Magic cookie at 236
+        raw_bytes[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        if let Ok(msg_oob) = Message::decode(&mut Decoder::new(&raw_bytes)) {
+            assert_eq!(extract_client_mac(&msg_oob), None);
+        }
+    }
+
+    #[test]
+    fn test_is_spoofed_l2_packet_anti_spoofing() {
+        let mac1 = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x01);
+        let mac2 = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x02);
+
+        // Non-relayed packet with matching MACs: valid
+        assert!(!is_spoofed_l2_packet(mac1, mac1, Ipv4Addr::UNSPECIFIED));
+
+        // Non-relayed packet with spoofed L2 MAC: spoofed
+        assert!(is_spoofed_l2_packet(mac1, mac2, Ipv4Addr::UNSPECIFIED));
+
+        // Relayed packet through DHCP relay agent (giaddr set): allowed
+        let relay_ip = Ipv4Addr::new(192, 168, 1, 254);
+        assert!(!is_spoofed_l2_packet(mac1, mac2, relay_ip));
+    }
+
+    #[test]
+    fn test_should_process_request_server_id() {
+        let server_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let other_server_ip = Ipv4Addr::new(192, 168, 1, 254);
+
+        // Request with matching server ID: should process
+        let mut msg_match = Message::default();
+        msg_match
+            .opts_mut()
+            .insert(DhcpOption::ServerIdentifier(server_ip));
+        assert!(should_process_request_server_id(&msg_match, server_ip));
+
+        // Request with mismatched server ID: should ignore (RFC 2131 Section 4.3.2)
+        let mut msg_mismatch = Message::default();
+        msg_mismatch
+            .opts_mut()
+            .insert(DhcpOption::ServerIdentifier(other_server_ip));
+        assert!(!should_process_request_server_id(&msg_mismatch, server_ip));
+
+        // Request without server ID (e.g. RENEWING): should process
+        let msg_none = Message::default();
+        assert!(should_process_request_server_id(&msg_none, server_ip));
+    }
+
+    #[test]
+    fn test_get_dest_mac_ip_broadcast_and_unicast() {
+        let client_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let leased_ip = Ipv4Addr::new(192, 168, 1, 100);
+
+        let (b_mac, b_ip) = get_dest_mac_ip(true, client_mac, leased_ip);
+        assert_eq!(b_mac, MacAddr::broadcast());
+        assert_eq!(b_ip, Ipv4Addr::BROADCAST);
+
+        let (u_mac, u_ip) = get_dest_mac_ip(false, client_mac, leased_ip);
+        assert_eq!(u_mac, client_mac);
+        assert_eq!(u_ip, leased_ip);
+    }
+
+    #[test]
+    fn test_record_multiple_conflicts_held_simultaneously() {
+        let mut leases = LeaseTable::new();
+        let ip1 = Ipv4Addr::new(192, 168, 1, 10);
+        let ip2 = Ipv4Addr::new(192, 168, 1, 20);
+
+        leases.record_conflict(ip1, Duration::from_secs(300));
+        leases.record_conflict(ip2, Duration::from_secs(300));
+
+        // Both IPs should be actively on hold and unavailable
+        assert!(!leases.is_ip_available(ip1));
+        assert!(!leases.is_ip_available(ip2));
+        assert!(leases.is_conflict_active(ip1));
+        assert!(leases.is_conflict_active(ip2));
+    }
+
+    #[test]
+    fn test_release_non_existent_and_existing_leases() {
+        let mut leases = LeaseTable::new();
+        let client1 = MacAddr::new(1, 2, 3, 4, 5, 6);
+        let client2 = MacAddr::new(1, 2, 3, 4, 5, 7);
+        let ip = Ipv4Addr::new(192, 168, 1, 50);
+
+        // Releasing a non-existent client MAC returns None
+        assert_eq!(leases.remove(&client1), None);
+
+        // Insert and then release
+        leases.insert(
+            client1,
+            ClientLease {
+                ip,
+                expiry: Instant::now() + Duration::from_secs(3600),
+            },
+        );
+        assert!(!leases.is_ip_available(ip));
+
+        let released = leases.remove(&client1);
+        assert!(released.is_some());
+        assert_eq!(released.unwrap().ip, ip);
+        assert!(leases.is_ip_available(ip));
+
+        // Unknown client2 still returns None
+        assert_eq!(leases.remove(&client2), None);
     }
 }
