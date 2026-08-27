@@ -527,6 +527,7 @@ fn get_dest_mac_ip(
 mod tests {
     use super::*;
     use crate::services::dhcp_server::{ClientLease, LeaseTable};
+    use dhcproto::{Decodable, Decoder};
     use std::time::Instant;
 
     fn make_config(cidr: &str) -> ServerConfig {
@@ -841,8 +842,6 @@ mod tests {
 
     #[test]
     fn test_extract_client_mac_valid_and_invalid() {
-        use dhcproto::{Decodable, Decoder};
-
         // Valid 6-byte Ethernet MAC
         let mut msg_valid = Message::default();
         msg_valid.set_chaddr(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);

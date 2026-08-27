@@ -1,13 +1,21 @@
 #![allow(dead_code, unused_macros)]
 
-use dhcproto::Decodable;
-use pnet::packet::Packet;
+use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
+use dhcproto::{Decodable, Encodable, Encoder};
+use pnet::packet::arp::{ArpHardwareTypes, MutableArpPacket};
+use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
+use pnet::packet::icmp::echo_reply::MutableEchoReplyPacket;
+use pnet::packet::ipv4::MutableIpv4Packet;
+use pnet::packet::udp::MutableUdpPacket;
+use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
-use std::io::{Seek, SeekFrom};
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
@@ -96,7 +104,6 @@ impl UnixStreamMock {
     }
 
     async fn send_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
         let len = frame.len() as u32;
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(frame).await?;
@@ -104,7 +111,6 @@ impl UnixStreamMock {
     }
 
     async fn recv_frame(&mut self) -> std::io::Result<Vec<u8>> {
-        use tokio::io::AsyncReadExt;
         let mut len_buf = [0u8; 4];
         self.stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
@@ -143,7 +149,6 @@ async fn main() {
     let mut env = startup_stage().await;
 
     // 3. Monitor QEMU output and verification signals in parallel
-    use tokio::io::AsyncBufReadExt;
     let mut qemu_stdout = tokio::io::BufReader::new(env._qemu_child.stdout.take().unwrap()).lines();
     let mut qemu_stderr = tokio::io::BufReader::new(env._qemu_child.stderr.take().unwrap()).lines();
 
@@ -254,8 +259,6 @@ async fn main() {
 }
 
 fn verify_host_image_log_partition(image_path: &std::path::Path) -> Result<(), String> {
-    use std::fs::OpenOptions;
-
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -283,7 +286,6 @@ fn verify_host_image_log_partition(image_path: &std::path::Path) -> Result<(), S
                 return Err("system.log on partition 2 is empty (0 bytes)".to_string());
             }
             let mut log_content = Vec::new();
-            use std::io::Read;
             let mut log_file = entry.to_file();
             log_file
                 .read_to_end(&mut log_content)
@@ -576,7 +578,6 @@ async fn collect_dhcp_discovers(
         };
 
         if let Ok(dhcp_discover) = parse_dhcp_message(&frame) {
-            use dhcproto::v4::MessageType;
             let msg_type = dhcp_discover
                 .opts()
                 .get(dhcproto::v4::OptionCode::MessageType);
@@ -644,7 +645,6 @@ async fn await_dhcp_request(
             Err(_) => continue,
         };
         if let Ok(dhcp_request) = parse_dhcp_message(&frame) {
-            use dhcproto::v4::MessageType;
             let msg_type = dhcp_request
                 .opts()
                 .get(dhcproto::v4::OptionCode::MessageType);
@@ -1138,9 +1138,6 @@ fn parse_dhcp_message(
 }
 
 fn build_dhcp_offer(xid: u32, client_mac: MacAddr) -> Vec<u8> {
-    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
-    use dhcproto::{Encodable, Encoder};
-
     let mut offer = Message::default();
     offer.set_opcode(Opcode::BootReply);
     offer.set_xid(xid);
@@ -1171,9 +1168,6 @@ fn build_dhcp_offer(xid: u32, client_mac: MacAddr) -> Vec<u8> {
 }
 
 fn build_dhcp_ack(xid: u32, client_mac: MacAddr) -> Vec<u8> {
-    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
-    use dhcproto::{Encodable, Encoder};
-
     let mut ack = Message::default();
     ack.set_opcode(Opcode::BootReply);
     ack.set_xid(xid);
@@ -1209,12 +1203,6 @@ fn build_arp_reply(
     sender_ip: Ipv4Addr,
     target_ip: Ipv4Addr,
 ) -> Vec<u8> {
-    use pnet::packet::MutablePacket;
-    use pnet::packet::arp::ArpHardwareTypes;
-    use pnet::packet::arp::MutableArpPacket;
-    use pnet::packet::ethernet::EtherTypes;
-    use pnet::packet::ethernet::MutableEthernetPacket;
-
     let eth_header_len = MutableEthernetPacket::minimum_packet_size();
     let arp_header_len = MutableArpPacket::minimum_packet_size();
     let total_len = eth_header_len + arp_header_len;
@@ -1322,11 +1310,6 @@ fn build_udp_packet(
     dest_port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    use pnet::packet::MutablePacket;
-    use pnet::packet::ethernet::MutableEthernetPacket;
-    use pnet::packet::ipv4::MutableIpv4Packet;
-    use pnet::packet::udp::MutableUdpPacket;
-
     let eth_header_len = MutableEthernetPacket::minimum_packet_size();
     let ip_header_len = MutableIpv4Packet::minimum_packet_size();
     let udp_header_len = MutableUdpPacket::minimum_packet_size();
@@ -1375,11 +1358,6 @@ fn build_icmp_echo_reply(
     identifier: u16,
     sequence: u16,
 ) -> Vec<u8> {
-    use pnet::packet::MutablePacket;
-    use pnet::packet::ethernet::MutableEthernetPacket;
-    use pnet::packet::icmp::echo_reply::MutableEchoReplyPacket;
-    use pnet::packet::ipv4::MutableIpv4Packet;
-
     let eth_header_len = MutableEthernetPacket::minimum_packet_size();
     let ip_header_len = MutableIpv4Packet::minimum_packet_size();
     let icmp_header_len = 8;
@@ -1427,7 +1405,6 @@ fn handle_arp_request_for_ip(
     _client_mac: MacAddr,
     client_ip: Option<Ipv4Addr>,
 ) -> Option<Ipv4Addr> {
-    use pnet::packet::Packet;
     let eth = pnet::packet::ethernet::EthernetPacket::new(frame)?;
     if eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Arp {
         let arp = pnet::packet::arp::ArpPacket::new(eth.payload())?;
@@ -1444,9 +1421,6 @@ fn handle_arp_request_for_ip(
 }
 
 fn build_dhcp_discover_lan(xid: u32, client_mac: MacAddr) -> Vec<u8> {
-    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
-    use dhcproto::{Encodable, Encoder};
-
     let mut disc = Message::default();
     disc.set_opcode(Opcode::BootRequest);
     disc.set_xid(xid);
@@ -1478,9 +1452,6 @@ fn build_dhcp_request_lan(
     requested_ip: Ipv4Addr,
     server_ip: Ipv4Addr,
 ) -> Vec<u8> {
-    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
-    use dhcproto::{Encodable, Encoder};
-
     let mut req = Message::default();
     req.set_opcode(Opcode::BootRequest);
     req.set_xid(xid);
@@ -1803,7 +1774,6 @@ async fn run_mock_lan_client(
 }
 
 fn parse_udp_payload(frame: &[u8]) -> Option<(Ipv4Addr, u16, u16, Vec<u8>)> {
-    use pnet::packet::Packet;
     let eth = pnet::packet::ethernet::EthernetPacket::new(frame)?;
     if eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4 {
         let ip = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())?;

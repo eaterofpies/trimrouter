@@ -1,3 +1,4 @@
+use futures_util::TryStreamExt;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use trimrouter::services::utils::{WanLeaseReceiver, WanLeaseSender};
@@ -72,9 +73,6 @@ pub async fn test_dhcp_renewal(lease_rx: WanLeaseReceiver) -> Result<(), String>
 }
 
 pub async fn has_default_route(iface_index: u32) -> Result<bool, String> {
-    use futures_util::TryStreamExt;
-    use rtnetlink::packet_route::AddressFamily;
-
     let (connection, handle, _) = rtnetlink::new_connection().map_err(|e| e.to_string())?;
     tokio::spawn(connection);
 
@@ -84,10 +82,10 @@ pub async fn has_default_route(iface_index: u32) -> Result<bool, String> {
     while let Ok(Some(route_msg)) = routes.try_next().await {
         if route_msg.header.destination_prefix_length == 0 {
             for attr in route_msg.attributes {
-                if let rtnetlink::packet_route::route::RouteAttribute::Oif(oif) = attr {
-                    if oif == iface_index {
-                        return Ok(true);
-                    }
+                if let rtnetlink::packet_route::route::RouteAttribute::Oif(oif) = attr
+                    && oif == iface_index
+                {
+                    return Ok(true);
                 }
             }
         }
