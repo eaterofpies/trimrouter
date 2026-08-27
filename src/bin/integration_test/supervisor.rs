@@ -66,3 +66,42 @@ pub async fn test_dns_supervisor_recovery(
         ))
     }
 }
+
+pub fn test_seccomp_sandbox_enforcement() -> Result<(), String> {
+    std::println!("[test] Starting Seccomp Sandbox BPF Enforcement test...");
+
+    match unsafe { nix::unistd::fork() } {
+        Ok(nix::unistd::ForkResult::Child) => {
+            if let Err(e) = trimrouter::services::utils::apply_seccomp() {
+                std::eprintln!("[test-seccomp] Failed to apply seccomp in child: {}", e);
+                std::process::exit(1);
+            }
+            // Execute unauthorized syscall (SYS_ptrace)
+            unsafe {
+                libc::syscall(libc::SYS_ptrace, 0, 0, 0, 0);
+            }
+            std::process::exit(2);
+        }
+        Ok(nix::unistd::ForkResult::Parent { child }) => {
+            let status = nix::sys::wait::waitpid(child, None)
+                .map_err(|e| format!("Failed to wait for child: {}", e))?;
+            match status {
+                nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
+                    if sig == nix::sys::signal::Signal::SIGSYS {
+                        std::println!(
+                            "[test] Child was successfully terminated with SIGSYS by kernel seccomp BPF filter."
+                        );
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "Child terminated with unexpected signal: {:?}",
+                            sig
+                        ))
+                    }
+                }
+                _ => Err(format!("Child exited without SIGSYS: {:?}", status)),
+            }
+        }
+        Err(e) => Err(format!("Fork failed: {}", e)),
+    }
+}

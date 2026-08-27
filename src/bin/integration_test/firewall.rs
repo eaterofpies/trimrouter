@@ -42,3 +42,16 @@ pub async fn test_firewall_wan_drop() -> Result<(), String> {
     std::println!("[test] Firewall WAN drop check completed.");
     Ok(())
 }
+
+pub async fn test_conntrack_invalid_drop() -> Result<(), String> {
+    std::println!("[test] Starting Firewall Conntrack Invalid Drop test...");
+
+    // 1. Tell the host runner to trigger invalid conntrack packet injection
+    std::println!("[test-control] TRIGGER_INVALID_CONNTRACK_TRAFFIC");
+
+    // 2. Sleep to allow the host to inject and check for a drop
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    std::println!("[test] Firewall conntrack invalid drop check completed.");
+    Ok(())
+}

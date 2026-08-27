@@ -70,3 +70,67 @@ pub async fn test_dhcp_renewal(lease_rx: WanLeaseReceiver) -> Result<(), String>
     std::println!("[test] DHCP Client renewal verified successfully.");
     Ok(())
 }
+
+pub async fn has_default_route(iface_index: u32) -> Result<bool, String> {
+    use futures_util::TryStreamExt;
+    use rtnetlink::packet_route::AddressFamily;
+
+    let (connection, handle, _) = rtnetlink::new_connection().map_err(|e| e.to_string())?;
+    tokio::spawn(connection);
+
+    let get_msg = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new().build();
+
+    let mut routes = handle.route().get(get_msg).execute();
+    while let Ok(Some(route_msg)) = routes.try_next().await {
+        if route_msg.header.destination_prefix_length == 0 {
+            for attr in route_msg.attributes {
+                if let rtnetlink::packet_route::route::RouteAttribute::Oif(oif) = attr {
+                    if oif == iface_index {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub async fn test_kernel_route_teardown() -> Result<(), String> {
+    std::println!("[test] Starting Kernel Dynamic Route Teardown test...");
+
+    let wan_idx = match trimrouter::network::get_interface_index("wan").await {
+        Some(idx) => idx,
+        None => return Err("Interface wan not found".to_string()),
+    };
+
+    let ip = Ipv4Addr::new(10, 0, 2, 15);
+    let mask = Ipv4Addr::new(255, 255, 255, 0);
+
+    // 1. Verify default route was established by DHCP client or configure it explicitly
+    if !has_default_route(wan_idx).await? {
+        let gw = Some(Ipv4Addr::new(10, 0, 2, 2));
+        trimrouter::services::dhcp_client::manager::configure_wan("wan", ip, mask, gw)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    if !has_default_route(wan_idx).await? {
+        return Err("Default route was not found in kernel routing table".to_string());
+    }
+    std::println!("[test] Verified active 0.0.0.0/0 default route in kernel routing table.");
+
+    // 2. Deconfigure WAN interface
+    trimrouter::services::dhcp_client::manager::deconfigure_wan("wan", ip, mask)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 3. Verify default route has been torn down
+    if has_default_route(wan_idx).await? {
+        return Err(
+            "Default route still exists in kernel routing table after deconfigure_wan".to_string(),
+        );
+    }
+
+    std::println!("[test] Verified default route was cleanly torn down from kernel FIB.");
+    Ok(())
+}

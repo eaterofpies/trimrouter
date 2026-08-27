@@ -227,6 +227,21 @@ async fn main() {
                         failed += 1;
                     }
                 }
+
+                // Run Test 2c: Seccomp BPF Sandbox Violation Test
+                match supervisor::test_seccomp_sandbox_enforcement() {
+                    Ok(_) => {
+                        std::println!("[test-control] TEST_PASSED seccomp_sandbox_enforcement");
+                        passed += 1;
+                    }
+                    Err(e) => {
+                        std::println!(
+                            "[test-control] TEST_FAILED seccomp_sandbox_enforcement {}",
+                            e
+                        );
+                        failed += 1;
+                    }
+                }
             }
             Err(e) => {
                 std::println!("[test-control] TEST_FAILED dns_forwarding {}", e);
@@ -236,6 +251,7 @@ async fn main() {
     } else {
         std::println!("[test] Skipping DNS Forwarding test (DHCP Client binding failed).");
         std::println!("[test] Skipping DNS Supervisor Recovery test (DHCP Client binding failed).");
+        std::println!("[test] Skipping Seccomp Sandbox test (DHCP Client binding failed).");
     }
 
     // Test 3: SNTP Client Time Sync (Only run if DNS forwarding is available)
@@ -284,8 +300,20 @@ async fn main() {
                 failed += 1;
             }
         }
+
+        // Test 5b: Firewall Conntrack Invalid Drop
+        match firewall::test_conntrack_invalid_drop().await {
+            Ok(_) => {
+                std::println!("[test-control] TEST_PASSED conntrack_invalid_drop");
+                passed += 1;
+            }
+            Err(e) => {
+                std::println!("[test-control] TEST_FAILED conntrack_invalid_drop {}", e);
+                failed += 1;
+            }
+        }
     } else {
-        std::println!("[test] Skipping Firewall Drop test (DHCP Client binding failed).");
+        std::println!("[test] Skipping Firewall Drop tests (DHCP Client binding failed).");
     }
 
     // Test 6: DHCP Renewal (Only run if client bound successfully)
@@ -304,13 +332,26 @@ async fn main() {
         std::println!("[test] Skipping DHCP Renewal test (DHCP Client binding failed).");
     }
 
-    // Clean up current running services before overlap test
+    // Clean up current running services before route teardown & overlap tests
     if let Some(mut client) = dhcp_client.take()
         && let Err(e) = client.stop().await
     {
         std::println!("[test-control] TEST_FAILED stop_dhcp_client {}", e);
         failed += 1;
     }
+
+    // Test 6b: Kernel Route Teardown Test
+    match dhcp_client::test_kernel_route_teardown().await {
+        Ok(_) => {
+            std::println!("[test-control] TEST_PASSED kernel_route_teardown");
+            passed += 1;
+        }
+        Err(e) => {
+            std::println!("[test-control] TEST_FAILED kernel_route_teardown {}", e);
+            failed += 1;
+        }
+    }
+
     if let Some(mut forwarder) = dns_forwarder.take()
         && let Err(e) = forwarder.stop().await
     {

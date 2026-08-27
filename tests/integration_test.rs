@@ -173,6 +173,8 @@ async fn main() {
                                 failed += 1;
                             } else if line.contains("[test-control] TRIGGER_UNSOLICITED_WAN_TRAFFIC") {
                                 let _ = env.wan_cmd_tx.send("SEND_UNSOLICITED_WAN".to_string()).await;
+                            } else if line.contains("[test-control] TRIGGER_INVALID_CONNTRACK_TRAFFIC") {
+                                let _ = env.wan_cmd_tx.send("SEND_INVALID_CONNTRACK_WAN".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE") {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_FORWARDED_NAT_TEST") {
@@ -279,6 +281,16 @@ fn verify_host_image_log_partition(image_path: &std::path::Path) -> Result<(), S
             found_system_log = true;
             if entry.len() == 0 {
                 return Err("system.log on partition 2 is empty (0 bytes)".to_string());
+            }
+            let mut log_content = Vec::new();
+            use std::io::Read;
+            let mut log_file = entry.to_file();
+            log_file
+                .read_to_end(&mut log_content)
+                .map_err(|e| e.to_string())?;
+            let log_str = String::from_utf8_lossy(&log_content);
+            if !log_str.contains("[INFO]") {
+                return Err("system.log does not contain expected log formatting".to_string());
             }
             break;
         }
@@ -712,6 +724,84 @@ async fn handle_unsolicited_wan_traffic(
     }
 }
 
+async fn handle_invalid_conntrack_traffic(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    client_mac: MacAddr,
+) {
+    println!(
+        "[isp-test] Sending invalid conntrack packet (mangled TCP SYN+FIN) to router's WAN IP: {}",
+        MOCK_CLIENT_IP
+    );
+    let eth_header_len = 14;
+    let ip_header_len = 20;
+    let tcp_header_len = 20;
+    let mut frame = vec![0u8; eth_header_len + ip_header_len + tcp_header_len];
+
+    // Ethernet
+    frame[0..6].copy_from_slice(&[
+        client_mac.0,
+        client_mac.1,
+        client_mac.2,
+        client_mac.3,
+        client_mac.4,
+        client_mac.5,
+    ]);
+    frame[6..12].copy_from_slice(&[
+        MOCK_SERVER_MAC.0,
+        MOCK_SERVER_MAC.1,
+        MOCK_SERVER_MAC.2,
+        MOCK_SERVER_MAC.3,
+        MOCK_SERVER_MAC.4,
+        MOCK_SERVER_MAC.5,
+    ]);
+    frame[12..14].copy_from_slice(&[0x08, 0x00]); // IPv4
+
+    // IPv4
+    frame[14] = 0x45;
+    frame[16..18].copy_from_slice(&((ip_header_len + tcp_header_len) as u16).to_be_bytes());
+    frame[22] = 64; // TTL
+    frame[23] = libc::IPPROTO_TCP as u8;
+    frame[26..30].copy_from_slice(&MOCK_SERVER_IP.octets());
+    frame[30..34].copy_from_slice(&MOCK_CLIENT_IP.octets());
+
+    // TCP with conflicting flags SYN (0x02) + FIN (0x01) = 0x03 invalid state
+    let tcp_offset = eth_header_len + ip_header_len;
+    frame[tcp_offset..tcp_offset + 2].copy_from_slice(&12345u16.to_be_bytes()); // src port
+    frame[tcp_offset + 2..tcp_offset + 4].copy_from_slice(&80u16.to_be_bytes()); // dst port
+    frame[tcp_offset + 12] = 5 << 4; // Data offset
+    frame[tcp_offset + 13] = 0x03; // SYN + FIN
+
+    let _ = mock.send_frame(&frame).await;
+
+    // Start a 1-second monitoring window to check if any response comes back
+    let monitor_start = std::time::Instant::now();
+    let mut packet_received = false;
+    while monitor_start.elapsed() < Duration::from_secs(1) {
+        if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(50), mock.recv_frame()).await
+            && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&f)
+            && eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4
+            && let Some(ip) = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())
+            && ip.get_source() == MOCK_CLIENT_IP
+            && ip.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Tcp
+        {
+            packet_received = true;
+            break;
+        }
+    }
+
+    if packet_received {
+        println!("[isp-test] ERROR: Router responded to invalid conntrack packet!");
+    } else {
+        println!(
+            "[isp-test] Verified: Firewall ct state invalid successfully dropped invalid TCP packet."
+        );
+        let _ = verification_tx
+            .send("FIREWALL_INVALID_DROP_VERIFIED".to_string())
+            .await;
+    }
+}
+
 struct WanUdpPacket<'a> {
     client_mac: MacAddr,
     src_ip: Ipv4Addr,
@@ -907,6 +997,8 @@ async fn run_mock_wan_isp(
                 if let Some(cmd_str) = cmd {
                     if cmd_str == "SEND_UNSOLICITED_WAN" {
                         handle_unsolicited_wan_traffic(&mut mock, &verification_tx, client_mac).await;
+                    } else if cmd_str == "SEND_INVALID_CONNTRACK_WAN" {
+                        handle_invalid_conntrack_traffic(&mut mock, &verification_tx, client_mac).await;
                     } else if cmd_str == "SIMULATE_DNS_OUTAGE" {
                         println!("[isp-test] Simulating upstream DNS outage.");
                         dns_outage_active = true;
