@@ -90,6 +90,7 @@ pub async fn recv_msg<T: for<'a> Deserialize<'a>, R: AsyncReadExt + Unpin>(
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
 

@@ -90,6 +90,7 @@ pub fn build_raw_packet(
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
     use pnet::packet::Packet;
