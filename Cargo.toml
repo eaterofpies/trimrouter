@@ -22,7 +22,7 @@ dhcproto = "0.15.0"
 rand = "0.10.2"
 ipnet = "2.12.1"
 dns-parser = "0.8.0"
-chrono = { version = "0.4", features = ["clock"] }
+chrono = { version = "0.4.45", features = ["clock"] }
 rsntp = "4.1.2"
 kobject-uevent = "0.2.0"
 netlink-sys = "0.9.0"
@@ -31,14 +31,14 @@ toml = "1.1.4"
 postcard = { version = "1.1.3", features = ["use-std"] }
 caps = "0.5.6"
 privdrop = "0.5.6"
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }
 seccompiler = "0.5.0"
 fatfs = "0.3.6"
-mbrman = "0.6"
-log = { version = "0.4", features = ["serde"] }
+mbrman = "0.6.1"
+log = { version = "0.4.34", features = ["serde"] }
 
 [build-dependencies]
-vergen-gitcl = { version = "9.0", features = ["build"] }
+vergen-gitcl = { version = "10.0.3", features = ["build", "cargo"] }
 
 
 

@@ -78,3 +78,7 @@ This skill provides code style and design standards for writing and modifying Ru
 * **Strict Assertion of Expected Behavior**: Tests must not merely check for the absence of panics or crashes (passive smoke testing). Every test must explicitly assert exact, correct domain behavior and contract compliance.
 * **Tests Must Fail on Incorrect Logic**: Test assertions must be designed such that if the underlying algorithm, business logic, boundary handling, or timing calculations are wrong or suboptimal, the test **will fail immediately**.
 * **Verify Negative & Edge Cases Actively**: Negative tests (such as malformed packets, truncated lengths, off-subnet gateways, or extreme timings) must explicitly verify that bad data is rejected, safely handled, or normalized to the specific expected outcome rather than blindly swallowed.
+
+## 15. Full Version Number Pinning in `Cargo.toml`
+* **Always Pin Full Version Numbers**: All dependencies and build-dependencies in `Cargo.toml` must always specify full three-component semantic version numbers (`major.minor.patch`, e.g., `version = "1.53.1"`, `version = "0.4.34"`, `version = "10.0.3"`).
+* **No Partial Version Strings**: Never use truncated or partial versions such as `"1.53"`, `"0.4"`, or `"10"`. Full version numbers ensure deterministic dependency resolution and transparent auditing across builds.

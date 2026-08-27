@@ -1,9 +1,11 @@
-use vergen_gitcl::{BuildBuilder, Emitter, GitclBuilder};
+use vergen_gitcl::{Build, Emitter, Gitcl};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let gitcl = Gitcl::all_git();
+    let build = Build::all_build();
     Emitter::default()
-        .add_instructions(&GitclBuilder::default().sha(true).build()?)?
-        .add_instructions(&BuildBuilder::default().build_timestamp(true).build()?)?
+        .add_instructions(&gitcl)?
+        .add_instructions(&build)?
         .emit()?;
     Ok(())
 }

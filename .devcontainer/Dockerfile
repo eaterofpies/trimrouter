@@ -32,7 +32,8 @@ RUN apt-get update \
     vim \
     xz-utils
 
-RUN rustup component add clippy rustfmt
+RUN rustup component add clippy rustfmt \
+    && cargo install cargo-edit --locked
 
 
 
