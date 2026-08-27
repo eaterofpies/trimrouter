@@ -166,7 +166,7 @@ fn start_system_services(sys: Arc<RealSystem>, shutdown_flag: Arc<AtomicBool>) -
     let power_sys = sys.clone();
     let power_shutdown = shutdown_flag.clone();
     tokio::spawn(async move {
-        start_power_button_monitor(power_sys, power_shutdown).await;
+        power::start_power_button_monitor(power_sys, power_shutdown).await;
     });
 
     // Spawn system signal monitor
@@ -245,65 +245,4 @@ fn build_managed_interfaces(
     );
 
     vec![wan_iface, lan_iface]
-}
-
-async fn start_power_button_monitor<S: system::PowerOps + 'static>(
-    sys: Arc<S>,
-    shutdown_flag: Arc<AtomicBool>,
-) {
-    debug!("[init] Starting ACPI power button monitor loop...");
-    let mut opened_devices = std::collections::HashSet::new();
-
-    loop {
-        if shutdown_flag.load(Ordering::Relaxed) {
-            break;
-        }
-
-        for i in 0..32 {
-            let path = format!("/dev/input/event{}", i);
-            if !opened_devices.contains(&path)
-                && let Ok(device) = evdev::Device::open(&path)
-            {
-                info!(
-                    "[init] Monitoring power button input device: {} ({})",
-                    path,
-                    device.name().unwrap_or("Unknown")
-                );
-                opened_devices.insert(path);
-                tokio::spawn(monitor_single_power_device(
-                    device,
-                    sys.clone(),
-                    shutdown_flag.clone(),
-                ));
-            }
-        }
-
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-}
-
-async fn monitor_single_power_device<S: system::PowerOps>(
-    device: evdev::Device,
-    sys: Arc<S>,
-    shutdown_flag: Arc<AtomicBool>,
-) {
-    let Ok(mut stream) = device.into_event_stream() else {
-        return;
-    };
-    while let Some(Ok(event)) = stream.next().await {
-        let is_power_key = event.event_type() == evdev::EventType::KEY
-            && (event.code() == evdev::KeyCode::KEY_POWER.code()
-                || event.code() == evdev::KeyCode::KEY_POWER2.code()
-                || event.code() == evdev::KeyCode::KEY_SLEEP.code());
-
-        if is_power_key && event.value() == 1 {
-            info!(
-                "[acpi] Power button pressed (event code: {}). Triggering system shutdown...",
-                event.code()
-            );
-            shutdown_flag.store(true, Ordering::Relaxed);
-            let _ = sys.reboot(nix::sys::reboot::RebootMode::RB_POWER_OFF);
-            break;
-        }
-    }
 }
