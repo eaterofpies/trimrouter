@@ -2,11 +2,15 @@ use crate::cli::WorkerService;
 use crate::services::ipc::{SntpClientToParentMsg, async_unix_stream, recv_msg};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceController, ServiceError};
 use crate::services::utils::{WanLeaseReceiver, create_ipc_fds, terminate_worker};
-use log::{error, info};
+use log::{error, info, warn};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch::Receiver;
+
+const MIN_SANE_EPOCH_SECS: i64 = 1_700_000_000; // ~Nov 2023
+const MAX_SANE_EPOCH_SECS: i64 = 4_102_444_800; // Jan 1, 2100
+const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 pub struct SntpClient {
     lease_rx: WanLeaseReceiver,
@@ -100,12 +104,24 @@ fn spawn_sntp_worker() -> Result<(u32, OwnedReadHalf, OwnedWriteHalf), ServiceEr
 }
 
 fn set_system_clock(seconds: i64, nanoseconds: i64) {
+    if !is_valid_system_time(seconds, nanoseconds) {
+        warn!(
+            "[sntp-client-parent] Rejecting invalid/insane system time: seconds={}, nanoseconds={}",
+            seconds, nanoseconds
+        );
+        return;
+    }
     let timespec = TimeSpec::new(seconds, nanoseconds);
     if let Err(e) = clock_settime(ClockId::CLOCK_REALTIME, timespec) {
         error!("[sntp-client-parent] Failed to set system clock: {}", e);
     } else {
         info!("[sntp-client-parent] Successfully set system clock.");
     }
+}
+
+fn is_valid_system_time(seconds: i64, nanoseconds: i64) -> bool {
+    (MIN_SANE_EPOCH_SECS..=MAX_SANE_EPOCH_SECS).contains(&seconds)
+        && (0..NANOS_PER_SEC).contains(&nanoseconds)
 }
 
 impl Service for SntpClient {
@@ -118,5 +134,38 @@ impl Service for SntpClient {
 
     async fn stop(&mut self) -> Result<(), ServiceError> {
         self.controller.stop().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_system_time_valid_bounds() {
+        // Year 2024 timestamp (~1.72 billion)
+        assert!(is_valid_system_time(1_720_000_000, 0));
+        // Year 2033 timestamp (~2.0 billion)
+        assert!(is_valid_system_time(2_011_000_000, 500_000_000));
+        // Max valid boundary (Jan 1, 2100)
+        assert!(is_valid_system_time(MAX_SANE_EPOCH_SECS, 999_999_999));
+        // Min valid boundary (~Nov 2023)
+        assert!(is_valid_system_time(MIN_SANE_EPOCH_SECS, 0));
+    }
+
+    #[test]
+    fn test_is_valid_system_time_rejects_insane_timestamps() {
+        // Pre-2023 or 1970 timestamp (CVE-2015-5300 time warp / TLS invalidation attack)
+        assert!(!is_valid_system_time(0, 0));
+        assert!(!is_valid_system_time(-100, 0));
+        assert!(!is_valid_system_time(1_000_000_000, 0)); // Year 2001
+
+        // Far future timestamp (beyond year 2100)
+        assert!(!is_valid_system_time(5_000_000_000, 0));
+        assert!(!is_valid_system_time(i64::MAX, 0));
+
+        // Invalid nanoseconds (>= 1_000_000_000 or negative)
+        assert!(!is_valid_system_time(1_720_000_000, 1_000_000_000));
+        assert!(!is_valid_system_time(1_720_000_000, -1));
     }
 }

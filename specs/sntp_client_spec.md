@@ -22,12 +22,13 @@ The SNTP service uses a decoupled, event-driven supervisor pattern:
 
 When executing a synchronization iteration:
 
-*   **DNS Resolution**: Resolves `time.google.com`'s A record manually.
+*   **DNS Resolution**: Resolves `time.google.com`'s A record manually, verifying the resolved address is a valid, routable unicast IPv4 address.
 *   **Protocol Client**: Constructs a UDP connection to the resolved IP address on port `123` (NTP).
 *   **SNTP Packet Exchange**: Uses the `rsntp` library to send an SNTP query and compute the offset and current time.
-*   **Clock Update**:
+*   **Clock Update & Sanity Validation**:
     *   Converts the resulting `rsntp` datetime representation to standard duration format.
-    *   Calls the `nix::time::clock_settime` system call using `ClockId::CLOCK_REALTIME` to set the system clock.
+    *   Validates timestamp sanity: bounds check ensures timestamps are within valid modern epoch bounds (`1_700_000_000` to `4_102_444_800` / Year 2100) and nanoseconds are `< 1_000_000_000`, rejecting bogus pre-1970 (CVE-2015-5300) or overflow dates.
+    *   Calls the `nix::time::clock_settime` system call using `ClockId::CLOCK_REALTIME` in the privileged parent supervisor to set the system clock.
     *   All system time modifications are logged with millisecond resolution.
 
 ---
