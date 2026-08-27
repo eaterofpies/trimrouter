@@ -8,6 +8,11 @@ use rustables::{
     Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, ProtocolFamily, Rule, Table,
 };
 
+/// Netfilter postrouting hook priority for NAT masquerade rules (standard NF_IP_PRI_NAT_SRC).
+const NF_HOOK_PRIORITY_NAT: i32 = 100;
+/// Netfilter input hook priority for local packet filtering (standard NF_IP_PRI_FILTER).
+const NF_HOOK_PRIORITY_FILTER: i32 = 0;
+
 fn pad_interface_name(name: &str) -> [u8; 16] {
     let mut bytes = [0u8; 16];
     let name_bytes = name.as_bytes();
@@ -93,13 +98,13 @@ pub fn configure_firewall(wan_iface: &str, lan_iface: &str) -> Result<(), Router
 
     let nat_chain = Chain::new(&table)
         .with_name("nat_postrouting")
-        .with_hook(Hook::new(HookClass::PostRouting, 100))
+        .with_hook(Hook::new(HookClass::PostRouting, NF_HOOK_PRIORITY_NAT))
         .with_type(ChainType::Nat)
         .with_policy(ChainPolicy::Accept);
 
     let filter_chain = Chain::new(&table)
         .with_name("filter_input")
-        .with_hook(Hook::new(HookClass::In, 0))
+        .with_hook(Hook::new(HookClass::In, NF_HOOK_PRIORITY_FILTER))
         .with_type(ChainType::Filter)
         .with_policy(ChainPolicy::Drop);
 

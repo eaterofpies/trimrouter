@@ -8,7 +8,6 @@ use rtnetlink::packet_route::link::LinkFlags;
 use rtnetlink::{Error as NetlinkError, Handle, LinkUnspec};
 use std::fs;
 use std::net::IpAddr;
-use std::str::FromStr;
 
 pub const WAN_INTERFACE: &str = "wan";
 pub const LAN_INTERFACE: &str = "lan";
@@ -34,7 +33,7 @@ pub async fn configure_network_init() -> Result<(), RouterError> {
 async fn configure_interface(
     handle: &Handle,
     name: &str,
-    ip_cidr: Option<&str>,
+    ip_net: Option<Ipv4Net>,
 ) -> Result<(), RouterError> {
     // Get link index by name
     let mut links = handle.link().get().match_name(name.to_string()).execute();
@@ -49,27 +48,21 @@ async fn configure_interface(
     let message = LinkUnspec::new_with_index(index).up().build();
     handle.link().change(message).execute().await?;
 
-    // If an IP/CIDR is specified, assign it to the link index
-    if let Some(cidr) = ip_cidr {
-        let parts: Vec<&str> = cidr.split('/').collect();
-        let ip_str = parts[0];
-        let prefix = if parts.len() > 1 {
-            parts[1].parse::<u8>()?
-        } else {
-            24
-        };
-        let ip = IpAddr::from_str(ip_str)?;
+    // If an IP/prefix is specified, assign it to the link index
+    if let Some(net) = ip_net {
+        let ip = IpAddr::V4(net.addr());
+        let prefix = net.prefix_len();
 
         // Attempt to assign the address. If it's already assigned (EEXIST), ignore the error.
         match handle.address().add(index, ip, prefix).execute().await {
-            Ok(_) => info!("[network] Successfully assigned {} to {}", cidr, name),
+            Ok(_) => info!("[network] Successfully assigned {} to {}", net, name),
             Err(NetlinkError::NetlinkError(msg)) if msg.code.map(|c| c.get()) == Some(-17) => {
                 // Address already exists (EEXIST), ignore silently
             }
             Err(e) => {
                 warn!(
                     "[network] Address assignment message for {} ({}): {}",
-                    name, cidr, e
+                    name, net, e
                 );
             }
         }

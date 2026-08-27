@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
+/// Default receive buffer size (16 MiB) for the Netlink uevent socket to prevent drops during coldplug storms.
+const UEVENT_RCVBUF_SIZE: usize = 16 * 1024 * 1024;
+
 /// Tracks already-loaded kernel modules in user-space.
 /// While the Linux kernel handles duplicate loads safely by returning `EEXIST` (which we catch and ignore),
 /// caching loaded modules here prevents redundant disk I/O and expensive decompression CPU cycles (e.g. gzip/xz/zstd).
@@ -528,8 +531,7 @@ fn run_uevent_listener() -> Result<(), Box<dyn std::error::Error>> {
     socket.bind(&addr)?;
 
     // Increase socket receive buffer size to 16MB to avoid packet drops during coldplug storms
-    let rcvbuf_size = 16 * 1024 * 1024;
-    let _ = setsockopt(&socket, sockopt::RcvBuf, &rcvbuf_size);
+    let _ = setsockopt(&socket, sockopt::RcvBuf, &UEVENT_RCVBUF_SIZE);
 
     info!("[uevent] Netlink uevent listener started successfully.");
 
