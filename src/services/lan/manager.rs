@@ -197,6 +197,14 @@ async fn shift_lan_subnet(
     info!("[lan-manager] LAN subnet shifted successfully.");
 }
 
+fn is_valid_subnet_prefix(prefix: u8) -> bool {
+    (8..=30).contains(&prefix)
+}
+
+fn is_subnet_overlap(net1: &Ipv4Net, net2: &Ipv4Net) -> bool {
+    net1.contains(&net2.network()) || net2.contains(&net1.network())
+}
+
 /// Checks for IP subnet collisions between the active WAN lease and current LAN subnet.
 ///
 /// If an overlap is detected (e.g., both WAN and LAN are on 192.168.1.0/24), this function
@@ -220,26 +228,49 @@ async fn check_and_resolve(
     let Ok(wan_prefix) = mask_to_prefix_len(wan_mask) else {
         return;
     };
+    if !is_valid_subnet_prefix(wan_prefix) {
+        return;
+    }
     let Ok(wan_net) = Ipv4Net::new(wan_ip, wan_prefix) else {
         return;
     };
     let Ok(lan_net) = current_ip.parse::<Ipv4Net>() else {
         return;
     };
+    let Ok(backup_net) = backup_ip.parse::<Ipv4Net>() else {
+        error!(
+            "[lan-manager] Invalid backup IP configuration: {}",
+            backup_ip
+        );
+        return;
+    };
 
-    if wan_net.contains(&lan_net.network()) || lan_net.contains(&wan_net.network()) {
+    if is_subnet_overlap(&wan_net, &lan_net) {
         warn!(
             "[lan-manager] CONFLICT DETECTED: WAN subnet ({}) overlaps with LAN subnet ({}).",
             wan_net, lan_net
         );
 
-        let new_ip = backup_ip.to_string();
-        if *current_ip == new_ip {
+        if *current_ip == backup_ip {
             // Already on backup subnet, can't shift further
             return;
         }
 
-        shift_lan_subnet(lan_interface, current_ip, new_ip, dhcp_server).await;
+        if is_subnet_overlap(&wan_net, &backup_net) {
+            warn!(
+                "[lan-manager] WARNING: Backup LAN subnet ({}) also conflicts with WAN subnet ({}). Cannot migrate.",
+                backup_net, wan_net
+            );
+            return;
+        }
+
+        shift_lan_subnet(
+            lan_interface,
+            current_ip,
+            backup_ip.to_string(),
+            dhcp_server,
+        )
+        .await;
     }
 }
 
@@ -342,5 +373,133 @@ mod tests {
         .await;
 
         assert_eq!(current_ip, "192.168.1.1/24");
+    }
+
+    #[test]
+    fn test_is_subnet_overlap() {
+        let net1: Ipv4Net = "192.168.1.0/24".parse().unwrap();
+        let net2: Ipv4Net = "192.168.1.0/25".parse().unwrap();
+        let net3: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+
+        // Subnet 1 and Subnet 2 overlap (subset/superset)
+        assert!(is_subnet_overlap(&net1, &net2));
+        assert!(is_subnet_overlap(&net2, &net1));
+
+        // Subnet 1 and Subnet 3 are disjoint
+        assert!(!is_subnet_overlap(&net1, &net3));
+        assert!(!is_subnet_overlap(&net3, &net1));
+    }
+
+    #[test]
+    fn test_is_valid_subnet_prefix() {
+        assert!(is_valid_subnet_prefix(8));
+        assert!(is_valid_subnet_prefix(24));
+        assert!(is_valid_subnet_prefix(30));
+
+        // Degenerate prefixes (default route /0, point-to-point /31, host /32)
+        assert!(!is_valid_subnet_prefix(0));
+        assert!(!is_valid_subnet_prefix(7));
+        assert!(!is_valid_subnet_prefix(31));
+        assert!(!is_valid_subnet_prefix(32));
+    }
+
+    #[tokio::test]
+    async fn test_check_and_resolve_wan_prefix_zero_ignored() {
+        let lease = WanLease {
+            ip: Some(Ipv4Addr::new(192, 168, 1, 50)),
+            mask: Some(Ipv4Addr::new(0, 0, 0, 0)), // /0 default route mask
+            gateway: None,
+            dns_servers: vec![],
+        };
+        let (_tx, lease_rx) = tokio::sync::watch::channel(lease);
+        let mut current_ip = "192.168.1.1/24".to_string();
+        let backup_ip = "10.0.0.1/24";
+        let mut dhcp_server = DhcpServer::new("lan".to_string(), current_ip.clone());
+
+        check_and_resolve(
+            "lan",
+            &mut current_ip,
+            backup_ip,
+            &lease_rx,
+            &mut dhcp_server,
+        )
+        .await;
+
+        assert_eq!(current_ip, "192.168.1.1/24"); // Not shifted
+    }
+
+    #[tokio::test]
+    async fn test_check_and_resolve_wan_prefix_32_ignored() {
+        let lease = WanLease {
+            ip: Some(Ipv4Addr::new(192, 168, 1, 50)),
+            mask: Some(Ipv4Addr::new(255, 255, 255, 255)), // /32 host route
+            gateway: None,
+            dns_servers: vec![],
+        };
+        let (_tx, lease_rx) = tokio::sync::watch::channel(lease);
+        let mut current_ip = "192.168.1.1/24".to_string();
+        let backup_ip = "10.0.0.1/24";
+        let mut dhcp_server = DhcpServer::new("lan".to_string(), current_ip.clone());
+
+        check_and_resolve(
+            "lan",
+            &mut current_ip,
+            backup_ip,
+            &lease_rx,
+            &mut dhcp_server,
+        )
+        .await;
+
+        assert_eq!(current_ip, "192.168.1.1/24"); // Not shifted
+    }
+
+    #[tokio::test]
+    async fn test_check_and_resolve_backup_also_conflicts_does_not_shift() {
+        let lease = WanLease {
+            ip: Some(Ipv4Addr::new(192, 168, 1, 50)),
+            mask: Some(Ipv4Addr::new(255, 255, 255, 0)), // 192.168.1.0/24
+            gateway: None,
+            dns_servers: vec![],
+        };
+        let (_tx, lease_rx) = tokio::sync::watch::channel(lease);
+        let mut current_ip = "192.168.1.1/24".to_string();
+        let backup_ip = "192.168.1.100/24"; // Backup also in 192.168.1.0/24!
+        let mut dhcp_server = DhcpServer::new("lan".to_string(), current_ip.clone());
+
+        check_and_resolve(
+            "lan",
+            &mut current_ip,
+            backup_ip,
+            &lease_rx,
+            &mut dhcp_server,
+        )
+        .await;
+
+        assert_eq!(current_ip, "192.168.1.1/24"); // Refuses to shift to another conflicting IP
+    }
+
+    #[tokio::test]
+    async fn test_check_and_resolve_already_on_backup_no_op() {
+        let lease = WanLease {
+            ip: Some(Ipv4Addr::new(10, 0, 0, 50)),
+            mask: Some(Ipv4Addr::new(255, 255, 255, 0)),
+            gateway: None,
+            dns_servers: vec![],
+        };
+        let (_tx, lease_rx) = tokio::sync::watch::channel(lease);
+        let mut current_ip = "10.0.0.1/24".to_string();
+        let backup_ip = "10.0.0.1/24";
+        let mut dhcp_server = DhcpServer::new("lan".to_string(), current_ip.clone());
+
+        check_and_resolve(
+            "lan",
+            &mut current_ip,
+            backup_ip,
+            &lease_rx,
+            &mut dhcp_server,
+        )
+        .await;
+
+        assert_eq!(current_ip, "10.0.0.1/24");
     }
 }
