@@ -5,6 +5,7 @@ use crate::services::utils::{
     CleanOption, WanLease, WanLeaseSender, mask_to_prefix_len, prefix_len_to_mask,
     setup_worker_sockets, terminate_worker,
 };
+use ipnet::Ipv4Net;
 use log::{error, info, warn};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::io::OwnedFd;
@@ -240,15 +241,104 @@ pub async fn configure_wan(
         .await?;
 
     if let Some(gw) = gateway {
-        let route = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
-            .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
-            .gateway(gw)
-            .output_interface(index)
-            .build();
-        if let Err(e) = handle.route().add(route).execute().await {
-            warn!("[dhcp-client] Failed to add default route: {}", e);
+        if is_valid_gateway(gw, ip, prefix_len) {
+            let route = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+                .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
+                .gateway(gw)
+                .output_interface(index)
+                .build();
+            if let Err(e) = handle.route().add(route).execute().await {
+                warn!("[dhcp-client] Failed to add default route: {}", e);
+            }
+        } else {
+            warn!(
+                "[dhcp-client] Ignoring invalid or off-subnet gateway IP: {}",
+                gw
+            );
         }
     }
 
     Ok(())
+}
+
+fn is_valid_gateway(gw: Ipv4Addr, ip: Ipv4Addr, prefix_len: u8) -> bool {
+    !gw.is_unspecified()
+        && !gw.is_broadcast()
+        && Ipv4Net::new(ip, prefix_len)
+            .map(|net| net.contains(&gw))
+            .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_apply_and_clear_parent_lease_channel_updates() {
+        let (lease_tx, lease_rx) = tokio::sync::watch::channel(WanLease::default());
+        let ip = Ipv4Addr::new(192, 168, 100, 5);
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        let gw = Ipv4Addr::new(192, 168, 100, 1);
+        let dns = vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(1, 0, 0, 1)];
+
+        // Note: wan interface doesn't exist so configure_wan logs error, but lease channel is updated
+        apply_parent_lease(&lease_tx, "nonexistent_wan", ip, mask, gw, dns.clone()).await;
+
+        let current = lease_rx.borrow().clone();
+        assert_eq!(current.ip, Some(ip));
+        assert_eq!(current.mask, Some(mask));
+        assert_eq!(current.gateway, Some(gw));
+        assert_eq!(current.dns_servers, dns);
+
+        clear_parent_lease(&lease_tx, "nonexistent_wan").await;
+        let cleared = lease_rx.borrow().clone();
+        assert_eq!(cleared, WanLease::default());
+    }
+
+    #[tokio::test]
+    async fn test_interface_not_found_errors() {
+        let ip = Ipv4Addr::new(10, 0, 0, 10);
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        let gw = Some(Ipv4Addr::new(10, 0, 0, 1));
+
+        let res_cfg = configure_wan("nonexistent_wan_999", ip, mask, gw).await;
+        assert!(matches!(res_cfg, Err(DhcpError::InterfaceNotFound(_))));
+
+        let res_decfg = deconfigure_wan("nonexistent_wan_999", ip, mask).await;
+        assert!(matches!(res_decfg, Err(DhcpError::InterfaceNotFound(_))));
+    }
+
+    #[test]
+    fn test_is_valid_gateway_validation() {
+        let ip = Ipv4Addr::new(192, 168, 1, 100);
+        let prefix_len = 24;
+
+        // Valid gateway within subnet
+        assert!(is_valid_gateway(
+            Ipv4Addr::new(192, 168, 1, 1),
+            ip,
+            prefix_len
+        ));
+        assert!(is_valid_gateway(
+            Ipv4Addr::new(192, 168, 1, 254),
+            ip,
+            prefix_len
+        ));
+
+        // Off-subnet gateway (rogue or misconfigured DHCP server)
+        assert!(!is_valid_gateway(
+            Ipv4Addr::new(10, 0, 0, 1),
+            ip,
+            prefix_len
+        ));
+        assert!(!is_valid_gateway(
+            Ipv4Addr::new(192, 168, 2, 1),
+            ip,
+            prefix_len
+        ));
+
+        // Unspecified (0.0.0.0) and broadcast (255.255.255.255)
+        assert!(!is_valid_gateway(Ipv4Addr::UNSPECIFIED, ip, prefix_len));
+        assert!(!is_valid_gateway(Ipv4Addr::BROADCAST, ip, prefix_len));
+    }
 }

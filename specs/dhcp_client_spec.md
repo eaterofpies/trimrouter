@@ -88,6 +88,8 @@ The client requests and parses the following standard DHCP options:
 ## 4. Failure Recovery & Robustness
 
 *   **Socket Reinitialization**: If the raw socket encounters persistent read/write errors, the client tears down the socket, waits 5 seconds (`SOCKET_RESTART_DELAY_SECS`), and binds a new socket.
+*   **Off-Subnet Gateway Protection**: Validates that any offered gateway IP is non-zero, non-broadcast, and contained within the leased subnet before configuring netlink default routes.
+*   **RFC 2131 Renewal Scaling**: Retransmission intervals during renewal and rebinding wait half the remaining time down to 60s for standard leases (`(remaining / 2).max(60)`), and scale dynamically for sub-minute leases (`(remaining / 2).max(1)`).
 *   **Unrecoverable Lease Expiry**: To prevent routing blackholes, if the lease expires during rebinding, the client immediately deletes the IP address and the default gateway route from the WAN interface before restarting discovery.
 *   **LAN/WAN Subnet Overlap Handling**: Subnet conflicts and overlaps between WAN and LAN subnets are managed reactively by the dedicated LAN Manager service.
 

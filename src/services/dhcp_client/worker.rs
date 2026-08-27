@@ -587,11 +587,19 @@ fn calculate_renewal_params(
     let in_rebinding = current_elapsed >= t2_secs;
     let (retry_interval, dest_ip) = if in_rebinding {
         let remaining = lease_secs.saturating_sub(current_elapsed);
-        let interval = std::cmp::max(remaining / 2, 60);
+        let interval = if remaining > 60 {
+            (remaining / 2).max(60)
+        } else {
+            (remaining / 2).max(1)
+        };
         (interval, Ipv4Addr::BROADCAST)
     } else {
         let remaining = t2_secs.saturating_sub(current_elapsed);
-        let interval = std::cmp::max(remaining / 2, 60);
+        let interval = if remaining > 60 {
+            (remaining / 2).max(60)
+        } else {
+            (remaining / 2).max(1)
+        };
         (interval, server_ip.unwrap_or(Ipv4Addr::BROADCAST))
     };
     (retry_interval, dest_ip, in_rebinding)
@@ -923,19 +931,23 @@ mod tests {
         let lease_secs = 3600;
         let t2_secs = 3150;
 
-        // T1 renewal phase (unicast to server)
+        // T1 renewal phase (unicast to server): remaining to T2 = 1350s -> 1350 / 2 = 675s
         let (interval, dest_ip, rebinding) =
             calculate_renewal_params(1800, t2_secs, lease_secs, Some(server_ip));
         assert!(!rebinding);
         assert_eq!(dest_ip, server_ip);
-        assert_eq!(interval, (t2_secs - 1800) / 2);
+        assert_eq!(interval, 675);
 
-        // T2 rebinding phase (broadcast)
+        // T2 rebinding phase (broadcast): remaining to expiry = 400s -> 400 / 2 = 200s
         let (interval, dest_ip, rebinding) =
             calculate_renewal_params(3200, t2_secs, lease_secs, Some(server_ip));
         assert!(rebinding);
         assert_eq!(dest_ip, Ipv4Addr::BROADCAST);
-        assert_eq!(interval, (lease_secs - 3200) / 2);
+        assert_eq!(interval, 200);
+
+        // Sub-minute remaining in T1: remaining = 50s -> 50 / 2 = 25s
+        let (interval, _, _) = calculate_renewal_params(3100, t2_secs, lease_secs, Some(server_ip));
+        assert_eq!(interval, 25);
     }
 
     #[test]
@@ -957,5 +969,144 @@ mod tests {
 
         let none_res = handle_ack_result(ParseAckResult::None);
         assert!(none_res.is_none());
+    }
+
+    #[test]
+    fn test_parse_ack_empty_router_option_returns_none_gateway() {
+        let mut msg = Message::default();
+        msg.set_xid(0x1234);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Ack));
+        msg.opts_mut().insert(DhcpOption::Router(vec![]));
+
+        if let ParseAckResult::Ack(ack) = parse_ack_nak(&msg, 0x1234) {
+            assert_eq!(ack.gateway, None);
+        } else {
+            panic!("Expected Ack");
+        }
+    }
+
+    #[test]
+    fn test_parse_ack_multiple_routers_takes_first() {
+        let mut msg = Message::default();
+        msg.set_xid(0x1234);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Ack));
+        let router1 = Ipv4Addr::new(10, 0, 2, 1);
+        let router2 = Ipv4Addr::new(10, 0, 2, 254);
+        msg.opts_mut()
+            .insert(DhcpOption::Router(vec![router1, router2]));
+
+        if let ParseAckResult::Ack(ack) = parse_ack_nak(&msg, 0x1234) {
+            assert_eq!(ack.gateway, Some(router1));
+        } else {
+            panic!("Expected Ack");
+        }
+    }
+
+    #[test]
+    fn test_parse_ack_extreme_lease_times() {
+        // Zero lease time
+        let mut msg_zero = Message::default();
+        msg_zero.set_xid(0x1000);
+        msg_zero
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Ack));
+        msg_zero.opts_mut().insert(DhcpOption::AddressLeaseTime(0));
+
+        if let ParseAckResult::Ack(ack) = parse_ack_nak(&msg_zero, 0x1000) {
+            assert_eq!(ack.lease_secs, 0);
+        } else {
+            panic!("Expected Ack");
+        }
+
+        // Max lease time (u32::MAX)
+        let mut msg_max = Message::default();
+        msg_max.set_xid(0x2000);
+        msg_max
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Ack));
+        msg_max
+            .opts_mut()
+            .insert(DhcpOption::AddressLeaseTime(u32::MAX));
+
+        if let ParseAckResult::Ack(ack) = parse_ack_nak(&msg_max, 0x2000) {
+            assert_eq!(ack.lease_secs, u32::MAX);
+        } else {
+            panic!("Expected Ack");
+        }
+    }
+
+    #[test]
+    fn test_parse_offer_special_yiaddr() {
+        let mut msg_zero = Message::default();
+        msg_zero.set_xid(0x5555);
+        msg_zero
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Offer));
+        msg_zero.set_yiaddr(Ipv4Addr::UNSPECIFIED);
+
+        let res = parse_offer(&msg_zero, 0x5555).unwrap();
+        assert_eq!(res.offered_ip, Ipv4Addr::UNSPECIFIED);
+
+        let mut msg_bcast = Message::default();
+        msg_bcast.set_xid(0x6666);
+        msg_bcast
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Offer));
+        msg_bcast.set_yiaddr(Ipv4Addr::BROADCAST);
+
+        let res_bcast = parse_offer(&msg_bcast, 0x6666).unwrap();
+        assert_eq!(res_bcast.offered_ip, Ipv4Addr::BROADCAST);
+    }
+
+    #[test]
+    fn test_parse_ack_nak_unexpected_message_types_returns_none() {
+        for unexpected_type in [
+            MessageType::Decline,
+            MessageType::Release,
+            MessageType::Inform,
+        ] {
+            let mut msg = Message::default();
+            msg.set_xid(0x7777);
+            msg.opts_mut()
+                .insert(DhcpOption::MessageType(unexpected_type));
+
+            let res = parse_ack_nak(&msg, 0x7777);
+            assert!(matches!(res, ParseAckResult::None));
+        }
+    }
+
+    #[test]
+    fn test_calculate_renewal_params_edge_cases() {
+        // Zero lease time: should not panic, returns minimum 1s interval
+        let (interval, _dest, rebinding) = calculate_renewal_params(0, 0, 0, None);
+        assert!(rebinding);
+        assert_eq!(interval, 1);
+
+        // Very short lease time (e.g. lease=10s, t2=8s, elapsed=2s):
+        // Remaining time to T2 is 6s; interval must scale down to remaining / 2 = 3s (strictly < 6s)
+        let (interval, _dest, rebinding) = calculate_renewal_params(2, 8, 10, None);
+        assert!(!rebinding);
+        assert_eq!(interval, 3);
+        assert!(
+            interval < 6,
+            "Retry interval must be strictly less than remaining time"
+        );
+
+        // In rebinding for short lease (elapsed=9s, lease=10s): remaining=1s -> interval=1s
+        let (interval, dest, rebinding) = calculate_renewal_params(9, 8, 10, None);
+        assert!(rebinding);
+        assert_eq!(dest, Ipv4Addr::BROADCAST);
+        assert_eq!(interval, 1);
+
+        // Max lease time: should handle large bounds without arithmetic overflow
+        let t2_max = (u32::MAX as f64 * 0.875) as u32;
+        let remaining_to_t2 = t2_max - 100;
+        let (interval, dest, rebinding) =
+            calculate_renewal_params(100, t2_max, u32::MAX, Some(MOCK_SERVER_IP));
+        assert!(!rebinding);
+        assert_eq!(dest, MOCK_SERVER_IP);
+        assert_eq!(interval, remaining_to_t2 / 2);
     }
 }

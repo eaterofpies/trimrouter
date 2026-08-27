@@ -73,3 +73,8 @@ This skill provides code style and design standards for writing and modifying Ru
 * **Strict Separation of Structural Reorganisation and Logic Changes**: When reorganising directory layouts, renaming files, moving modules, or co-locating code (e.g., moving managers and workers into unified service folders), limit changes strictly to moving files, updating module paths, adjusting imports, and re-exporting symbols.
 * **No Unrelated Refactors During Moves**: Do NOT modify algorithms, alter function signatures, change error handling behaviors, swap crates, or refactor unrelated logic as part of a reorganization.
 * **One Change at a Time**: Perform architectural and structural reorganizations first in a dedicated, isolated commit. Any bug fixes, optimizations, or code cleanup must be performed in separate, focused follow-up commits.
+
+## 14. Assertive Testing Standards (No Passive Smoke Tests)
+* **Strict Assertion of Expected Behavior**: Tests must not merely check for the absence of panics or crashes (passive smoke testing). Every test must explicitly assert exact, correct domain behavior and contract compliance.
+* **Tests Must Fail on Incorrect Logic**: Test assertions must be designed such that if the underlying algorithm, business logic, boundary handling, or timing calculations are wrong or suboptimal, the test **will fail immediately**.
+* **Verify Negative & Edge Cases Actively**: Negative tests (such as malformed packets, truncated lengths, off-subnet gateways, or extreme timings) must explicitly verify that bad data is rejected, safely handled, or normalized to the specific expected outcome rather than blindly swallowed.

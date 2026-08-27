@@ -733,6 +733,58 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_dhcp_payload_truncated_ip_header() {
+        // Ethernet (14) + truncated IP header (10 bytes instead of 20)
+        let mut frame = vec![0u8; 24];
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4
+        frame[14] = 0x45; // Version 4, IHL 5
+        assert!(parse_dhcp_payload(&frame, 68).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_payload_truncated_udp_header() {
+        // Ethernet (14) + IPv4 (20) + truncated UDP (4 bytes instead of 8)
+        let mut frame = vec![0u8; 38];
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        frame[14] = 0x45;
+        frame[23] = 17; // UDP
+        assert!(parse_dhcp_payload(&frame, 68).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_payload_truncated_dhcp_body() {
+        // Ethernet (14) + IPv4 (20) + UDP (8) + only 10 bytes DHCP payload
+        let mut frame = vec![0u8; 52];
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        frame[14] = 0x45;
+        frame[23] = 17;
+        frame[36] = 0x00;
+        frame[37] = 68; // Dest port 68 (Client port)
+        assert!(parse_dhcp_payload(&frame, 68).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_payload_vlan_tagged_packet() {
+        // 802.1Q VLAN tagged frame (EtherType 0x8100) should return None
+        let mut frame = vec![0u8; 60];
+        frame[12] = 0x81;
+        frame[13] = 0x00;
+        assert!(parse_dhcp_payload(&frame, 68).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_payload_ipv6_packet() {
+        // IPv6 frame (EtherType 0x86DD) should return None
+        let mut frame = vec![0u8; 60];
+        frame[12] = 0x86;
+        frame[13] = 0xDD;
+        assert!(parse_dhcp_payload(&frame, 68).is_none());
+    }
+
+    #[test]
     fn test_parse_dns_response_corrupted_returns_err() {
         let corrupted = [0u8; 5];
         let res = parse_dns_a_record_response(&corrupted, 0x1234, "google.com");
