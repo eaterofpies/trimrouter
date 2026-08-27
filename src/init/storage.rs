@@ -52,6 +52,56 @@ fn reread_partition_table<F: AsFd>(fd: &F) {
     }
 }
 
+pub fn calculate_p2_layout(
+    p1_starting_lba: u32,
+    p1_sectors: u32,
+    disk_sectors: u64,
+) -> Result<(u32, u32), RouterError> {
+    if p1_sectors == 0 {
+        return Err(RouterError::Generic(
+            "Boot partition 1 has zero sectors".to_string(),
+        ));
+    }
+    let start_sector = (p1_starting_lba as u64).saturating_add(p1_sectors as u64);
+    if start_sector >= disk_sectors {
+        return Err(RouterError::Generic(format!(
+            "Disk is too small for log partition (size: {} sectors, required > {} sectors)",
+            disk_sectors, start_sector
+        )));
+    }
+    let p2_sectors = disk_sectors - start_sector;
+    if p2_sectors == 0 {
+        return Err(RouterError::Generic(
+            "Calculated zero sectors for log partition".to_string(),
+        ));
+    }
+    let p2_lba = u32::try_from(start_sector).map_err(|_| {
+        RouterError::Generic("Starting sector exceeds 32-bit MBR LBA limit".to_string())
+    })?;
+    let p2_len = (p2_sectors.min(u32::MAX as u64)) as u32;
+    Ok((p2_lba, p2_len))
+}
+
+pub fn derive_p2_device_name(boot_dev: &str) -> Result<String, RouterError> {
+    let p1_name = Path::new(boot_dev)
+        .file_name()
+        .ok_or_else(|| RouterError::Generic("Invalid boot device path".to_string()))?
+        .to_str()
+        .ok_or_else(|| RouterError::Generic("Non-UTF8 boot device path".to_string()))?;
+
+    if p1_name.ends_with('1') {
+        let mut s = p1_name.to_string();
+        s.pop();
+        s.push('2');
+        Ok(format!("/dev/{}", s))
+    } else {
+        Err(RouterError::Generic(format!(
+            "Boot partition name {} does not end with 1",
+            boot_dev
+        )))
+    }
+}
+
 fn write_mbr_partition_2(parent_disk: &str) -> Result<(), RouterError> {
     let disk_name = Path::new(parent_disk)
         .file_name()
@@ -75,22 +125,15 @@ fn write_mbr_partition_2(parent_disk: &str) -> Result<(), RouterError> {
     let mut mbr = mbrman::MBR::read_from(&mut disk_file, MBR_SECTOR_SIZE as u32)
         .map_err(|e| RouterError::Generic(format!("Failed to read MBR: {:?}", e)))?;
 
-    let start_sector = (mbr[1].starting_lba + mbr[1].sectors) as u64;
-    if disk_sectors <= start_sector {
-        return Err(RouterError::Generic(format!(
-            "Disk is too small for log partition (size: {} sectors, required > {} sectors)",
-            disk_sectors, start_sector
-        )));
-    }
-    let p2_sectors = disk_sectors - start_sector;
+    let (p2_lba, p2_len) = calculate_p2_layout(mbr[1].starting_lba, mbr[1].sectors, disk_sectors)?;
 
     mbr[2] = mbrman::MBRPartitionEntry {
         boot: mbrman::BOOT_INACTIVE,
         first_chs: mbrman::CHS::empty(),
         sys: MBR_PART_TYPE_FAT32_LBA,
         last_chs: mbrman::CHS::empty(),
-        starting_lba: start_sector as u32,
-        sectors: p2_sectors.min(u32::MAX as u64) as u32,
+        starting_lba: p2_lba,
+        sectors: p2_len,
     };
 
     disk_file
@@ -205,26 +248,13 @@ pub fn find_boot_partition() -> Result<(String, String), RouterError> {
 }
 
 pub fn ensure_log_partition_in_mbr(boot_dev: &str, parent_disk: &str) -> Result<(), RouterError> {
-    let p1_name = Path::new(boot_dev)
+    let p2_dev_path = derive_p2_device_name(boot_dev)?;
+    let p2_name = Path::new(&p2_dev_path)
         .file_name()
-        .ok_or_else(|| RouterError::Generic("Invalid boot device path".to_string()))?
-        .to_str()
-        .ok_or_else(|| RouterError::Generic("Non-UTF8 boot device path".to_string()))?;
-
-    let p2_name = if p1_name.ends_with('1') {
-        let mut s = p1_name.to_string();
-        s.pop();
-        s.push('2');
-        s
-    } else {
-        return Err(RouterError::Generic(format!(
-            "Boot partition name {} does not end with 1",
-            boot_dev
-        )));
-    };
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| RouterError::Generic("Invalid partition 2 device name".to_string()))?;
 
     let p2_sys_path = format!("/sys/class/block/{}", p2_name);
-    let p2_dev_path = format!("/dev/{}", p2_name);
 
     if !Path::new(&p2_sys_path).exists() {
         info!("[init] Partition 2 does not exist in MBR. Creating partition entry...");
@@ -293,25 +323,7 @@ pub fn setup_log_partition<S: MountOps>(
     boot_dev: &str,
     _parent_disk: &str,
 ) -> Result<(), RouterError> {
-    let p1_name = Path::new(boot_dev)
-        .file_name()
-        .ok_or_else(|| RouterError::Generic("Invalid boot device path".to_string()))?
-        .to_str()
-        .ok_or_else(|| RouterError::Generic("Non-UTF8 boot device path".to_string()))?;
-
-    let p2_name = if p1_name.ends_with('1') {
-        let mut s = p1_name.to_string();
-        s.pop();
-        s.push('2');
-        s
-    } else {
-        return Err(RouterError::Generic(format!(
-            "Boot partition name {} does not end with 1",
-            boot_dev
-        )));
-    };
-
-    let p2_dev_path = format!("/dev/{}", p2_name);
+    let p2_dev_path = derive_p2_device_name(boot_dev)?;
 
     if let Err(e) = fs::create_dir_all("/var/log") {
         warn!("[init] Warning: failed to create /var/log: {}", e);
@@ -349,4 +361,76 @@ pub fn setup_log_partition<S: MountOps>(
     // Reopen active log file immediately now that /var/log partition is mounted
     crate::logging::get_logger().lock().unwrap().open_log_file();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_p2_layout_valid() {
+        let p1_start = 2048;
+        let p1_sectors = 204800; // 100 MiB
+        let disk_sectors = 2097152; // 1 GiB
+
+        let (p2_start, p2_len) = calculate_p2_layout(p1_start, p1_sectors, disk_sectors).unwrap();
+        assert_eq!(p2_start, 206848);
+        assert_eq!(p2_len, 2097152 - 206848);
+    }
+
+    #[test]
+    fn test_calculate_p2_layout_disk_too_small() {
+        let p1_start = 2048;
+        let p1_sectors = 204800;
+        let disk_sectors = 200000; // Smaller than p1 start + sectors
+
+        let res = calculate_p2_layout(p1_start, p1_sectors, disk_sectors);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Disk is too small"));
+    }
+
+    #[test]
+    fn test_calculate_p2_layout_zero_p1_sectors() {
+        let res = calculate_p2_layout(2048, 0, 1000000);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("zero sectors"));
+    }
+
+    #[test]
+    fn test_calculate_p2_layout_overflow_protection() {
+        let p1_start = u32::MAX - 10;
+        let p1_sectors = 20;
+        let disk_sectors = (u32::MAX as u64) + 100;
+
+        let res = calculate_p2_layout(p1_start, p1_sectors, disk_sectors);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("exceeds 32-bit MBR LBA limit")
+        );
+    }
+
+    #[test]
+    fn test_derive_p2_device_name() {
+        assert_eq!(
+            derive_p2_device_name("/dev/sda1").unwrap(),
+            "/dev/sda2".to_string()
+        );
+        assert_eq!(
+            derive_p2_device_name("/dev/vda1").unwrap(),
+            "/dev/vda2".to_string()
+        );
+        assert_eq!(
+            derive_p2_device_name("/dev/mmcblk0p1").unwrap(),
+            "/dev/mmcblk0p2".to_string()
+        );
+        assert_eq!(
+            derive_p2_device_name("/dev/nvme0n1p1").unwrap(),
+            "/dev/nvme0n1p2".to_string()
+        );
+
+        assert!(derive_p2_device_name("/dev/sda").is_err());
+        assert!(derive_p2_device_name("/dev/sda2").is_err());
+    }
 }
