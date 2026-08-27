@@ -271,7 +271,7 @@ async fn send_dhcp_frame(
     dest_ip: Ipv4Addr,
     payload: &[u8],
 ) {
-    let frame = build_raw_packet(
+    let frame = match build_raw_packet(
         config.server_mac,
         dest_mac,
         config.server_ip,
@@ -279,7 +279,13 @@ async fn send_dhcp_frame(
         dhcproto::v4::SERVER_PORT,
         dhcproto::v4::CLIENT_PORT,
         payload,
-    );
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("[dhcp-server] Failed to build raw packet frame: {}", e);
+            return;
+        }
+    };
     send_raw_packet(async_sock, &frame).await;
 }
 

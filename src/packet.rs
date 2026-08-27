@@ -59,6 +59,10 @@ fn set_ip_checksum(buf: &mut [u8]) -> Option<()> {
 /// To bypass this and communicate with the server before an IP is assigned, we must construct
 /// raw Ethernet, IPv4, and UDP headers in-place and write them directly into a raw packet socket
 /// targeting Layer 2 MAC addresses.
+use crate::error::RouterError;
+
+pub const MAX_RAW_PACKET_PAYLOAD: usize = 65507; // 65535 - 20 (IP header) - 8 (UDP header)
+
 pub fn build_raw_packet(
     src_mac: MacAddr,
     dest_mac: MacAddr,
@@ -67,7 +71,15 @@ pub fn build_raw_packet(
     src_port: u16,
     dest_port: u16,
     payload: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, RouterError> {
+    if payload.len() > MAX_RAW_PACKET_PAYLOAD {
+        return Err(RouterError::Generic(format!(
+            "Payload length {} exceeds maximum raw packet payload capacity {}",
+            payload.len(),
+            MAX_RAW_PACKET_PAYLOAD
+        )));
+    }
+
     let eth_header_len = MutableEthernetPacket::minimum_packet_size();
     let ip_header_len = MutableIpv4Packet::minimum_packet_size();
     let udp_header_len = MutableUdpPacket::minimum_packet_size();
@@ -83,10 +95,14 @@ pub fn build_raw_packet(
         src_port,
         dest_port,
     };
-    write_packet_headers(&mut buf, &endpoints, payload);
-    set_ip_checksum(&mut buf);
+    write_packet_headers(&mut buf, &endpoints, payload).ok_or_else(|| {
+        RouterError::Generic("Failed to serialize raw packet headers".to_string())
+    })?;
+    set_ip_checksum(&mut buf).ok_or_else(|| {
+        RouterError::Generic("Failed to compute IP checksum for raw packet".to_string())
+    })?;
 
-    buf
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -111,7 +127,8 @@ mod tests {
 
         let raw = build_raw_packet(
             src_mac, dest_mac, src_ip, dest_ip, src_port, dest_port, payload,
-        );
+        )
+        .expect("valid raw packet");
 
         let eth = EthernetPacket::new(&raw).expect("valid ethernet frame");
         assert_eq!(eth.get_destination(), dest_mac);
@@ -142,5 +159,31 @@ mod tests {
         assert_eq!(udp.get_destination(), dest_port);
         assert_eq!(udp.get_length() as usize, 8 + payload.len());
         assert_eq!(udp.payload(), payload);
+    }
+
+    #[test]
+    fn test_build_raw_packet_payload_overflow_returns_err() {
+        let src_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let dest_mac = MacAddr::new(0xff, 0xff, 0xff, 0xff, 0xff, 0xff);
+        let src_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let dest_ip = Ipv4Addr::new(192, 168, 1, 2);
+        let huge_payload = vec![0xAA; MAX_RAW_PACKET_PAYLOAD + 1];
+
+        let res = build_raw_packet(src_mac, dest_mac, src_ip, dest_ip, 68, 67, &huge_payload);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_build_raw_packet_empty_payload() {
+        let src_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let dest_mac = MacAddr::new(0xff, 0xff, 0xff, 0xff, 0xff, 0xff);
+        let src_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let dest_ip = Ipv4Addr::new(192, 168, 1, 2);
+        let empty_payload = b"";
+
+        let raw = build_raw_packet(src_mac, dest_mac, src_ip, dest_ip, 68, 67, empty_payload)
+            .expect("valid empty payload packet");
+        assert_eq!(raw.len(), 14 + 20 + 8);
     }
 }

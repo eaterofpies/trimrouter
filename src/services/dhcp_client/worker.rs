@@ -119,7 +119,8 @@ impl DhcpClientSocket {
             dhcproto::v4::CLIENT_PORT,
             dhcproto::v4::SERVER_PORT,
             &payload,
-        );
+        )
+        .map_err(|e| DhcpError::Protocol(e.to_string()))?;
         self.raw_socket.send(&frame).await?;
         Ok(())
     }

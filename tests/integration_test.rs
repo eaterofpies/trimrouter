@@ -827,7 +827,8 @@ async fn process_wan_dhcp_renewal(
             67,
             68,
             &renew_ack,
-        );
+        )
+        .expect("valid ack frame");
         let _ = mock.send_frame(&ack_frame).await;
         let _ = verification_tx
             .send("DHCP_RENEWAL_VERIFIED".to_string())
@@ -858,7 +859,8 @@ async fn run_mock_wan_isp(
         67,
         68,
         &offer_payload,
-    );
+    )
+    .expect("valid offer frame");
     if mock.send_frame(&offer_frame).await.is_err() {
         return false;
     }
@@ -880,7 +882,8 @@ async fn run_mock_wan_isp(
         67,
         68,
         &ack_payload,
-    );
+    )
+    .expect("valid ack frame");
     if mock.send_frame(&ack_frame).await.is_err() {
         return false;
     }
@@ -1426,7 +1429,8 @@ async fn handle_lan_command(
             68,
             67,
             &discover_payload,
-        );
+        )
+        .expect("valid discover pkt");
         if let Err(e) = mock.send_frame(&discover_pkt).await {
             println!("[lan-client] ERROR sending DHCPDISCOVER: {}", e);
         } else {
@@ -1443,7 +1447,8 @@ async fn handle_lan_command(
             23456,
             23456,
             payload,
-        );
+        )
+        .expect("valid nat pkt");
         if let Err(e) = mock.send_frame(&pkt).await {
             println!("[lan-client] ERROR sending NAT Ping: {}", e);
         } else {
@@ -1460,7 +1465,8 @@ async fn handle_lan_command(
             12345, // client port
             53,    // DNS port
             DNS_QUERY,
-        );
+        )
+        .expect("valid dns query pkt");
         if let Err(e) = mock.send_frame(&pkt).await {
             println!("[lan-client] ERROR sending DNS Query 1: {}", e);
         } else {
@@ -1550,7 +1556,8 @@ async fn process_lan_udp_nat(
             23456,
             23457,
             b"FORWARDED_NAT_OK",
-        );
+        )
+        .expect("valid confirm pkt");
         let _ = mock.send_frame(&confirm_pkt).await;
     }
 }
@@ -1592,7 +1599,8 @@ async fn process_lan_udp_dns(
                 12345, // client port
                 53,    // DNS port
                 DNS_QUERY,
-            );
+            )
+            .expect("valid dns req pkt");
             let _ = mock.send_frame(&req_pkt).await;
             println!(
                 "[lan-client] Sent DNS Query 2 (which must be served from cache) to 192.168.1.1:53"
@@ -1609,7 +1617,8 @@ async fn process_lan_udp_dns(
                 23456,
                 23457,
                 b"DNS_CACHE_OK",
-            );
+            )
+            .expect("valid confirm pkt");
             let _ = mock.send_frame(&confirm_pkt).await;
         }
     }
@@ -1644,7 +1653,8 @@ async fn process_lan_dhcp(
                     68,
                     67,
                     &request_payload,
-                );
+                )
+                .expect("valid req pkt");
                 let _ = mock.send_frame(&request_pkt).await;
                 println!("[lan-client] Sent DHCPREQUEST for IP: {}", offered_ip);
             }
