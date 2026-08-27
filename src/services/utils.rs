@@ -598,13 +598,24 @@ pub fn async_udp_socket(fd: OwnedFd) -> Result<tokio::net::UdpSocket, std::io::E
     tokio::net::UdpSocket::from_std(std_sock)
 }
 
+pub const MAX_SUPERVISOR_RESTART_DELAY_SECS: u64 = 60;
+
+pub fn calculate_supervisor_restart_delay(attempt: u32) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+    let shift = attempt.min(6);
+    let secs = (1u64 << shift).min(MAX_SUPERVISOR_RESTART_DELAY_SECS);
+    Duration::from_secs(secs)
+}
+
 pub async fn handle_supervisor_restart_delay(
     service_name: &str,
     attempt: &mut u32,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     if *attempt > 0 {
-        let delay = std::time::Duration::from_secs(std::cmp::min(1 << *attempt, 60));
+        let delay = calculate_supervisor_restart_delay(*attempt);
         warn!(
             "[{}-parent] Worker crashed/exited. Restarting in {:?}",
             service_name, delay
@@ -618,7 +629,7 @@ pub async fn handle_supervisor_restart_delay(
             }
         }
     }
-    *attempt += 1;
+    *attempt = attempt.saturating_add(1);
     true
 }
 
@@ -800,5 +811,52 @@ mod tests {
         let res = parse_dns_a_record_response(&dns_resp, 0x2222, "google.com");
         assert!(res.is_err());
         assert_eq!(res.unwrap_err(), "Transaction ID mismatch");
+    }
+
+    #[test]
+    fn test_calculate_supervisor_restart_delay_exponential_and_overflow_safe() {
+        assert_eq!(calculate_supervisor_restart_delay(0), Duration::ZERO);
+        assert_eq!(
+            calculate_supervisor_restart_delay(1),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            calculate_supervisor_restart_delay(2),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            calculate_supervisor_restart_delay(3),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            calculate_supervisor_restart_delay(4),
+            Duration::from_secs(16)
+        );
+        assert_eq!(
+            calculate_supervisor_restart_delay(5),
+            Duration::from_secs(32)
+        );
+        assert_eq!(
+            calculate_supervisor_restart_delay(6),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_supervisor_restart_delay(10),
+            Duration::from_secs(60)
+        );
+
+        // Overflow safety check: large attempts (>= 32) must NOT panic on bit-shift
+        assert_eq!(
+            calculate_supervisor_restart_delay(32),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_supervisor_restart_delay(64),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_supervisor_restart_delay(u32::MAX),
+            Duration::from_secs(60)
+        );
     }
 }

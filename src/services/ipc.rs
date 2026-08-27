@@ -59,12 +59,24 @@ pub enum SntpClientToParentMsg {
     SetSystemTime { seconds: i64, nanoseconds: i64 },
 }
 
+pub const MAX_IPC_MSG_LEN: usize = 65536; // 64 KB maximum message size
+
 pub async fn send_msg<T: Serialize, W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &T,
 ) -> Result<(), std::io::Error> {
     let serialized = postcard::to_stdvec(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if serialized.len() > MAX_IPC_MSG_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Serialized IPC message length {} exceeds maximum limit of {}",
+                serialized.len(),
+                MAX_IPC_MSG_LEN
+            ),
+        ));
+    }
     let len = serialized.len() as u32;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(&serialized).await?;
@@ -82,6 +94,15 @@ pub async fn recv_msg<T: for<'a> Deserialize<'a>, R: AsyncReadExt + Unpin>(
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > MAX_IPC_MSG_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "IPC message length {} exceeds maximum limit of {}",
+                len, MAX_IPC_MSG_LEN
+            ),
+        ));
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
     let msg = postcard::from_bytes(&buf)
@@ -169,5 +190,42 @@ mod tests {
         let res: Result<Option<DhcpClientToParentMsg>, std::io::Error> = recv_msg(&mut r1).await;
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_recv_oversized_length_rejected() {
+        let (sock1, sock2) = UnixStream::pair().unwrap();
+        let (mut r1, _w1) = sock1.into_split();
+        let (_r2, mut w2) = sock2.into_split();
+
+        // Write a 4-byte length prefix exceeding MAX_IPC_MSG_LEN (e.g. 100,000 bytes)
+        let len: u32 = 100_000;
+        w2.write_all(&len.to_be_bytes()).await.unwrap();
+        w2.flush().await.unwrap();
+
+        let res: Result<Option<DhcpClientToParentMsg>, std::io::Error> = recv_msg(&mut r1).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds maximum limit"));
+    }
+
+    #[tokio::test]
+    async fn test_ipc_send_oversized_payload_rejected() {
+        let (sock1, _sock2) = UnixStream::pair().unwrap();
+        let (_r1, mut w1) = sock1.into_split();
+
+        // Create an oversized message with > 64KB of DNS servers
+        let oversized_servers: Vec<Ipv4Addr> =
+            (0..20_000).map(|i| Ipv4Addr::from(i as u32)).collect();
+        let msg = DnsParentToWorkerMsg::SetUpstreamResolvers {
+            servers: oversized_servers,
+        };
+
+        let res = send_msg(&mut w1, &msg).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds maximum limit"));
     }
 }

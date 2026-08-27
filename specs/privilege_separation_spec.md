@@ -110,7 +110,8 @@ Workers communicate with the Privileged Parent over standard bidirectional **Uni
 Rather than parsing complex and potentially vulnerable JSON strings, IPC relies on a **strongly-typed binary serialization** format:
 1.  **Format**: Messages are serialized using **`postcard`**, a safe, zero-copy, `no_std` compatible binary format.
 2.  **Framing**: Sockets are wrapped in a **length-prefixed framing** layer. Each payload is preceded by a `u32` value in network byte order representing the message length, preventing message fragmentation/coalescing issues.
-3.  **Security Benefit**: Since the parent and child are instances of the same compiled Rust binary, they share the exact same enum memory schemas. Postcard deserialization is linear and does not allocate memory or parse nested string structures, eliminating parser-level vulnerability surfaces in PID 1.
+3.  **Payload Length Cap**: IPC messages are strictly limited to a maximum length of 64 KB (`MAX_IPC_MSG_LEN = 65536`). Incoming length headers exceeding this bound are rejected immediately with `io::ErrorKind::InvalidData` prior to memory allocation, preventing memory exhaustion (OOM) attacks against the privileged supervisor.
+4.  **Security Benefit**: Since the parent and child are instances of the same compiled Rust binary, they share the exact same enum memory schemas. Postcard deserialization is linear and does not allocate memory or parse nested string structures, eliminating parser-level vulnerability surfaces in PID 1.
 
 ### 4.2 Parent-to-Worker Protocol
 The parent routes events to children using the following Rust enum structure:
