@@ -1,0 +1,27 @@
+# Build artifacts & target directories
+target/
+out/
+dist/
+
+# Git metadata & version control (163MB - pass VERGEN_GIT_SHA via build-arg instead)
+.git/
+.gitignore
+
+# Agent skills & development container configs
+.agents/
+.devcontainer/
+.vscode/
+
+# Project documentation & specs (not needed for compilation)
+specs/
+README.md
+TODO.md
+LICENSE-*
+
+# Configuration overrides & local scratch files
+override/
+*.sock
+*.img
+*.img.xz
+*.log
+*.tmp

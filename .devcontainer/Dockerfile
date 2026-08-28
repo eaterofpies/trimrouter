@@ -30,12 +30,12 @@ RUN apt-get update \
     sudo \
     systemd-boot-efi \
     vim \
-    xz-utils
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add clippy rustfmt \
+    && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl arm-unknown-linux-musleabihf \
     && cargo install cargo-edit --locked
-
-
 
 # Create the user
 RUN groupadd --gid $USER_GID $USERNAME \
