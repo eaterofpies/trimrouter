@@ -69,15 +69,16 @@ The FAT32 boot partition stores all files required for kernel boot and system st
 
 | Path in Partition | Source | Description |
 | :--- | :--- | :--- |
-| `/bootcode.bin` | Raspberry Pi bootloader `.deb` | Stage 2 GPU bootloader (loads `start.elf`) |
-| `/start.elf` | Raspberry Pi bootloader `.deb` | GPU firmware blob |
-| `/fixup.dat` | Raspberry Pi bootloader `.deb` | GPU memory split configuration |
-| `/kernel8.img` (arm64) or `/kernel.img` (armhf) | Raspberry Pi kernel `.deb` | Linux kernel image for the target architecture |
-| `/pi_initramfs.cpio.gz` | `target/<arch>/pi_initramfs.cpio.gz` | Compressed initramfs CPIO archive containing the `trimrouter` binary as `/init` and kernel modules |
-| `/config.txt` | Generated at build time | Raspberry Pi GPU firmware configuration: sets kernel file, 64-bit mode, initramfs load address, UART, and audio settings |
+| `/bootcode.bin` | Installed Debian `raspi-firmware` | Stage 2 GPU bootloader (loads `start.elf`) |
+| `/start*.elf` | Installed Debian `raspi-firmware` | GPU firmware blob |
+| `/fixup*.dat` | Installed Debian `raspi-firmware` | GPU memory split configuration |
+| `/vmlinuz` | `target/<arch>/test_boot/vmlinuz` | Linux kernel image for target architecture |
+| `/initramfs.cpio.gz` | `target/<arch>/initramfs.cpio.gz` | Compressed initramfs CPIO archive containing the `trimrouter` binary as `/init` |
+| `/modules.erofs` | `target/<arch>/modules.erofs` | Read-only EROFS compressed image containing the full kernel module tree |
+| `/config.txt` | Generated at build time | Raspberry Pi GPU firmware configuration |
 | `/cmdline.txt` | Generated at build time | Kernel command line: `console=serial0,115200 console=tty1 root=/dev/ram0 rdinit=/init quiet panic=-1 net.ifnames=0` |
-| `/bcm*.dtb` | Raspberry Pi kernel `.deb` | Device Tree Blobs for all supported Pi board variants |
-| `/overlays/` | Raspberry Pi kernel `.deb` | Directory of Device Tree overlay files |
+| `/*.dtb` | Installed Debian `raspi-firmware` | Device Tree Blobs for supported Pi board variants |
+| `/overlays/` | Installed Debian `raspi-firmware` | Directory of Device Tree overlay files |
 | `/config/trimrouter.toml` | `config/trimrouter.toml` (or `TRIMROUTER_CONFIG` override) | Router TOML configuration file |
 
 ---

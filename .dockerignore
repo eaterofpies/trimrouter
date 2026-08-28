@@ -2,6 +2,7 @@
 target/
 out/
 dist/
+.cargo/
 
 # Git metadata & version control (163MB - pass VERGEN_GIT_SHA via build-arg instead)
 .git/

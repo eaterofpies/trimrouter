@@ -7,7 +7,7 @@ set -e
 # Detect target architecture (defaults to x86_64)
 ARCH=${ARCH:-x86_64}
 
-# Ensure the kernel is downloaded and the VM image is compiled
+# Ensure the VM image is compiled
 make target/${ARCH}/trimrouter.img ARCH=${ARCH}
 
 KERNEL="target/${ARCH}/test_boot/vmlinuz"
@@ -46,29 +46,31 @@ if [ "$ARCH" = "x86_64" ]; then
       -nographic
 elif [ "$ARCH" = "arm64" ]; then
     exec qemu-system-aarch64 \
-      -M raspi3b \
+      -M virt \
       -cpu cortex-a53 \
       -m 1024 \
-      -kernel "target/arm64/pi_boot/kernel8.img" \
-      -dtb "target/arm64/pi_boot/bcm2710-rpi-3-b-plus.dtb" \
-      -initrd "target/arm64/pi_initramfs.cpio.gz" \
-      -drive file="$IMAGE",if=sd,format=raw \
-      -device usb-net,netdev=lan0,mac=52:54:00:12:34:57 \
+      -kernel "$KERNEL" \
+      -initrd "$INITRAMFS" \
+      -drive file="$IMAGE",format=raw,media=disk,if=virtio \
+      -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
+      -netdev user,id=wan0 \
+      -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
       -netdev user,id=lan0 \
-      -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0 dwc_otg.lpm_enable=0 dwc_otg.fiq_enable=0 dwc_otg.fiq_fsm_enable=0" \
+      -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0" \
       -nographic
 elif [ "$ARCH" = "armhf" ]; then
-    exec qemu-system-aarch64 \
-      -M raspi3b \
-      -cpu cortex-a53 \
+    exec qemu-system-arm \
+      -M virt \
+      -cpu cortex-a7 \
       -m 1024 \
-      -kernel "target/armhf/pi_boot/kernel.img" \
-      -dtb "target/armhf/pi_boot/bcm2708-rpi-zero-w.dtb" \
-      -initrd "target/armhf/pi_initramfs.cpio.gz" \
-      -drive file="$IMAGE",if=sd,format=raw \
-      -device usb-net,netdev=lan0,mac=52:54:00:12:34:57 \
+      -kernel "$KERNEL" \
+      -initrd "$INITRAMFS" \
+      -drive file="$IMAGE",format=raw,media=disk,if=virtio \
+      -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
+      -netdev user,id=wan0 \
+      -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
       -netdev user,id=lan0 \
-      -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0 dwc_otg.lpm_enable=0 dwc_otg.fiq_enable=0 dwc_otg.fiq_fsm_enable=0" \
+      -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0" \
       -nographic
 else
     echo "[qemu] ERROR: Unsupported architecture: $ARCH"
