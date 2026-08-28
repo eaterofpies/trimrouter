@@ -94,7 +94,7 @@ target/$(RUST_TARGET_$(1))/test-fast/integration_test: Cargo.toml Cargo.lock $(S
 	@echo "[build] Compiling integration_test (Static $(1) Fast Test)..."
 	@RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld" cargo build --profile test-fast --bin integration_test --target $(RUST_TARGET_$(1))
 
-# Rule for downloading and extracting Debian generic kernel for tests
+# Rule for staging and extracting container kernel for tests and disk images
 target/$(1)/test_boot/.kernel_extracted: scripts/extract_kernel.sh
 	@./scripts/extract_kernel.sh $(1)
 
