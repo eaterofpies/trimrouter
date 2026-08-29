@@ -1,2 +1,5 @@
 /target
 /override/
+/.cargo/
+!/.cargo/config.toml
+/dist/

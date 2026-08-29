@@ -424,7 +424,7 @@ pub async fn wait_ipc_eof(reader: &mut tokio::net::unix::OwnedReadHalf) {
     }
 }
 
-const ALLOWED_SYSCALLS: &[i64] = &[
+const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_read,
     libc::SYS_write,
     libc::SYS_close,
@@ -448,17 +448,23 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_accept,
     libc::SYS_getsockname,
     libc::SYS_getpeername,
+    #[cfg(not(target_arch = "aarch64"))]
     libc::SYS_epoll_create,
     libc::SYS_epoll_ctl,
+    #[cfg(not(target_arch = "aarch64"))]
     libc::SYS_epoll_wait,
     libc::SYS_epoll_create1,
+    libc::SYS_epoll_pwait,
     libc::SYS_eventfd2,
     libc::SYS_futex,
     #[cfg(target_arch = "x86_64")]
     libc::SYS_clone,
     #[cfg(target_arch = "x86_64")]
     libc::SYS_clone3,
+    #[cfg(not(target_arch = "arm"))]
     libc::SYS_mmap,
+    #[cfg(target_arch = "arm")]
+    libc::SYS_mmap2,
     libc::SYS_mprotect,
     libc::SYS_munmap,
     libc::SYS_brk,
@@ -488,14 +494,16 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_getrandom,
     libc::SYS_ioctl,
     libc::SYS_uname,
+    #[cfg(not(target_arch = "aarch64"))]
     libc::SYS_pipe,
     libc::SYS_pipe2,
 ];
 
+#[allow(clippy::useless_conversion)]
 pub fn apply_seccomp() -> Result<(), std::io::Error> {
     let mut rules = BTreeMap::new();
     for &syscall in ALLOWED_SYSCALLS {
-        rules.insert(syscall, vec![]);
+        rules.insert(i64::from(syscall), vec![]);
     }
 
     let filter = SeccompFilter::new(

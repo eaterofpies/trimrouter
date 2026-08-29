@@ -138,8 +138,17 @@ fn load_and_apply_config(sys: &RealSystem) -> RouterConfig {
         }
     };
     crate::logging::init_logging(config.logging.max_log_size_mb, config.logging.level);
+    let version = match option_env!("VERGEN_GIT_DESCRIBE") {
+        Some(desc)
+            if desc.starts_with('v') || desc.chars().next().is_some_and(|c| c.is_ascii_digit()) =>
+        {
+            desc.strip_prefix('v').unwrap_or(desc)
+        }
+        _ => env!("CARGO_PKG_VERSION"),
+    };
     info!(
-        "[init] trimrouter starting (git: {}, built: {})",
+        "[init] trimrouter v{} (git: {}, built: {})",
+        version,
         env!("VERGEN_GIT_SHA"),
         env!("VERGEN_BUILD_TIMESTAMP")
     );

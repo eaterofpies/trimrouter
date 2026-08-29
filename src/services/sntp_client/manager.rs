@@ -111,7 +111,7 @@ fn set_system_clock(seconds: i64, nanoseconds: i64) {
         );
         return;
     }
-    let timespec = TimeSpec::new(seconds, nanoseconds);
+    let timespec = TimeSpec::new(seconds as _, nanoseconds as _);
     if let Err(e) = clock_settime(ClockId::CLOCK_REALTIME, timespec) {
         error!("[sntp-client-parent] Failed to set system clock: {}", e);
     } else {
