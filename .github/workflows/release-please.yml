@@ -18,3 +18,26 @@ jobs:
         with:
           release-type: rust
           package-name: trimrouter
+
+      # The steps below only execute when a release was actually published
+      - name: Checkout repository
+        if: ${{ steps.release.outputs.release_created }}
+        uses: actions/checkout@v4
+
+      - name: Build and extract x86_64 image
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg ARCH=x86_64 \
+            --build-arg VERGEN_GIT_SHA="${{ github.sha }}" \
+            --build-arg VERGEN_GIT_DESCRIBE="${{ steps.release.outputs.tag_name }}" \
+            --output type=local,dest=./dist \
+            .
+
+      - name: Upload image to GitHub Release
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.release.outputs.tag_name }}" ./dist/trimrouter-x86_64.img.xz --clobber
