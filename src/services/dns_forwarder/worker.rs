@@ -327,7 +327,12 @@ fn insert_cache(cache_key: Vec<u8>, response: Vec<u8>, cache: &mut HashMap<Vec<u
 }
 
 fn is_valid_upstream_resolver(ip: Ipv4Addr) -> bool {
-    !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_loopback()
+    !ip.is_unspecified()
+        && !ip.is_broadcast()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_link_local()
+        && !ip.is_documentation()
 }
 
 fn get_upstream_resolvers(configured: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
@@ -461,6 +466,9 @@ mod tests {
         assert!(!is_valid_upstream_resolver(Ipv4Addr::BROADCAST));
         assert!(!is_valid_upstream_resolver(Ipv4Addr::new(127, 0, 0, 1)));
         assert!(!is_valid_upstream_resolver(Ipv4Addr::new(127, 0, 0, 53)));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(224, 0, 0, 1))); // Multicast
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(169, 254, 1, 1))); // Link local
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(192, 0, 2, 1))); // Documentation
     }
 
     #[test]

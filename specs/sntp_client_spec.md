@@ -13,7 +13,7 @@ The SNTP service uses a decoupled, event-driven supervisor pattern:
 
 1.  **Dynamic Worker Lifecycle**: The privileged parent supervisor (`SntpClient`) monitors the WAN lease watch channel (`WanLeaseReceiver`). When a valid WAN IP lease is acquired, the supervisor dynamically spawns the sandboxed worker child process. When the WAN lease is cleared or lost, the supervisor automatically stops and terminates the worker, ensuring zero CPU and memory resources are consumed when WAN is inactive.
 2.  **Autonomous Sandboxed Worker**: The child worker has no dependency on interface states or IPC status messages. Once started, it queries NTP and reports the time back to the parent over IPC, retrying with exponential backoff on transient network failures.
-3.  **DNS Dependency**: Resolves the domain `time.google.com` dynamically using the local DNS forwarder before initiating the NTP connection.
+3.  **DNS Dependency**: Resolves the domain `time.google.com` dynamically by querying the parent supervisor over IPC (`SntpClientToParentMsg::ResolveHost`), which resolves through `/etc/resolv.conf` and the embedded DNS forwarder. Transient DNS resolution failure does not terminate the worker; the worker retries in-place with exponential backoff.
 4.  **Shutdown Watch**: The supervisor cleanly stops the worker via `SIGTERM` when the service is stopped.
 
 ---
@@ -22,7 +22,7 @@ The SNTP service uses a decoupled, event-driven supervisor pattern:
 
 When executing a synchronization iteration:
 
-*   **DNS Resolution**: Resolves `time.google.com`'s A record manually, verifying the resolved address is a valid, routable unicast IPv4 address.
+*   **DNS Resolution**: The sandboxed worker requests DNS resolution of `time.google.com` from the parent supervisor over IPC. The supervisor resolves the hostname using `tokio::net::lookup_host` via `/etc/resolv.conf` and returns the validated routable IPv4 address.
 *   **Protocol Client**: Constructs a UDP connection to the resolved IP address on port `123` (NTP).
 *   **SNTP Packet Exchange**: Uses the `rsntp` library to send an SNTP query and compute the offset and current time.
 *   **Clock Update & Sanity Validation**:

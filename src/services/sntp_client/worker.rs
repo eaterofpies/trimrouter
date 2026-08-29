@@ -1,11 +1,10 @@
-use crate::services::ipc::{SntpClientToParentMsg, send_msg};
+use crate::services::ipc::{SntpClientToParentMsg, SntpParentToClientMsg, recv_msg, send_msg};
 use crate::services::utils::{
-    NTP_PORT, SNTP_GID, SNTP_UID, resolve_dns_a_record, run_sandboxed_worker, wait_ipc_eof,
+    NTP_PORT, SNTP_GID, SNTP_UID, is_valid_ntp_server_ip, run_sandboxed_worker, wait_ipc_eof,
 };
 use chrono::{DateTime, Utc};
 use log::{error, info, warn};
 use std::io::Error as IoError;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::OwnedFd;
 use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -13,6 +12,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
 const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(900); // 15 minutes
+const DNS_TIMEOUT: Duration = Duration::from_secs(5); // 5 seconds
 
 pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
     run_sandboxed_worker(
@@ -49,10 +49,7 @@ async fn handle_sntp_iteration(
     ipc_reader: &mut OwnedReadHalf,
     current_retry_delay: &mut Duration,
 ) -> bool {
-    let sync_res = tokio::select! {
-        _ = wait_ipc_eof(ipc_reader) => return false,
-        res = sync_time() => res,
-    };
+    let sync_res = sync_time(ipc_writer, ipc_reader).await;
 
     match sync_res {
         Ok(chrono_dt) => {
@@ -90,10 +87,6 @@ fn datetime_to_time_components(chrono_dt: DateTime<Utc>) -> Option<(i64, i64)> {
     ))
 }
 
-fn is_valid_ntp_server_ip(ip: Ipv4Addr) -> bool {
-    !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_loopback()
-}
-
 async fn send_time_to_parent(ipc_writer: &mut OwnedWriteHalf, chrono_dt: DateTime<Utc>) {
     if let Some((seconds, nanoseconds)) = datetime_to_time_components(chrono_dt) {
         let msg = SntpClientToParentMsg::SetSystemTime {
@@ -113,18 +106,39 @@ async fn sleep_or_shutdown(duration: Duration, ipc_reader: &mut OwnedReadHalf) -
     }
 }
 
-async fn sync_time() -> Result<DateTime<Utc>, String> {
-    // Resolve time.google.com manually via local DNS forwarder
-    let ntp_server_ip = resolve_dns_a_record("time.google.com").await?;
+async fn sync_time(
+    ipc_writer: &mut OwnedWriteHalf,
+    ipc_reader: &mut OwnedReadHalf,
+) -> Result<DateTime<Utc>, String> {
+    // 1. Request DNS resolution for time.google.com from parent over IPC
+    let msg = SntpClientToParentMsg::ResolveHost {
+        host: "time.google.com".to_string(),
+    };
+    send_msg(ipc_writer, &msg)
+        .await
+        .map_err(|e| format!("Failed to send ResolveHost IPC message: {}", e))?;
+
+    // 2. Await HostResolved response from parent with 5s timeout
+    let resolved_msg: Option<SntpParentToClientMsg> =
+        tokio::time::timeout(DNS_TIMEOUT, recv_msg(ipc_reader))
+            .await
+            .map_err(|_| "DNS resolution request timed out awaiting parent response".to_string())?
+            .map_err(|e| format!("Failed to receive HostResolved IPC message: {}", e))?;
+
+    let ntp_server_ip = match resolved_msg {
+        Some(SntpParentToClientMsg::HostResolved { result }) => result?,
+        None => return Err("Parent closed IPC during DNS resolution".to_string()),
+    };
+
     if !is_valid_ntp_server_ip(ntp_server_ip) {
         return Err(format!(
             "Invalid/unroutable NTP server IP: {}",
             ntp_server_ip
         ));
     }
-    let ntp_addr = SocketAddr::new(IpAddr::V4(ntp_server_ip), NTP_PORT);
+    let ntp_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ntp_server_ip), NTP_PORT);
 
-    // Synchronize using standard rsntp client
+    // 3. Synchronize using standard rsntp client
     let client = rsntp::AsyncSntpClient::new();
     let result = client
         .synchronize(ntp_addr)
@@ -194,6 +208,7 @@ mod tests {
 
     #[test]
     fn test_is_valid_ntp_server_ip() {
+        use std::net::Ipv4Addr;
         // Valid routable IP
         assert!(is_valid_ntp_server_ip(Ipv4Addr::new(216, 239, 35, 0))); // time.google.com
         assert!(is_valid_ntp_server_ip(Ipv4Addr::new(8, 8, 8, 8)));
@@ -202,6 +217,28 @@ mod tests {
         assert!(!is_valid_ntp_server_ip(Ipv4Addr::UNSPECIFIED)); // 0.0.0.0
         assert!(!is_valid_ntp_server_ip(Ipv4Addr::BROADCAST)); // 255.255.255.255
         assert!(!is_valid_ntp_server_ip(Ipv4Addr::new(127, 0, 0, 1))); // Loopback
+    }
+
+    #[tokio::test]
+    async fn test_sync_time_dns_failure_returns_err() {
+        let (sock1, sock2) = UnixStream::pair().unwrap();
+        let (mut worker_reader, mut worker_writer) = sock1.into_split();
+        let (mut parent_reader, mut parent_writer) = sock2.into_split();
+
+        tokio::spawn(async move {
+            if let Ok(Some(SntpClientToParentMsg::ResolveHost { .. })) =
+                recv_msg(&mut parent_reader).await
+            {
+                let response = SntpParentToClientMsg::HostResolved {
+                    result: Err("DNS query timed out".to_string()),
+                };
+                let _ = send_msg(&mut parent_writer, &response).await;
+            }
+        });
+
+        let res = sync_time(&mut worker_writer, &mut worker_reader).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("DNS query timed out"));
     }
 
     #[test]

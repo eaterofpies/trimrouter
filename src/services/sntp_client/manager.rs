@@ -1,16 +1,23 @@
 use crate::cli::WorkerService;
-use crate::services::ipc::{SntpClientToParentMsg, async_unix_stream, recv_msg};
+use crate::services::ipc::{
+    SntpClientToParentMsg, SntpParentToClientMsg, async_unix_stream, recv_msg, send_msg,
+};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceController, ServiceError};
-use crate::services::utils::{WanLeaseReceiver, create_ipc_fds, terminate_worker};
+use crate::services::utils::{
+    NTP_PORT, WanLeaseReceiver, create_ipc_fds, is_valid_ntp_server_ip, terminate_worker,
+};
 use log::{error, info, warn};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch::Receiver;
 
 const MIN_SANE_EPOCH_SECS: i64 = 1_700_000_000; // ~Nov 2023
 const MAX_SANE_EPOCH_SECS: i64 = 4_102_444_800; // Jan 1, 2100
 const NANOS_PER_SEC: i64 = 1_000_000_000;
+const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub struct SntpClient {
     lease_rx: WanLeaseReceiver,
@@ -24,6 +31,21 @@ impl SntpClient {
             controller: ServiceController::new(),
         }
     }
+}
+
+async fn resolve_host(host: &str) -> Result<Ipv4Addr, String> {
+    let addrs = tokio::net::lookup_host((host, NTP_PORT))
+        .await
+        .map_err(|e| format!("Failed to resolve {}: {}", host, e))?;
+
+    for addr in addrs {
+        if let IpAddr::V4(ip) = addr.ip()
+            && is_valid_ntp_server_ip(ip)
+        {
+            return Ok(ip);
+        }
+    }
+    Err(format!("No valid IPv4 address resolved for {}", host))
 }
 
 async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: Receiver<bool>) {
@@ -54,7 +76,7 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
                 }
             }
 
-            // Branch B: Process IPC time updates from child (only active when child is running)
+            // Branch B: Process IPC messages from child
             msg = async {
                 match active_child.as_mut() {
                     Some((_, reader, _)) => recv_msg::<SntpClientToParentMsg, _>(reader).await,
@@ -64,6 +86,25 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
                 match msg {
                     Ok(Some(SntpClientToParentMsg::SetSystemTime { seconds, nanoseconds })) => {
                         set_system_clock(seconds, nanoseconds);
+                    }
+                    Ok(Some(SntpClientToParentMsg::ResolveHost { host })) => {
+                        if let Some((_, _, writer)) = active_child.as_mut() {
+                            let result = match tokio::time::timeout(
+                                DNS_RESOLUTION_TIMEOUT,
+                                resolve_host(&host),
+                            )
+                            .await
+                            {
+                                Ok(res) => res,
+                                Err(_) => {
+                                    Err(format!("DNS resolution timed out for {}", host))
+                                }
+                            };
+                            let response = SntpParentToClientMsg::HostResolved { result };
+                            if let Err(e) = send_msg(writer, &response).await {
+                                error!("[sntp-client-parent] Failed to send HostResolved IPC msg: {}", e);
+                            }
+                        }
                     }
                     _ => {
                         if let Some((pid, _, _)) = active_child.take() {

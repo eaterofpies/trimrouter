@@ -131,7 +131,9 @@ pub fn setup_resolv_conf_at_path(path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, RESOLV_CONF_CONTENT)
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, RESOLV_CONF_CONTENT)?;
+    fs::rename(&tmp_path, path)
 }
 
 pub fn setup_resolv_conf<S: ProcessOps>(sys: &S) -> Result<(), std::io::Error> {

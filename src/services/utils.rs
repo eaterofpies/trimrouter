@@ -21,8 +21,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::net::UdpSocket;
-use tokio::time::timeout;
 
 pub const CHROOT_JAIL_PATH: &str = "/run/empty";
 pub const NOBODY_UID: u32 = 65534;
@@ -344,75 +342,13 @@ pub fn get_timestamp_prefix() -> String {
     now.format("[%Y-%m-%dT%H:%M:%S%.3fZ] ").to_string()
 }
 
-const LOCALHOST: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-const LOCAL_DNS_BIND: &str = "127.0.0.1:0";
-
-fn find_first_a_record(answers: Vec<dns_parser::ResourceRecord<'_>>) -> Option<std::net::Ipv4Addr> {
-    for answer in answers {
-        if let dns_parser::RData::A(ip) = answer.data {
-            return Some(ip.0);
-        }
-    }
-    None
-}
-
-pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, String> {
-    let socket = UdpSocket::bind(LOCAL_DNS_BIND)
-        .await
-        .map_err(|e| format!("Failed to bind DNS query socket: {}", e))?;
-
-    // Generate unique randomized transaction ID
-    let query_id = rand::random::<u16>();
-
-    // Build DNS standard query for the host (A record)
-    let mut builder = dns_parser::Builder::new_query(query_id, true);
-    builder.add_question(
-        host,
-        false,
-        dns_parser::QueryType::A,
-        dns_parser::QueryClass::IN,
-    );
-    let query = builder
-        .build()
-        .map_err(|_| "Failed to build DNS query packet".to_string())?;
-
-    let dns_server = std::net::SocketAddr::new(std::net::IpAddr::V4(LOCALHOST), DNS_PORT);
-
-    socket
-        .send_to(&query, dns_server)
-        .await
-        .map_err(|e| format!("Failed to send DNS query: {}", e))?;
-
-    let mut buf = [0u8; 512];
-    let recv_res = timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await;
-    let (len, _) = match recv_res {
-        Ok(Ok((l, addr))) => {
-            if addr == dns_server {
-                (l, addr)
-            } else {
-                return Err("Received packet from unexpected source".to_string());
-            }
-        }
-        Ok(Err(e)) => return Err(format!("Socket receive error: {}", e)),
-        Err(_) => return Err("DNS query timed out".to_string()),
-    };
-
-    parse_dns_a_record_response(&buf[..len], query_id, host)
-}
-
-pub fn parse_dns_a_record_response(
-    buf: &[u8],
-    query_id: u16,
-    host: &str,
-) -> Result<Ipv4Addr, String> {
-    let packet = dns_parser::Packet::parse(buf)
-        .map_err(|e| format!("Failed to parse DNS response: {}", e))?;
-
-    if packet.header.id != query_id {
-        return Err("Transaction ID mismatch".to_string());
-    }
-
-    find_first_a_record(packet.answers).ok_or_else(|| format!("No A record resolved for {}", host))
+pub fn is_valid_ntp_server_ip(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_broadcast()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_link_local()
+        && !ip.is_documentation()
 }
 
 pub async fn wait_ipc_eof(reader: &mut tokio::net::unix::OwnedReadHalf) {
@@ -801,24 +737,6 @@ mod tests {
         frame[12] = 0x86;
         frame[13] = 0xDD;
         assert!(parse_dhcp_payload(&frame, 68).is_none());
-    }
-
-    #[test]
-    fn test_parse_dns_response_corrupted_returns_err() {
-        let corrupted = [0u8; 5];
-        let res = parse_dns_a_record_response(&corrupted, 0x1234, "google.com");
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn test_parse_dns_response_xid_mismatch_returns_err() {
-        let mut dns_resp = vec![0u8; 12];
-        dns_resp[0] = 0x11;
-        dns_resp[1] = 0x11; // ID = 0x1111
-
-        let res = parse_dns_a_record_response(&dns_resp, 0x2222, "google.com");
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), "Transaction ID mismatch");
     }
 
     #[test]
