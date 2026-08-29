@@ -1,6 +1,5 @@
 # TODO List
 
-- Set up `/etc/resolv.conf` in the guest so we can make standard DNS library calls for local requests
 - Maybe switch upstream DNS queries to use a proper DNS client library instead of manual UDP packet forwarding
 - Support TCP, DNSSEC, etc. in the DNS forwarder
 - Add some basic observability and metrics

@@ -43,6 +43,7 @@ Crucially, **no other files** will be present on the target filesystem other tha
 5. **Kernel Module Autoloading**: Probes required modules at startup via a built-in `modprobe` emulator. Listens for `NETLINK_KOBJECT_UEVENT` broadcasts and loads modules matching received `modalias` strings by resolving `modules.dep` with cycle detection and recursion depth caps (`MAX_DEP_RECURSION_DEPTH = 64`), non-recursive polynomial wildcard matching (eliminating ReDoS / stack exhaustion), and path traversal sanitization. The binary also acts as a drop-in `modprobe` replacement when invoked as `argv[0] == "modprobe"`.
 6. **Panic Handling**: Registers a custom panic hook via `std::panic::set_hook`. On panic, logs the traceback to stdout and hangs indefinitely (to avoid an unclean kernel panic) rather than exiting.
 7. **ACPI Power Button**: Monitors `/dev/input/event0`–`event31` via the `evdev` crate with a dynamic background discovery loop for `KEY_POWER`, `KEY_POWER2`, or `KEY_SLEEP` key-down events to trigger a clean shutdown, since no `acpid` or `systemd-logind` is present.
+8. **Local DNS Resolver Configuration**: Writes `/etc/resolv.conf` configured with `nameserver 127.0.0.1` so that standard library DNS lookups from PID 1 and local utilities resolve transparently through the embedded DNS forwarder. Failure to write `/etc/resolv.conf` is treated as a fatal initialization error (panic).
 
 ### 2.2 Routing, Address & NAT Configuration
 

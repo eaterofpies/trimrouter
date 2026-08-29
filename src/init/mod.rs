@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use storage::{
     ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
 };
-use system::{ProcessOps, RealSystem, mount_virtual_filesystems, register_panic_handler};
+use system::{
+    ProcessOps, RealSystem, mount_virtual_filesystems, register_panic_handler, setup_resolv_conf,
+};
 use tokio::task::JoinHandle;
 
 pub async fn run_as_init(sys: Arc<RealSystem>) {
@@ -103,6 +105,9 @@ fn mount_storage_and_modules(sys: &RealSystem) {
 
     if let Err(e) = mount_virtual_filesystems(sys) {
         panic!("FATAL: Failed to mount virtual filesystems: {}", e);
+    }
+    if let Err(e) = setup_resolv_conf(sys) {
+        panic!("FATAL: Failed to setup /etc/resolv.conf: {}", e);
     }
     kmod::trigger_uevents();
     kmod::load_required_modules();
