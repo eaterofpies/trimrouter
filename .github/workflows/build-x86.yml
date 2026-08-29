@@ -23,6 +23,7 @@ jobs:
             --platform linux/amd64 \
             --build-arg ARCH=x86_64 \
             --build-arg VERGEN_GIT_SHA="${{ github.sha }}" \
+            --build-arg VERGEN_GIT_DESCRIBE="${{ github.ref_name }}" \
             --output type=local,dest=./dist \
             .
 
