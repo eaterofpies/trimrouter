@@ -7,4 +7,3 @@
 - Add service stopping notifications
 - Panic doesn't stop routing / other services. Should it?
 - Remove compressed module loading support if the kernel can do it
-- Revisit Seccomp-BPF filters to establish per-service fine-grained allowed syscall lists
