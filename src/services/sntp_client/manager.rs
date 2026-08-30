@@ -74,6 +74,12 @@ async fn handle_sntp_ipc_msg(
                         DEFAULT_NTP_SERVER
                     )),
                 };
+                if let Err(err_msg) = &result {
+                    error!(
+                        "[sntp-client-parent] Failed to resolve time server {}: {}",
+                        DEFAULT_NTP_SERVER, err_msg
+                    );
+                }
                 let response = SntpParentToClientMsg::TimeServerResolved { result };
                 if let Err(e) = send_msg(writer, &response).await {
                     error!(
