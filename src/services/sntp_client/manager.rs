@@ -46,7 +46,20 @@ async fn resolve_host(host: &str) -> Result<Ipv4Addr, String> {
             return Ok(ip);
         }
     }
-    Err(format!("No valid IPv4 address resolved for {}", host))
+    Err(format!(
+        "No valid routable IPv4 address resolved for {}",
+        host
+    ))
+}
+
+async fn resolve_time_server_ip() -> Result<Ipv4Addr, String> {
+    match tokio::time::timeout(DNS_RESOLUTION_TIMEOUT, resolve_host(DEFAULT_NTP_SERVER)).await {
+        Ok(res) => res,
+        Err(_) => Err(format!(
+            "DNS resolution timed out for {}",
+            DEFAULT_NTP_SERVER
+        )),
+    }
 }
 
 async fn handle_sntp_ipc_msg(
@@ -62,18 +75,7 @@ async fn handle_sntp_ipc_msg(
         }
         Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) => {
             if let Some((_, _, writer)) = active_child.as_mut() {
-                let result = match tokio::time::timeout(
-                    DNS_RESOLUTION_TIMEOUT,
-                    resolve_host(DEFAULT_NTP_SERVER),
-                )
-                .await
-                {
-                    Ok(res) => res,
-                    Err(_) => Err(format!(
-                        "DNS resolution timed out for {}",
-                        DEFAULT_NTP_SERVER
-                    )),
-                };
+                let result = resolve_time_server_ip().await;
                 if let Err(err_msg) = &result {
                     error!(
                         "[sntp-client-parent] Failed to resolve time server {}: {}",
@@ -232,5 +234,12 @@ mod tests {
         // Invalid nanoseconds (>= 1_000_000_000 or negative)
         assert!(!is_valid_system_time(1_720_000_000, 1_000_000_000));
         assert!(!is_valid_system_time(1_720_000_000, -1));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_invalid_domain_returns_err() {
+        let res = resolve_host("invalid.nonexistent.domain.example.invalid").await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Failed to resolve"));
     }
 }
