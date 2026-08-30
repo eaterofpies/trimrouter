@@ -152,11 +152,22 @@ pub enum DhcpClientToParentMsg {
 
 /// Messages that only the SNTP Client worker is permitted to send
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub enum SntpToParentMsg {
+pub enum SntpClientToParentMsg {
     /// Sent to update the system time
     SetSystemTime {
         seconds: i64,
-        nanoseconds: u32,
+        nanoseconds: i64,
+    },
+    /// Request resolution of the configured time server IP from the supervisor
+    ResolveTimeServer,
+}
+
+/// Messages sent from the parent supervisor to the SNTP Client worker
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum SntpParentToClientMsg {
+    /// Response with the resolved time server IP
+    TimeServerResolved {
+        result: Result<Ipv4Addr, String>,
     },
 }
 

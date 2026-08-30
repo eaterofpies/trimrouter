@@ -18,6 +18,7 @@ const MIN_SANE_EPOCH_SECS: i64 = 1_700_000_000; // ~Nov 2023
 const MAX_SANE_EPOCH_SECS: i64 = 4_102_444_800; // Jan 1, 2100
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(4);
+const DEFAULT_NTP_SERVER: &str = "time.google.com";
 
 pub struct SntpClient {
     lease_rx: WanLeaseReceiver,
@@ -87,22 +88,22 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
                     Ok(Some(SntpClientToParentMsg::SetSystemTime { seconds, nanoseconds })) => {
                         set_system_clock(seconds, nanoseconds);
                     }
-                    Ok(Some(SntpClientToParentMsg::ResolveHost { host })) => {
+                    Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) => {
                         if let Some((_, _, writer)) = active_child.as_mut() {
                             let result = match tokio::time::timeout(
                                 DNS_RESOLUTION_TIMEOUT,
-                                resolve_host(&host),
+                                resolve_host(DEFAULT_NTP_SERVER),
                             )
                             .await
                             {
                                 Ok(res) => res,
                                 Err(_) => {
-                                    Err(format!("DNS resolution timed out for {}", host))
+                                    Err(format!("DNS resolution timed out for {}", DEFAULT_NTP_SERVER))
                                 }
                             };
-                            let response = SntpParentToClientMsg::HostResolved { result };
+                            let response = SntpParentToClientMsg::TimeServerResolved { result };
                             if let Err(e) = send_msg(writer, &response).await {
-                                error!("[sntp-client-parent] Failed to send HostResolved IPC msg: {}", e);
+                                error!("[sntp-client-parent] Failed to send TimeServerResolved IPC msg: {}", e);
                             }
                         }
                     }

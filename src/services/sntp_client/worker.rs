@@ -110,23 +110,21 @@ async fn sync_time(
     ipc_writer: &mut OwnedWriteHalf,
     ipc_reader: &mut OwnedReadHalf,
 ) -> Result<DateTime<Utc>, String> {
-    // 1. Request DNS resolution for time.google.com from parent over IPC
-    let msg = SntpClientToParentMsg::ResolveHost {
-        host: "time.google.com".to_string(),
-    };
+    // 1. Request DNS resolution for time server from parent supervisor over IPC
+    let msg = SntpClientToParentMsg::ResolveTimeServer;
     send_msg(ipc_writer, &msg)
         .await
-        .map_err(|e| format!("Failed to send ResolveHost IPC message: {}", e))?;
+        .map_err(|e| format!("Failed to send ResolveTimeServer IPC message: {}", e))?;
 
-    // 2. Await HostResolved response from parent with 5s timeout
+    // 2. Await TimeServerResolved response from parent with 5s timeout
     let resolved_msg: Option<SntpParentToClientMsg> =
         tokio::time::timeout(DNS_TIMEOUT, recv_msg(ipc_reader))
             .await
             .map_err(|_| "DNS resolution request timed out awaiting parent response".to_string())?
-            .map_err(|e| format!("Failed to receive HostResolved IPC message: {}", e))?;
+            .map_err(|e| format!("Failed to receive TimeServerResolved IPC message: {}", e))?;
 
     let ntp_server_ip = match resolved_msg {
-        Some(SntpParentToClientMsg::HostResolved { result }) => result?,
+        Some(SntpParentToClientMsg::TimeServerResolved { result }) => result?,
         None => return Err("Parent closed IPC during DNS resolution".to_string()),
     };
 
@@ -226,10 +224,10 @@ mod tests {
         let (mut parent_reader, mut parent_writer) = sock2.into_split();
 
         tokio::spawn(async move {
-            if let Ok(Some(SntpClientToParentMsg::ResolveHost { .. })) =
+            if let Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) =
                 recv_msg(&mut parent_reader).await
             {
-                let response = SntpParentToClientMsg::HostResolved {
+                let response = SntpParentToClientMsg::TimeServerResolved {
                     result: Err("DNS query timed out".to_string()),
                 };
                 let _ = send_msg(&mut parent_writer, &response).await;

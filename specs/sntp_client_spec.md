@@ -22,7 +22,7 @@ The SNTP service uses a decoupled, event-driven supervisor pattern:
 
 When executing a synchronization iteration:
 
-*   **DNS Resolution**: The sandboxed worker requests DNS resolution of `time.google.com` from the parent supervisor over IPC. The supervisor resolves the hostname using `tokio::net::lookup_host` via `/etc/resolv.conf` and returns the validated routable IPv4 address.
+*   **DNS Resolution Delegation**: Because worker sandboxing isolates the child process, the SNTP worker sends a parameterless `ResolveTimeServer` IPC message to the privileged parent supervisor. The parent resolves the configured NTP host (`time.google.com`) using `/etc/resolv.conf` (pointing to the local DNS forwarder on `127.0.0.1:53`), validates the resolved IP address, and replies with a `TimeServerResolved` IPC message.
 *   **Protocol Client**: Constructs a UDP connection to the resolved IP address on port `123` (NTP).
 *   **SNTP Packet Exchange**: Uses the `rsntp` library to send an SNTP query and compute the offset and current time.
 *   **Clock Update & Sanity Validation**:
