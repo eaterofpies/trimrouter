@@ -4,5 +4,4 @@
 - Support TCP, DNSSEC, etc. in the DNS forwarder
 - Add some basic observability and metrics
 - Deduplicate dependencies
-- Add service stopping notifications
 - Panic doesn't stop routing / other services. Should it?
