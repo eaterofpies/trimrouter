@@ -49,6 +49,48 @@ async fn resolve_host(host: &str) -> Result<Ipv4Addr, String> {
     Err(format!("No valid IPv4 address resolved for {}", host))
 }
 
+async fn handle_sntp_ipc_msg(
+    msg: Result<Option<SntpClientToParentMsg>, std::io::Error>,
+    active_child: &mut Option<(u32, OwnedReadHalf, OwnedWriteHalf)>,
+) {
+    match msg {
+        Ok(Some(SntpClientToParentMsg::SetSystemTime {
+            seconds,
+            nanoseconds,
+        })) => {
+            set_system_clock(seconds, nanoseconds);
+        }
+        Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) => {
+            if let Some((_, _, writer)) = active_child.as_mut() {
+                let result = match tokio::time::timeout(
+                    DNS_RESOLUTION_TIMEOUT,
+                    resolve_host(DEFAULT_NTP_SERVER),
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_) => Err(format!(
+                        "DNS resolution timed out for {}",
+                        DEFAULT_NTP_SERVER
+                    )),
+                };
+                let response = SntpParentToClientMsg::TimeServerResolved { result };
+                if let Err(e) = send_msg(writer, &response).await {
+                    error!(
+                        "[sntp-client-parent] Failed to send TimeServerResolved IPC msg: {}",
+                        e
+                    );
+                }
+            }
+        }
+        _ => {
+            if let Some((pid, _, _)) = active_child.take() {
+                terminate_worker(pid).await;
+            }
+        }
+    }
+}
+
 async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: Receiver<bool>) {
     let mut active_child: Option<(u32, OwnedReadHalf, OwnedWriteHalf)> = None;
 
@@ -84,35 +126,7 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
                     None => std::future::pending().await,
                 }
             } => {
-                match msg {
-                    Ok(Some(SntpClientToParentMsg::SetSystemTime { seconds, nanoseconds })) => {
-                        set_system_clock(seconds, nanoseconds);
-                    }
-                    Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) => {
-                        if let Some((_, _, writer)) = active_child.as_mut() {
-                            let result = match tokio::time::timeout(
-                                DNS_RESOLUTION_TIMEOUT,
-                                resolve_host(DEFAULT_NTP_SERVER),
-                            )
-                            .await
-                            {
-                                Ok(res) => res,
-                                Err(_) => {
-                                    Err(format!("DNS resolution timed out for {}", DEFAULT_NTP_SERVER))
-                                }
-                            };
-                            let response = SntpParentToClientMsg::TimeServerResolved { result };
-                            if let Err(e) = send_msg(writer, &response).await {
-                                error!("[sntp-client-parent] Failed to send TimeServerResolved IPC msg: {}", e);
-                            }
-                        }
-                    }
-                    _ => {
-                        if let Some((pid, _, _)) = active_child.take() {
-                            terminate_worker(pid).await;
-                        }
-                    }
-                }
+                handle_sntp_ipc_msg(msg, &mut active_child).await;
             }
         }
     }
@@ -127,8 +141,11 @@ fn spawn_sntp_worker() -> Result<(u32, OwnedReadHalf, OwnedWriteHalf), ServiceEr
     let ipc_stream = async_unix_stream(parent_ipc).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
 
+    let ntp_socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(ServiceError::Io)?;
+
     let worker_service = WorkerService::SntpClient {
         ipc_fd: child_ipc.into(),
+        ntp_socket_fd: ntp_socket.into(),
     };
     let args = worker_service.to_args();
     let arg_strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();

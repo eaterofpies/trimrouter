@@ -5,7 +5,10 @@ use std::process::exit;
 
 async fn dispatch_worker(service: WorkerService) -> Result<(), (&'static str, std::io::Error)> {
     match service {
-        WorkerService::SntpClient { ipc_fd } => sntp_client::run_sntp_client_worker(ipc_fd.into())
+        WorkerService::SntpClient {
+            ipc_fd,
+            ntp_socket_fd,
+        } => sntp_client::run_sntp_client_worker(ipc_fd.into(), ntp_socket_fd.into())
             .await
             .map_err(|e| ("sntp-client", e)),
         WorkerService::DhcpClient {

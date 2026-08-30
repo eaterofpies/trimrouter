@@ -378,12 +378,6 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_fcntl,
     libc::SYS_getsockopt,
     libc::SYS_setsockopt,
-    libc::SYS_socket,
-    libc::SYS_bind,
-    libc::SYS_connect,
-    libc::SYS_accept,
-    libc::SYS_getsockname,
-    libc::SYS_getpeername,
     #[cfg(not(target_arch = "aarch64"))]
     libc::SYS_epoll_create,
     libc::SYS_epoll_ctl,

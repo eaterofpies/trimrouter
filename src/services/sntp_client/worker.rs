@@ -2,7 +2,7 @@ use crate::services::ipc::{SntpClientToParentMsg, SntpParentToClientMsg, recv_ms
 use crate::services::utils::{
     NTP_PORT, SNTP_GID, SNTP_UID, is_valid_ntp_server_ip, run_sandboxed_worker, wait_ipc_eof,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use log::{error, info, warn};
 use std::io::Error as IoError;
 use std::os::unix::io::OwnedFd;
@@ -14,7 +14,12 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(900); // 15 minutes
 const DNS_TIMEOUT: Duration = Duration::from_secs(5); // 5 seconds
 
-pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
+pub async fn run_sntp_client_worker(
+    ipc_fd: OwnedFd,
+    ntp_socket_fd: OwnedFd,
+) -> Result<(), IoError> {
+    let ntp_socket = std::sync::Arc::new(crate::services::utils::async_udp_socket(ntp_socket_fd)?);
+
     run_sandboxed_worker(
         "sntp-client",
         SNTP_UID,
@@ -29,6 +34,7 @@ pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
                 if !handle_sntp_iteration(
                     &mut ipc_writer,
                     &mut ipc_reader,
+                    &ntp_socket,
                     &mut current_retry_delay,
                 )
                 .await
@@ -47,9 +53,10 @@ pub async fn run_sntp_client_worker(ipc_fd: OwnedFd) -> Result<(), IoError> {
 async fn handle_sntp_iteration(
     ipc_writer: &mut OwnedWriteHalf,
     ipc_reader: &mut OwnedReadHalf,
+    ntp_socket: &std::sync::Arc<tokio::net::UdpSocket>,
     current_retry_delay: &mut Duration,
 ) -> bool {
-    let sync_res = sync_time(ipc_writer, ipc_reader).await;
+    let sync_res = sync_time(ipc_writer, ipc_reader, ntp_socket).await;
 
     match sync_res {
         Ok(chrono_dt) => {
@@ -106,9 +113,30 @@ async fn sleep_or_shutdown(duration: Duration, ipc_reader: &mut OwnedReadHalf) -
     }
 }
 
+use sntpc::{
+    Error as SntpError, NtpContext, NtpResult as SntpResult, NtpUdpSocket, StdTimestampGen,
+    get_time,
+};
+
+struct TokioUdpSocketRef<'a>(&'a tokio::net::UdpSocket);
+
+impl NtpUdpSocket for TokioUdpSocketRef<'_> {
+    async fn send_to(&self, buf: &[u8], addr: std::net::SocketAddr) -> Result<usize, SntpError> {
+        self.0
+            .send_to(buf, addr)
+            .await
+            .map_err(|_| SntpError::Network)
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, std::net::SocketAddr), SntpError> {
+        self.0.recv_from(buf).await.map_err(|_| SntpError::Network)
+    }
+}
+
 async fn sync_time(
     ipc_writer: &mut OwnedWriteHalf,
     ipc_reader: &mut OwnedReadHalf,
+    ntp_socket: &tokio::net::UdpSocket,
 ) -> Result<DateTime<Utc>, String> {
     // 1. Request DNS resolution for time server from parent supervisor over IPC
     let msg = SntpClientToParentMsg::ResolveTimeServer;
@@ -136,20 +164,24 @@ async fn sync_time(
     }
     let ntp_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ntp_server_ip), NTP_PORT);
 
-    // 3. Synchronize using standard rsntp client
-    let client = rsntp::AsyncSntpClient::new();
-    let result = client
-        .synchronize(ntp_addr)
-        .await
-        .map_err(|e| format!("NTP synchronization failed: {:?}", e))?;
+    // 3. Query NTP server using sntpc library with passed UDP socket
+    let ntp_context = NtpContext::new(StdTimestampGen::default());
+    let socket_wrapper = TokioUdpSocketRef(ntp_socket);
 
-    // Convert datetime using rsntp's integrated chrono feature
-    let chrono_dt = result
-        .datetime()
-        .into_chrono_datetime()
-        .map_err(|e| format!("Failed to convert NTP datetime: {}", e))?;
+    let result: SntpResult = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_time(ntp_addr, &socket_wrapper, ntp_context),
+    )
+    .await
+    .map_err(|_| "Timeout while waiting for SNTP server reply".to_string())?
+    .map_err(|e| format!("SNTP get_time failed: {:?}", e))?;
 
-    Ok(chrono_dt)
+    let unix_secs = result.sec() as i64;
+    let nanos = (u64::from(result.sec_fraction()) * 1_000_000_000 / (1u64 << 32)) as u32;
+
+    Utc.timestamp_opt(unix_secs, nanos)
+        .single()
+        .ok_or_else(|| format!("Invalid timestamp: secs={}, nanos={}", unix_secs, nanos))
 }
 
 // =========================================================================
@@ -222,6 +254,8 @@ mod tests {
         let (sock1, sock2) = UnixStream::pair().unwrap();
         let (mut worker_reader, mut worker_writer) = sock1.into_split();
         let (mut parent_reader, mut parent_writer) = sock2.into_split();
+        let udp_sock =
+            std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
 
         tokio::spawn(async move {
             if let Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) =
@@ -234,7 +268,7 @@ mod tests {
             }
         });
 
-        let res = sync_time(&mut worker_writer, &mut worker_reader).await;
+        let res = sync_time(&mut worker_writer, &mut worker_reader, &udp_sock).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("DNS query timed out"));
     }
