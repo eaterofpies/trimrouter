@@ -4,3 +4,15 @@
 - Support TCP, DNSSEC, etc. in the DNS forwarder
 - Add some basic observability and metrics
 - Panic doesn't stop routing / other services. Should it?
+- Enable Linux hardware watchdog (/dev/watchdog) integration with async health checks in PID 1
+- Static DHCP lease reservations via trimrouter.toml
+- Local LAN DNS / DHCP hostname resolution (split-horizon)
+- Inbound port forwarding (DNAT rules in trimrouter.toml)
+- IPv6 SLAAC & Router Advertisements (RAs)
+- Custom upstream DNS resolvers via trimrouter.toml / kernel cmdline
+- DNS query rate limiting / flooding protection
+- Negative DNS caching (RFC 2308)
+- DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH) upstream resolution
+- Dynamic temp / run filesystem sizing limits (tmpfs quotas)
+- Graceful filesystem sync on power-button teardown
+- Network interface carrier & link state polling (watchdog carrier check)
