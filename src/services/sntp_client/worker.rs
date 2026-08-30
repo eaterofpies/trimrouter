@@ -4,21 +4,42 @@ use crate::services::utils::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use log::{error, info, warn};
+use sntpc::{
+    Error as SntpError, NtpContext, NtpResult as SntpResult, NtpUdpSocket, StdTimestampGen,
+    fraction_to_microseconds, get_time,
+};
 use std::io::Error as IoError;
 use std::os::unix::io::OwnedFd;
 use std::time::Duration;
+use tokio::net::UdpSocket;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
 const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(900); // 15 minutes
 const DNS_TIMEOUT: Duration = Duration::from_secs(5); // 5 seconds
+const NANOS_PER_MICRO: u32 = 1_000;
+
+pub struct TokioUdpSocketRef<'a>(pub &'a UdpSocket);
+
+impl NtpUdpSocket for TokioUdpSocketRef<'_> {
+    async fn send_to(&self, buf: &[u8], addr: std::net::SocketAddr) -> Result<usize, SntpError> {
+        self.0
+            .send_to(buf, addr)
+            .await
+            .map_err(|_| SntpError::Network)
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, std::net::SocketAddr), SntpError> {
+        self.0.recv_from(buf).await.map_err(|_| SntpError::Network)
+    }
+}
 
 pub async fn run_sntp_client_worker(
     ipc_fd: OwnedFd,
     ntp_socket_fd: OwnedFd,
 ) -> Result<(), IoError> {
-    let ntp_socket = std::sync::Arc::new(crate::services::utils::async_udp_socket(ntp_socket_fd)?);
+    let ntp_socket = crate::services::utils::async_udp_socket(ntp_socket_fd)?;
 
     run_sandboxed_worker(
         "sntp-client",
@@ -53,7 +74,7 @@ pub async fn run_sntp_client_worker(
 async fn handle_sntp_iteration(
     ipc_writer: &mut OwnedWriteHalf,
     ipc_reader: &mut OwnedReadHalf,
-    ntp_socket: &std::sync::Arc<tokio::net::UdpSocket>,
+    ntp_socket: &UdpSocket,
     current_retry_delay: &mut Duration,
 ) -> bool {
     let sync_res = sync_time(ipc_writer, ipc_reader, ntp_socket).await;
@@ -113,30 +134,10 @@ async fn sleep_or_shutdown(duration: Duration, ipc_reader: &mut OwnedReadHalf) -
     }
 }
 
-use sntpc::{
-    Error as SntpError, NtpContext, NtpResult as SntpResult, NtpUdpSocket, StdTimestampGen,
-    get_time,
-};
-
-struct TokioUdpSocketRef<'a>(&'a tokio::net::UdpSocket);
-
-impl NtpUdpSocket for TokioUdpSocketRef<'_> {
-    async fn send_to(&self, buf: &[u8], addr: std::net::SocketAddr) -> Result<usize, SntpError> {
-        self.0
-            .send_to(buf, addr)
-            .await
-            .map_err(|_| SntpError::Network)
-    }
-
-    async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, std::net::SocketAddr), SntpError> {
-        self.0.recv_from(buf).await.map_err(|_| SntpError::Network)
-    }
-}
-
 async fn sync_time(
     ipc_writer: &mut OwnedWriteHalf,
     ipc_reader: &mut OwnedReadHalf,
-    ntp_socket: &tokio::net::UdpSocket,
+    ntp_socket: &UdpSocket,
 ) -> Result<DateTime<Utc>, String> {
     // 1. Request DNS resolution for time server from parent supervisor over IPC
     let msg = SntpClientToParentMsg::ResolveTimeServer;
@@ -177,7 +178,8 @@ async fn sync_time(
     .map_err(|e| format!("SNTP get_time failed: {:?}", e))?;
 
     let unix_secs = result.sec() as i64;
-    let nanos = (u64::from(result.sec_fraction()) * 1_000_000_000 / (1u64 << 32)) as u32;
+    let micros = fraction_to_microseconds(result.sec_fraction());
+    let nanos = micros.saturating_mul(NANOS_PER_MICRO);
 
     Utc.timestamp_opt(unix_secs, nanos)
         .single()
@@ -254,8 +256,7 @@ mod tests {
         let (sock1, sock2) = UnixStream::pair().unwrap();
         let (mut worker_reader, mut worker_writer) = sock1.into_split();
         let (mut parent_reader, mut parent_writer) = sock2.into_split();
-        let udp_sock =
-            std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let udp_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         tokio::spawn(async move {
             if let Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) =
@@ -283,5 +284,24 @@ mod tests {
         // Pre-1970 date: 1969-12-31T23:59:59Z (should return None)
         let pre_epoch_dt = Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap();
         assert_eq!(datetime_to_time_components(pre_epoch_dt), None);
+    }
+
+    #[tokio::test]
+    async fn test_tokio_udp_socket_ref_send_recv() {
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let wrapper_a = TokioUdpSocketRef(&sock_a);
+        let wrapper_b = TokioUdpSocketRef(&sock_b);
+
+        let sent = wrapper_a.send_to(b"ping", addr_b).await.unwrap();
+        assert_eq!(sent, 4);
+
+        let mut buf = [0u8; 16];
+        let (recv_len, src) = wrapper_b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(recv_len, 4);
+        assert_eq!(&buf[..recv_len], b"ping");
+        assert_eq!(src, sock_a.local_addr().unwrap());
     }
 }
