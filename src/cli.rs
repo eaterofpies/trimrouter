@@ -135,6 +135,8 @@ pub enum WorkerService {
     SntpClient {
         #[arg(value_parser = parse_cli_fd)]
         ipc_fd: CliFd,
+        #[arg(value_parser = parse_cli_fd)]
+        ntp_socket_fd: CliFd,
     },
     #[command(name = "dhcp-client")]
     DhcpClient {
@@ -167,8 +169,14 @@ pub enum WorkerService {
 impl WorkerService {
     pub fn to_args(&self) -> Vec<String> {
         match self {
-            Self::SntpClient { ipc_fd } => {
-                vec![ipc_fd.as_raw_fd().to_string()]
+            Self::SntpClient {
+                ipc_fd,
+                ntp_socket_fd,
+            } => {
+                vec![
+                    ipc_fd.as_raw_fd().to_string(),
+                    ntp_socket_fd.as_raw_fd().to_string(),
+                ]
             }
             Self::DhcpClient {
                 ipc_fd,
@@ -210,7 +218,10 @@ impl WorkerService {
 
     pub fn child_fds(&self) -> Vec<BorrowedFd<'_>> {
         match self {
-            Self::SntpClient { ipc_fd } => vec![ipc_fd.as_fd()],
+            Self::SntpClient {
+                ipc_fd,
+                ntp_socket_fd,
+            } => vec![ipc_fd.as_fd(), ntp_socket_fd.as_fd()],
             Self::DhcpClient {
                 ipc_fd,
                 raw_socket_fd,
@@ -287,12 +298,15 @@ mod tests {
     #[test]
     fn test_proc_self_exe_worker_parsing() {
         let (s5, _s6) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (s5b, _s6b) = std::os::unix::net::UnixStream::pair().unwrap();
         let fd5 = s5.into_raw_fd();
+        let fd5b = s5b.into_raw_fd();
         let exe_worker_args = vec![
             "/proc/self/exe".to_string(),
             "worker".to_string(),
             "sntp-client".to_string(),
             fd5.to_string(),
+            fd5b.to_string(),
         ];
         assert!(Cli::try_parse_from(&exe_worker_args).is_ok());
 
@@ -327,9 +341,15 @@ mod tests {
         let raw3 = fd3.as_raw_fd().to_string();
 
         // SntpClient
-        let sntp = WorkerService::SntpClient { ipc_fd: fd1 };
-        assert_eq!(sntp.to_args(), vec![raw1]);
-        assert_eq!(sntp.child_fds().len(), 1);
+        let (sntp_sock, _sntp_sock_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let sntp_fd = CliFd(sntp_sock.into());
+        let sntp_raw = sntp_fd.as_raw_fd().to_string();
+        let sntp = WorkerService::SntpClient {
+            ipc_fd: fd1,
+            ntp_socket_fd: sntp_fd,
+        };
+        assert_eq!(sntp.to_args(), vec![raw1, sntp_raw]);
+        assert_eq!(sntp.child_fds().len(), 2);
 
         // DhcpClient
         let (dc1, dc2) = std::os::unix::net::UnixStream::pair().unwrap();

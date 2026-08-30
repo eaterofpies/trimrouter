@@ -23,7 +23,7 @@ rand = "0.10.2"
 ipnet = "2.12.1"
 dns-parser = "0.8.0"
 chrono = { version = "0.4.45", features = ["clock"] }
-rsntp = "4.1.2"
+sntpc = { version = "0.11.0", features = ["std"] }
 kobject-uevent = "0.2.0"
 netlink-sys = "0.9.0"
 serde = { version = "1.0.229", features = ["derive"] }

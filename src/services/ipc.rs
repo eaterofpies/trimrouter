@@ -57,6 +57,12 @@ pub enum DhcpClientToParentMsg {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum SntpClientToParentMsg {
     SetSystemTime { seconds: i64, nanoseconds: i64 },
+    ResolveTimeServer,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum SntpParentToClientMsg {
+    TimeServerResolved { result: Result<Ipv4Addr, String> },
 }
 
 pub const MAX_IPC_MSG_LEN: usize = 65536; // 64 KB maximum message size
@@ -163,6 +169,20 @@ mod tests {
         send_msg(&mut w2, &sntp_msg).await.unwrap();
         let received: SntpClientToParentMsg = recv_msg(&mut r1).await.unwrap().unwrap();
         assert_eq!(received, sntp_msg);
+
+        // 6. SntpClientToParentMsg::ResolveTimeServer
+        let resolve_msg = SntpClientToParentMsg::ResolveTimeServer;
+        send_msg(&mut w2, &resolve_msg).await.unwrap();
+        let received: SntpClientToParentMsg = recv_msg(&mut r1).await.unwrap().unwrap();
+        assert_eq!(received, resolve_msg);
+
+        // 7. SntpParentToClientMsg::TimeServerResolved
+        let resolved_msg = SntpParentToClientMsg::TimeServerResolved {
+            result: Ok(Ipv4Addr::new(216, 239, 35, 0)),
+        };
+        send_msg(&mut w1, &resolved_msg).await.unwrap();
+        let received: SntpParentToClientMsg = recv_msg(&mut r2).await.unwrap().unwrap();
+        assert_eq!(received, resolved_msg);
     }
 
     #[tokio::test]

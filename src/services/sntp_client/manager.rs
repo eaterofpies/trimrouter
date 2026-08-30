@@ -1,16 +1,24 @@
 use crate::cli::WorkerService;
-use crate::services::ipc::{SntpClientToParentMsg, async_unix_stream, recv_msg};
+use crate::services::ipc::{
+    SntpClientToParentMsg, SntpParentToClientMsg, async_unix_stream, recv_msg, send_msg,
+};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceController, ServiceError};
-use crate::services::utils::{WanLeaseReceiver, create_ipc_fds, terminate_worker};
+use crate::services::utils::{
+    NTP_PORT, WanLeaseReceiver, create_ipc_fds, is_valid_ntp_server_ip, terminate_worker,
+};
 use log::{error, info, warn};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch::Receiver;
 
 const MIN_SANE_EPOCH_SECS: i64 = 1_700_000_000; // ~Nov 2023
 const MAX_SANE_EPOCH_SECS: i64 = 4_102_444_800; // Jan 1, 2100
 const NANOS_PER_SEC: i64 = 1_000_000_000;
+const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(4);
+const DEFAULT_NTP_SERVER: &str = "time.google.com";
 
 pub struct SntpClient {
     lease_rx: WanLeaseReceiver,
@@ -22,6 +30,71 @@ impl SntpClient {
         Self {
             lease_rx,
             controller: ServiceController::new(),
+        }
+    }
+}
+
+async fn resolve_host(host: &str) -> Result<Ipv4Addr, String> {
+    let addrs = tokio::net::lookup_host((host, NTP_PORT))
+        .await
+        .map_err(|e| format!("Failed to resolve {}: {}", host, e))?;
+
+    for addr in addrs {
+        if let IpAddr::V4(ip) = addr.ip()
+            && is_valid_ntp_server_ip(ip)
+        {
+            return Ok(ip);
+        }
+    }
+    Err(format!(
+        "No valid routable IPv4 address resolved for {}",
+        host
+    ))
+}
+
+async fn resolve_time_server_ip() -> Result<Ipv4Addr, String> {
+    match tokio::time::timeout(DNS_RESOLUTION_TIMEOUT, resolve_host(DEFAULT_NTP_SERVER)).await {
+        Ok(res) => res,
+        Err(_) => Err(format!(
+            "DNS resolution timed out for {}",
+            DEFAULT_NTP_SERVER
+        )),
+    }
+}
+
+async fn handle_sntp_ipc_msg(
+    msg: Result<Option<SntpClientToParentMsg>, std::io::Error>,
+    active_child: &mut Option<(u32, OwnedReadHalf, OwnedWriteHalf)>,
+) {
+    match msg {
+        Ok(Some(SntpClientToParentMsg::SetSystemTime {
+            seconds,
+            nanoseconds,
+        })) => {
+            set_system_clock(seconds, nanoseconds);
+        }
+        Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) => {
+            if let Some((_, _, writer)) = active_child.as_mut() {
+                let result = resolve_time_server_ip().await;
+                if let Err(err_msg) = &result {
+                    error!(
+                        "[sntp-client-parent] Failed to resolve time server {}: {}",
+                        DEFAULT_NTP_SERVER, err_msg
+                    );
+                }
+                let response = SntpParentToClientMsg::TimeServerResolved { result };
+                if let Err(e) = send_msg(writer, &response).await {
+                    error!(
+                        "[sntp-client-parent] Failed to send TimeServerResolved IPC msg: {}",
+                        e
+                    );
+                }
+            }
+        }
+        _ => {
+            if let Some((pid, _, _)) = active_child.take() {
+                terminate_worker(pid).await;
+            }
         }
     }
 }
@@ -54,23 +127,14 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
                 }
             }
 
-            // Branch B: Process IPC time updates from child (only active when child is running)
+            // Branch B: Process IPC messages from child
             msg = async {
                 match active_child.as_mut() {
                     Some((_, reader, _)) => recv_msg::<SntpClientToParentMsg, _>(reader).await,
                     None => std::future::pending().await,
                 }
             } => {
-                match msg {
-                    Ok(Some(SntpClientToParentMsg::SetSystemTime { seconds, nanoseconds })) => {
-                        set_system_clock(seconds, nanoseconds);
-                    }
-                    _ => {
-                        if let Some((pid, _, _)) = active_child.take() {
-                            terminate_worker(pid).await;
-                        }
-                    }
-                }
+                handle_sntp_ipc_msg(msg, &mut active_child).await;
             }
         }
     }
@@ -85,8 +149,11 @@ fn spawn_sntp_worker() -> Result<(u32, OwnedReadHalf, OwnedWriteHalf), ServiceEr
     let ipc_stream = async_unix_stream(parent_ipc).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
 
+    let ntp_socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(ServiceError::Io)?;
+
     let worker_service = WorkerService::SntpClient {
         ipc_fd: child_ipc.into(),
+        ntp_socket_fd: ntp_socket.into(),
     };
     let args = worker_service.to_args();
     let arg_strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -167,5 +234,12 @@ mod tests {
         // Invalid nanoseconds (>= 1_000_000_000 or negative)
         assert!(!is_valid_system_time(1_720_000_000, 1_000_000_000));
         assert!(!is_valid_system_time(1_720_000_000, -1));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_invalid_domain_returns_err() {
+        let res = resolve_host("invalid.nonexistent.domain.example.invalid").await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Failed to resolve"));
     }
 }

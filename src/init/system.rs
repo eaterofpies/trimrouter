@@ -6,6 +6,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::fs;
 use std::panic;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
@@ -121,6 +122,30 @@ pub fn mount_virtual_filesystems<S: MountOps>(sys: &S) -> Result<(), RouterError
     }
 
     Ok(())
+}
+
+pub const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+pub const RESOLV_CONF_CONTENT: &str = "nameserver 127.0.0.1\n";
+
+pub fn setup_resolv_conf_at_path(path: &Path) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, RESOLV_CONF_CONTENT)?;
+    fs::rename(&tmp_path, path)
+}
+
+pub fn setup_resolv_conf<S: ProcessOps>(sys: &S) -> Result<(), std::io::Error> {
+    if sys.getpid() != Pid::from_raw(1) {
+        info!("[init] Skipping /etc/resolv.conf setup (not PID 1)");
+        return Ok(());
+    }
+    info!(
+        "[init] Configuring {} with local DNS forwarder...",
+        RESOLV_CONF_PATH
+    );
+    setup_resolv_conf_at_path(Path::new(RESOLV_CONF_PATH))
 }
 
 // -1 = infinite (default), >=0 = delay in seconds
@@ -300,5 +325,30 @@ mod tests {
 
         let reboot_called = sys.reboot_call.lock().unwrap();
         assert_eq!(*reboot_called, None);
+    }
+
+    #[test]
+    fn test_setup_resolv_conf_skipped_when_not_pid1() {
+        let mut sys = MockSystem::new();
+        sys.pid = Pid::from_raw(42);
+        let res = setup_resolv_conf(&sys);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_setup_resolv_conf_at_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "trimrouter_test_resolv_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let resolv_path = temp_dir.join("resolv.conf");
+        let res = setup_resolv_conf_at_path(&resolv_path);
+        assert!(res.is_ok());
+        let content = fs::read_to_string(&resolv_path).unwrap();
+        assert_eq!(content, RESOLV_CONF_CONTENT);
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

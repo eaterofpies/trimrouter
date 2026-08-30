@@ -1420,16 +1420,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "rsntp"
-version = "4.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc507d0efdc8ce91a17455b1efe9ada6a21e2414470b3f1d84aefc7ebcf247bd"
-dependencies = [
- "chrono",
- "tokio",
-]
-
-[[package]]
 name = "rtnetlink"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1625,6 +1615,15 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "sntpc"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "294278b134cd7d06d7f22eca970aebe38707864c080f66547f9ad26327534af3"
+dependencies = [
+ "cfg-if",
+]
 
 [[package]]
 name = "socket2"
@@ -1879,11 +1878,11 @@ dependencies = [
  "postcard",
  "privdrop",
  "rand",
- "rsntp",
  "rtnetlink",
  "rustables",
  "seccompiler",
  "serde",
+ "sntpc",
  "socket2",
  "tokio",
  "toml",

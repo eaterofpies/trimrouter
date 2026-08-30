@@ -9,7 +9,9 @@ use trimrouter::init::kmod;
 use trimrouter::init::storage::{
     ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
 };
-use trimrouter::init::system::{PowerOps, ProcessOps, RealSystem, mount_virtual_filesystems};
+use trimrouter::init::system::{
+    PowerOps, ProcessOps, RealSystem, mount_virtual_filesystems, setup_resolv_conf,
+};
 use trimrouter::network;
 use trimrouter::services::{Service, WanLease};
 
@@ -61,6 +63,10 @@ async fn main() {
             std::eprintln!("[test] FATAL: Failed to mount VFS: {}", e);
             std::process::exit(1);
         }
+        if let Err(e) = setup_resolv_conf(sys.as_ref()) {
+            std::eprintln!("[test] FATAL: Failed to setup /etc/resolv.conf: {}", e);
+            std::process::exit(1);
+        }
         kmod::start_uevent_listener();
         kmod::trigger_uevents();
         kmod::load_required_modules();
@@ -97,6 +103,29 @@ async fn main() {
             }
         };
         trimrouter::logging::init_logging(config.logging.max_log_size_mb, config.logging.level);
+
+        // Test: Resolv.conf Configuration
+        std::println!("[test] Starting /etc/resolv.conf verification test...");
+        match std::fs::read_to_string("/etc/resolv.conf") {
+            Ok(content) if content.contains("nameserver 127.0.0.1") => {
+                std::println!("[test-control] TEST_PASSED resolv_conf");
+                passed += 1;
+            }
+            Ok(content) => {
+                std::println!(
+                    "[test-control] TEST_FAILED resolv_conf Invalid /etc/resolv.conf content: {}",
+                    content
+                );
+                failed += 1;
+            }
+            Err(e) => {
+                std::println!(
+                    "[test-control] TEST_FAILED resolv_conf Failed to read /etc/resolv.conf: {}",
+                    e
+                );
+                failed += 1;
+            }
+        }
 
         // Test 0: Network Device Discovery (Waiting for interfaces to appear via MAC)
         std::println!("[test] Starting Network Device Discovery test...");
