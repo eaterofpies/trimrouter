@@ -86,9 +86,9 @@ Each worker drops privileges using the following sequence:
 4.  **Seccomp Syscall Whitelisting**: Installs a strict Seccomp-BPF filter allowing only required system calls (e.g., `read`, `write`, `recvmsg`, `sendmsg`, `epoll_wait`, `nanosleep`, `exit`).
 
 ### 3.3 Helper Libraries (Rust Ecosystem)
-To avoid manual libc system call handling, the following pure-Rust libraries are recommended for integration:
-*   **[`privdrop`](https://docs.rs/privdrop)**: Performs chroot, UID/GID switching, and supplementary group clearing in a secure, atomic sequence.
-*   **[`caps`](https://docs.rs/caps)**: Provides high-level support for querying, clearing, and dropping specific Linux process/thread capabilities.
+The privilege dropping sequence uses:
+*   **[`nix`](https://docs.rs/nix)**: Performs low-level POSIX and Linux system operations (e.g. `setuid`, `setgid`, `chroot`, signal handling, and process termination) safely in Rust.
+*   **[`caps`](https://docs.rs/caps)**: Provides support for querying, clearing, and dropping specific Linux process/thread capability sets (Bounding, Inheritable, Effective, Permitted).
 *   **[`seccompiler`](https://docs.rs/seccompiler)**: A pure-Rust Seccomp-BPF filter compiler from the `rust-vmm` project. It generates and applies BPF filters directly in Rust without calling out to `libseccomp` C libraries, ensuring completely static binaries.
 
 ### 3.4 Service Lifecycle & Process Supervision
