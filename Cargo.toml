@@ -21,7 +21,7 @@ socket2 = "0.6.5"
 dhcproto = "0.15.0"
 rand = "0.10.2"
 ipnet = "2.12.1"
-dns-parser = "0.8.0"
+hickory-proto = "0.26.1"
 chrono = { version = "0.4.45", features = ["clock"] }
 sntpc = { version = "0.11.0", features = ["std"] }
 kobject-uevent = "0.2.0"

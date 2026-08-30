@@ -2,6 +2,8 @@ use crate::services::ipc::{DnsParentToWorkerMsg, recv_msg};
 use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_udp_socket, run_sandboxed_worker,
 };
+use hickory_proto::op::{Message, OpCode};
+use hickory_proto::serialize::binary::BinDecodable;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::io::Error as IoError;
@@ -272,12 +274,13 @@ fn evict_expired_cache(cache: &mut HashMap<Vec<u8>, CacheEntry>) {
 }
 
 fn get_cache_key(query_bytes: &[u8]) -> Option<Vec<u8>> {
-    let packet = dns_parser::Packet::parse(query_bytes).ok()?;
-    if packet.questions.is_empty() || packet.header.opcode != dns_parser::Opcode::StandardQuery {
+    let packet = Message::from_bytes(query_bytes).ok()?;
+    let queries = &packet.queries;
+    if queries.is_empty() || packet.op_code != OpCode::Query {
         return None;
     }
-    let q = &packet.questions[0];
-    let key = format!("{}:{:?}:{:?}", q.qname, q.qtype, q.qclass);
+    let q = &queries[0];
+    let key = format!("{}:{:?}:{:?}", q.name(), q.query_type(), q.query_class());
     Some(key.into_bytes())
 }
 
@@ -296,7 +299,7 @@ fn insert_cache(cache_key: Vec<u8>, response: Vec<u8>, cache: &mut HashMap<Vec<u
     if response.len() < DNS_HEADER_SIZE {
         return;
     }
-    let packet = match dns_parser::Packet::parse(&response) {
+    let packet = match Message::from_bytes(&response) {
         Ok(p) => p,
         Err(_) => return,
     };
@@ -377,7 +380,7 @@ mod tests {
         query.extend_from_slice(&[0, 1]); // Class IN
 
         let key = get_cache_key(&query);
-        assert_eq!(key, Some("google.com:A:IN".to_string().into_bytes()));
+        assert_eq!(key, Some("google.com.:A:IN".to_string().into_bytes()));
     }
 
     #[test]
