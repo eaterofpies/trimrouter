@@ -121,7 +121,7 @@ These values ensure dirty log pages are flushed to flash within at most 35 secon
 
 `fsync` is called only on two occasions:
 1. **Before rotation** — to ensure the completed log file is fully persisted before it is renamed.
-2. **On clean shutdown** — to flush any remaining buffered lines before the process exits.
+2. **On clean shutdown** — to flush in-flight log buffers and execute a global filesystem `sync()` before executing system poweroff.
 
 > [!NOTE]
 > On an unclean power-off, up to 35 seconds of log output may be lost. This is an accepted trade-off for a router where SD card longevity outweighs log completeness.

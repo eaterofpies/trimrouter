@@ -25,6 +25,7 @@ pub trait MountOps: Send + Sync + 'static {
 
 pub trait PowerOps: Send + Sync + 'static {
     fn reboot(&self, mode: RebootMode) -> Result<(), nix::Error>;
+    fn sync(&self);
 }
 
 pub trait ProcessOps: Send + Sync + 'static {
@@ -69,6 +70,12 @@ impl MountOps for RealSystem {
 impl PowerOps for RealSystem {
     fn reboot(&self, mode: RebootMode) -> Result<(), nix::Error> {
         nix::sys::reboot::reboot(mode).map(|_| ())
+    }
+
+    fn sync(&self) {
+        unsafe {
+            libc::sync();
+        }
     }
 }
 
@@ -172,15 +179,23 @@ fn halt_on_panic<S: PowerOps + ProcessOps>(sys: &S) {
     if sys.getpid() != Pid::from_raw(1) {
         return;
     }
-    let delay = REBOOT_DELAY.load(Ordering::Relaxed);
+    crate::logging::flush();
+    sys.sync();
 
+    let delay = REBOOT_DELAY.load(Ordering::Relaxed);
     if delay >= 0 {
         error!("[init] Rebooting in {} seconds...", delay);
+        crate::logging::flush();
+        sys.sync();
         thread::sleep(Duration::from_secs(delay as u64));
         error!("[init] Rebooting system now...");
+        crate::logging::flush();
+        sys.sync();
         let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
     } else {
         error!("[init] System halted. Hanging indefinitely on panic...");
+        crate::logging::flush();
+        sys.sync();
         loop {
             thread::sleep(Duration::from_secs(3600));
         }
@@ -206,6 +221,7 @@ pub mod mock {
         pub config_content: String,
         pub mount_calls: Mutex<Vec<MountCall>>,
         pub reboot_call: Mutex<Option<RebootMode>>,
+        pub sync_calls: Mutex<usize>,
         pub waitpid_results: Mutex<Vec<Result<WaitStatus, nix::Error>>>,
     }
 
@@ -222,6 +238,7 @@ pub mod mock {
                 config_content: "".to_string(),
                 mount_calls: Mutex::new(Vec::new()),
                 reboot_call: Mutex::new(None),
+                sync_calls: Mutex::new(0),
                 waitpid_results: Mutex::new(Vec::new()),
             }
         }
@@ -250,6 +267,10 @@ pub mod mock {
         fn reboot(&self, mode: RebootMode) -> Result<(), nix::Error> {
             *self.reboot_call.lock().unwrap() = Some(mode);
             Ok(())
+        }
+
+        fn sync(&self) {
+            *self.sync_calls.lock().unwrap() += 1;
         }
     }
 

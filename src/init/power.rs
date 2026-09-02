@@ -8,6 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Duration, sleep};
 
+const MAX_INPUT_EVENT_DEVICES: usize = 32;
+const ACPI_DEVICE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+const SIGNAL_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(500);
+
 pub fn is_power_event(event_type: evdev::EventType, code: u16, value: i32) -> bool {
     event_type == evdev::EventType::KEY
         && (code == evdev::KeyCode::KEY_POWER.code()
@@ -28,7 +32,7 @@ pub async fn start_power_button_monitor<S: PowerOps + 'static>(
             break;
         }
 
-        for i in 0..32 {
+        for i in 0..MAX_INPUT_EVENT_DEVICES {
             let path = format!("/dev/input/event{}", i);
             if !opened_devices.contains(&path)
                 && let Ok(device) = evdev::Device::open(&path)
@@ -47,7 +51,23 @@ pub async fn start_power_button_monitor<S: PowerOps + 'static>(
             }
         }
 
-        sleep(Duration::from_secs(2)).await;
+        sleep(ACPI_DEVICE_SCAN_INTERVAL).await;
+    }
+}
+
+pub fn execute_clean_poweroff<S: PowerOps>(sys: &S, source: &'static str) {
+    info!("[{}] Syncing filesystems to persistent storage...", source);
+    crate::logging::flush();
+    sys.sync();
+
+    info!("[{}] Executing system poweroff...", source);
+    crate::logging::flush();
+    if let Err(e) = sys.reboot(RebootMode::RB_POWER_OFF) {
+        warn!(
+            "[{}] Poweroff failed: {}. Falling back to default reboot.",
+            source, e
+        );
+        let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
     }
 }
 
@@ -66,14 +86,7 @@ async fn monitor_single_power_device<S: PowerOps>(
                 event.code()
             );
             shutdown_flag.store(true, Ordering::Relaxed);
-            crate::logging::flush();
-            if let Err(e) = sys.reboot(RebootMode::RB_POWER_OFF) {
-                warn!(
-                    "[acpi] Poweroff failed: {}. Falling back to default reboot.",
-                    e
-                );
-                let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
-            }
+            execute_clean_poweroff(&*sys, "acpi");
             break;
         }
     }
@@ -106,17 +119,9 @@ pub async fn start_signal_monitor<S: PowerOps>(sys: Arc<S>, shutdown_flag: Arc<A
 
     shutdown_flag.store(true, Ordering::Relaxed);
 
-    sleep(Duration::from_millis(500)).await;
+    sleep(SIGNAL_SHUTDOWN_GRACE_PERIOD).await;
 
-    info!("[init] Executing system poweroff...");
-    crate::logging::flush();
-    if let Err(e) = sys.reboot(RebootMode::RB_POWER_OFF) {
-        warn!(
-            "[init] Poweroff failed: {}. Falling back to default reboot.",
-            e
-        );
-        let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
-    }
+    execute_clean_poweroff(&*sys, "init");
 }
 
 #[cfg(test)]
@@ -167,5 +172,17 @@ mod tests {
             evdev::KeyCode::KEY_POWER.code(),
             1
         ));
+    }
+
+    #[test]
+    fn test_execute_clean_poweroff_syncs_and_reboots() {
+        let sys = crate::init::system::mock::MockSystem::new();
+        execute_clean_poweroff(&sys, "test");
+
+        assert_eq!(*sys.sync_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *sys.reboot_call.lock().unwrap(),
+            Some(RebootMode::RB_POWER_OFF)
+        );
     }
 }
