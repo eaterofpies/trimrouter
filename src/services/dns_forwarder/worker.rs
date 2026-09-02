@@ -412,20 +412,11 @@ fn insert_cache(cache_key: Vec<u8>, response: Vec<u8>, cache: &mut HashMap<Vec<u
     cache.insert(cache_key, CacheEntry { response, expiry });
 }
 
-fn is_valid_upstream_resolver(ip: Ipv4Addr) -> bool {
-    !ip.is_unspecified()
-        && !ip.is_broadcast()
-        && !ip.is_loopback()
-        && !ip.is_multicast()
-        && !ip.is_link_local()
-        && !ip.is_documentation()
-}
-
 fn get_upstream_resolvers(configured: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
     let valid: Vec<Ipv4Addr> = configured
         .iter()
         .copied()
-        .filter(|&ip| is_valid_upstream_resolver(ip))
+        .filter(|&ip| crate::services::utils::is_valid_upstream_resolver(ip))
         .collect();
     if !valid.is_empty() {
         valid
@@ -579,6 +570,7 @@ fn build_authoritative_nxdomain_response(query_msg: &Message) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::utils::is_valid_upstream_resolver;
 
     #[test]
     fn test_get_cache_key_valid() {

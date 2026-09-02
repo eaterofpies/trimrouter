@@ -236,8 +236,9 @@ async fn configure_networking_and_services(
         });
     }
 
-    let mut dns_forwarder = services::DnsForwarder::with_local_hosts(
+    let mut dns_forwarder = services::DnsForwarder::with_custom_dns(
         lease_rx.clone(),
+        config.dns_servers.clone(),
         Some(heartbeat_tx.clone()),
         Some(local_hosts_rx),
     );

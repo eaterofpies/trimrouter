@@ -47,6 +47,15 @@ pub const LOCAL_DOMAIN: &str = "lan";
 pub const MDNS_DOMAIN: &str = "local";
 pub const ROUTER_HOSTNAME: &str = "router";
 
+pub fn is_valid_upstream_resolver(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_broadcast()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_link_local()
+        && !ip.is_documentation()
+}
+
 // =========================================================================
 // Shared WAN Lease Info
 // =========================================================================

@@ -14,6 +14,11 @@ The DNS Forwarder is a local DNS proxy service in `trimrouter` that resolves DNS
     > [!TIP]
     > Reusing a single socket avoids binding and closing temporary sockets for each query, preventing ephemeral port exhaustion in high-concurrency environments.
 
+### 1.1 Upstream Resolver Selection & Precedence
+1. **Custom DNS Overrides**: If custom upstream DNS resolvers are configured in `trimrouter.toml` (e.g. `[network].dns_servers = ["1.1.1.1", "1.0.0.1"]` or `[dns].servers`), the DNS forwarder strictly uses these configured resolvers as upstream servers, ignoring dynamic DNS servers advertised by WAN DHCP leases.
+2. **WAN DHCP Dynamic Resolvers**: If no custom DNS servers are configured, the forwarder dynamically updates its upstream resolver list whenever the WAN DHCP client obtains or renews a lease with DNS server options (`OptionCode::DnsServer`).
+3. **Fallback Resolver**: If neither custom DNS servers nor WAN DHCP DNS servers are available (e.g. before WAN lease acquisition or if the ISP provides no DNS servers), the forwarder falls back to `1.1.1.1` (`FALLBACK_DNS_SERVER`).
+
 ---
 
 ## 2. Upstream Forwarding & Security Mechanics

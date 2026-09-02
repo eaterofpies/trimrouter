@@ -7,6 +7,5 @@
 - Static DHCP lease reservations via trimrouter.toml
 - Inbound port forwarding (DNAT rules in trimrouter.toml)
 - IPv6 SLAAC & Router Advertisements (RAs)
-- Custom upstream DNS resolvers via trimrouter.toml / kernel cmdline
 - DNS query rate limiting / flooding protection
 - DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH) upstream resolution

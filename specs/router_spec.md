@@ -126,13 +126,14 @@ wan_mac = "52:54:00:12:34:56"   # Required — maps WAN interface, renames it to
 lan_mac = "52:54:00:12:34:57"   # Required — maps LAN interface, renames it to "lan"
 lan_ip = "192.168.1.1/24"       # Optional — defaults to "192.168.1.1/24"
 backup_lan_ip = "10.0.0.1/24"   # Optional — defaults to "10.0.0.1/24"
+dns_servers = ["1.1.1.1", "1.0.0.1"] # Optional — custom upstream DNS resolvers (overrides WAN DHCP DNS)
 
 [system]
 reboot_delay = 10               # Optional — seconds before reboot on panic (omit for infinite hang)
 watchdog = true                 # Optional — enable /dev/watchdog hardware supervisor (default: true)
 ```
 
-If `wan_mac` or `lan_mac` is missing, invalid (e.g. zero, broadcast, multicast, or identical MACs), if `lan_ip`/`backup_lan_ip` are invalid CIDRs (or overlap with each other), or if the configuration file cannot be read, PID 1 prints a descriptive configuration error and halts.
+If `wan_mac` or `lan_mac` is missing, invalid (e.g. zero, broadcast, multicast, or identical MACs), if `lan_ip`/`backup_lan_ip` are invalid CIDRs (or overlap with each other), if `dns_servers` contains invalid IP addresses, or if the configuration file cannot be read, PID 1 prints a descriptive configuration error and halts.
 
 ---
 

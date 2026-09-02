@@ -3,6 +3,7 @@ use crate::init::system::ConfigReaderOps;
 use crate::services::utils::CleanOption;
 use pnet::util::MacAddr;
 use serde::Deserialize;
+use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -29,6 +30,7 @@ pub struct RouterConfig {
     pub reboot_delay: Option<u32>, // Some(N) = N seconds, None = infinite
     pub logging: LoggingConfig,
     pub watchdog: bool,
+    pub dns_servers: Vec<Ipv4Addr>,
 }
 
 impl std::fmt::Debug for RouterConfig {
@@ -41,6 +43,7 @@ impl std::fmt::Debug for RouterConfig {
             .field("reboot_delay", &CleanOption(&self.reboot_delay))
             .field("logging", &self.logging)
             .field("watchdog", &self.watchdog)
+            .field("dns_servers", &self.dns_servers)
             .finish()
     }
 }
@@ -50,6 +53,7 @@ struct ConfigToml {
     network: NetworkSection,
     system: Option<SystemSection>,
     logging: Option<LoggingSection>,
+    dns: Option<DnsSection>,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +62,12 @@ struct NetworkSection {
     backup_lan_ip: Option<String>,
     wan_mac: String,
     lan_mac: String,
+    dns_servers: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct DnsSection {
+    servers: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +164,40 @@ fn parse_logging_config(logging: Option<&LoggingSection>) -> Result<LoggingConfi
     })
 }
 
+fn parse_dns_servers(
+    net: &NetworkSection,
+    dns: Option<&DnsSection>,
+) -> Result<Vec<Ipv4Addr>, RouterError> {
+    let raw_list = net
+        .dns_servers
+        .as_deref()
+        .or_else(|| dns.and_then(|d| d.servers.as_deref()));
+
+    let Some(raw_list) = raw_list else {
+        return Ok(Vec::new());
+    };
+
+    let mut parsed_ips = Vec::new();
+    for ip_str in raw_list {
+        let ip = Ipv4Addr::from_str(ip_str.trim()).map_err(|e| {
+            RouterError::Generic(format!(
+                "Invalid custom DNS resolver IP address '{}': {}",
+                ip_str, e
+            ))
+        })?;
+        if !crate::services::utils::is_valid_upstream_resolver(ip) {
+            return Err(RouterError::Generic(format!(
+                "Invalid custom DNS resolver '{}': cannot be loopback, broadcast, multicast, link-local, documentation, or unspecified",
+                ip_str
+            )));
+        }
+        if !parsed_ips.contains(&ip) {
+            parsed_ips.push(ip);
+        }
+    }
+    Ok(parsed_ips)
+}
+
 impl RouterConfig {
     pub fn parse<S: ConfigReaderOps>(sys: &S) -> Result<Self, RouterError> {
         let content = sys.read_config_file().map_err(|e| {
@@ -171,6 +215,7 @@ impl RouterConfig {
         })?;
 
         let (wan_mac, lan_mac) = parse_mac_addresses(&parsed.network)?;
+        let dns_servers = parse_dns_servers(&parsed.network, parsed.dns.as_ref())?;
         let lan_ip = parsed
             .network
             .lan_ip
@@ -206,6 +251,7 @@ impl RouterConfig {
             reboot_delay,
             logging,
             watchdog,
+            dns_servers,
         })
     }
 }
@@ -541,5 +587,66 @@ mod tests {
         .to_string();
         let cfg = RouterConfig::parse(&sys).unwrap();
         assert!(!cfg.watchdog);
+    }
+
+    #[test]
+    fn test_config_parsing_custom_dns_network_section() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            dns_servers = ["1.1.1.1", "1.0.0.1"]
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(
+            cfg.dns_servers,
+            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(1, 0, 0, 1),]
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_custom_dns_dedicated_section() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            [dns]
+            servers = ["8.8.8.8", "8.8.4.4"]
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(
+            cfg.dns_servers,
+            vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4),]
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_custom_dns_invalid_ip() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            dns_servers = ["not.an.ip.address"]
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_custom_dns_rejects_loopback() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            dns_servers = ["127.0.0.1"]
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
     }
 }
