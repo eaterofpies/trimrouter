@@ -20,6 +20,9 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 const DNS_HEADER_SIZE: usize = 12;
 const DEFAULT_TTL_SECS: u32 = 30;
 const MAX_TTL_SECS: u32 = 3600; // 1 hour max cache duration
+const DEFAULT_NEGATIVE_TTL_SECS: u32 = 60; // 1 minute default for NXDOMAIN/NODATA
+const MIN_NEGATIVE_TTL_SECS: u32 = 5;
+const MAX_NEGATIVE_TTL_SECS: u32 = 300; // 5 minutes max negative cache per RFC 2308
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const RECV_BUF_SIZE: usize = 4096;
 const FALLBACK_DNS_SERVER: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
@@ -284,7 +287,12 @@ fn get_cache_key(query_bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let q = &queries[0];
-    let key = format!("{}:{:?}:{:?}", q.name(), q.query_type(), q.query_class());
+    let key = format!(
+        "{}:{:?}:{:?}",
+        q.name().to_ascii().to_ascii_lowercase(),
+        q.query_type(),
+        q.query_class()
+    );
     Some(key.into_bytes())
 }
 
@@ -299,6 +307,46 @@ fn lookup_cache(cache_key: &[u8], cache: &mut HashMap<Vec<u8>, CacheEntry>) -> O
     }
 }
 
+fn calculate_cache_ttl(packet: &Message) -> Option<Duration> {
+    if packet.truncation || packet.message_type != hickory_proto::op::MessageType::Response {
+        return None;
+    }
+    match packet.response_code {
+        hickory_proto::op::ResponseCode::NoError => {
+            if !packet.answers.is_empty() {
+                let raw_ttl = packet
+                    .answers
+                    .iter()
+                    .map(|ans| ans.ttl)
+                    .min()
+                    .unwrap_or(DEFAULT_TTL_SECS);
+                if raw_ttl == 0 {
+                    return None;
+                }
+                let cache_ttl = std::cmp::min(MAX_TTL_SECS, raw_ttl);
+                Some(Duration::from_secs(cache_ttl as u64))
+            } else {
+                Some(calculate_negative_ttl(packet))
+            }
+        }
+        hickory_proto::op::ResponseCode::NXDomain => Some(calculate_negative_ttl(packet)),
+        _ => None,
+    }
+}
+
+fn calculate_negative_ttl(packet: &Message) -> Duration {
+    for record in &packet.authorities {
+        if let hickory_proto::rr::RData::SOA(soa) = &record.data {
+            let soa_ttl = record.ttl;
+            let minimum = soa.minimum;
+            let effective_ttl = std::cmp::min(soa_ttl, minimum);
+            let clamped = effective_ttl.clamp(MIN_NEGATIVE_TTL_SECS, MAX_NEGATIVE_TTL_SECS);
+            return Duration::from_secs(clamped as u64);
+        }
+    }
+    Duration::from_secs(DEFAULT_NEGATIVE_TTL_SECS as u64)
+}
+
 fn insert_cache(cache_key: Vec<u8>, response: Vec<u8>, cache: &mut HashMap<Vec<u8>, CacheEntry>) {
     if response.len() < DNS_HEADER_SIZE {
         return;
@@ -307,17 +355,10 @@ fn insert_cache(cache_key: Vec<u8>, response: Vec<u8>, cache: &mut HashMap<Vec<u
         Ok(p) => p,
         Err(_) => return,
     };
-    let raw_ttl = packet
-        .answers
-        .iter()
-        .map(|ans| ans.ttl)
-        .min()
-        .unwrap_or(DEFAULT_TTL_SECS);
-    if raw_ttl == 0 {
+    let Some(ttl_duration) = calculate_cache_ttl(&packet) else {
         return;
-    }
-    let cache_ttl = std::cmp::min(MAX_TTL_SECS, raw_ttl);
-    let expiry = Instant::now() + Duration::from_secs(cache_ttl as u64);
+    };
+    let expiry = Instant::now() + ttl_duration;
 
     if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&cache_key) {
         evict_expired_cache(cache);
@@ -396,6 +437,7 @@ mod tests {
     #[test]
     fn test_insert_cache_ttl() {
         let mut resp = vec![0u8; DNS_HEADER_SIZE];
+        resp[2] = 0x81; // QR = 1, RD = 1
         resp.extend_from_slice(&[
             6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
         ]);
@@ -500,6 +542,7 @@ mod tests {
     #[test]
     fn test_insert_cache_ttl_rfc2181_behavior() {
         let mut resp = vec![0u8; DNS_HEADER_SIZE];
+        resp[2] = 0x81; // QR = 1, RD = 1
         resp.extend_from_slice(&[
             6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
         ]);
@@ -571,5 +614,143 @@ mod tests {
 
         assert_eq!(lookup_cache(&key, &mut cache), None);
         assert!(!cache.contains_key(&key)); // Purged
+    }
+
+    #[test]
+    fn test_insert_cache_nxdomain_rfc2308_fallback_without_soa() {
+        let mut resp = vec![0u8; DNS_HEADER_SIZE];
+        resp[2] = 0x81; // QR = 1, RD = 1
+        resp[3] = 0x83; // RA = 1, RCODE = 3 (NXDomain)
+        resp[5] = 1; // QDCount = 1
+        resp.extend_from_slice(&[7, b'i', b'n', b'v', b'a', b'l', b'i', b'd', 0]);
+        resp.extend_from_slice(&[0, 1, 0, 1]); // Type A, Class IN
+
+        let mut cache = HashMap::new();
+        insert_cache(b"nxdomain_key".to_vec(), resp, &mut cache);
+
+        let entry = cache
+            .get(&b"nxdomain_key".to_vec()[..])
+            .expect("NXDomain should be cached");
+        let ttl = entry.expiry.duration_since(Instant::now()).as_secs();
+        assert!((58..=60).contains(&ttl));
+    }
+
+    #[test]
+    fn test_insert_cache_servfail_refused_not_cached() {
+        // ServFail (RCODE 2)
+        let mut resp_servfail = vec![0u8; DNS_HEADER_SIZE];
+        resp_servfail[2] = 0x81;
+        resp_servfail[3] = 0x82; // RCODE = 2
+        resp_servfail[5] = 1;
+        resp_servfail
+            .extend_from_slice(&[7, b'i', b'n', b'v', b'a', b'l', b'i', b'd', 0, 0, 1, 0, 1]);
+
+        // Refused (RCODE 5)
+        let mut resp_refused = vec![0u8; DNS_HEADER_SIZE];
+        resp_refused[2] = 0x81;
+        resp_refused[3] = 0x85; // RCODE = 5
+        resp_refused[5] = 1;
+        resp_refused
+            .extend_from_slice(&[7, b'i', b'n', b'v', b'a', b'l', b'i', b'd', 0, 0, 1, 0, 1]);
+
+        let mut cache = HashMap::new();
+        insert_cache(b"servfail_key".to_vec(), resp_servfail, &mut cache);
+        assert!(!cache.contains_key(&b"servfail_key".to_vec()[..]));
+
+        insert_cache(b"refused_key".to_vec(), resp_refused, &mut cache);
+        assert!(!cache.contains_key(&b"refused_key".to_vec()[..]));
+    }
+
+    #[test]
+    fn test_insert_cache_nxdomain_rfc2308_with_soa() {
+        use hickory_proto::rr::Name;
+        use hickory_proto::rr::Record;
+        use hickory_proto::rr::rdata::SOA;
+        use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+
+        let mut msg = Message::new(
+            1234,
+            hickory_proto::op::MessageType::Response,
+            OpCode::Query,
+        );
+        msg.metadata.response_code = hickory_proto::op::ResponseCode::NXDomain;
+
+        let soa = SOA::new(
+            Name::from_ascii("ns1.example.com.").unwrap(),
+            Name::from_ascii("hostmaster.example.com.").unwrap(),
+            1,
+            7200,
+            3600,
+            1209600,
+            45, // minimum TTL = 45s
+        );
+        let record = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            120, // SOA record TTL = 120s
+            hickory_proto::rr::RData::SOA(soa),
+        );
+        msg.add_authority(record);
+
+        let mut buf = Vec::new();
+        let mut encoder = BinEncoder::new(&mut buf);
+        msg.emit(&mut encoder).unwrap();
+
+        let mut cache = HashMap::new();
+        insert_cache(b"nxdomain_soa".to_vec(), buf, &mut cache);
+
+        let entry = cache.get(&b"nxdomain_soa".to_vec()[..]).unwrap();
+        let ttl = entry.expiry.duration_since(Instant::now()).as_secs();
+        // Min(120, 45) = 45s
+        assert!((44..=45).contains(&ttl));
+    }
+
+    #[test]
+    fn test_get_cache_key_case_insensitive() {
+        let mut query1 = vec![0u8; DNS_HEADER_SIZE];
+        query1[5] = 1; // QDCount = 1
+        query1.extend_from_slice(&[
+            6, b'G', b'o', b'O', b'g', b'L', b'e', 3, b'C', b'o', b'M', 0,
+        ]);
+        query1.extend_from_slice(&[0, 1, 0, 1]); // Type A, Class IN
+
+        let mut query2 = vec![0u8; DNS_HEADER_SIZE];
+        query2[5] = 1; // QDCount = 1
+        query2.extend_from_slice(&[
+            6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query2.extend_from_slice(&[0, 1, 0, 1]); // Type A, Class IN
+
+        assert_eq!(get_cache_key(&query1), get_cache_key(&query2));
+    }
+
+    #[test]
+    fn test_insert_cache_truncated_response_not_cached() {
+        let mut resp_tc = vec![0u8; DNS_HEADER_SIZE];
+        resp_tc[2] = 0x83; // QR = 1, TC = 1 (Truncated)
+        resp_tc[3] = 0x80;
+        resp_tc[5] = 1; // QDCount = 1
+        resp_tc[7] = 1; // ANCount = 1
+        resp_tc.extend_from_slice(&[
+            6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
+        ]);
+        resp_tc.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 8, 8, 8, 8]);
+
+        let mut cache = HashMap::new();
+        insert_cache(b"tc_key".to_vec(), resp_tc, &mut cache);
+        assert!(!cache.contains_key(&b"tc_key".to_vec()[..]));
+    }
+
+    #[test]
+    fn test_insert_cache_non_response_query_packet_not_cached() {
+        let mut query = vec![0u8; DNS_HEADER_SIZE];
+        query[2] = 0x01; // QR = 0 (Query, not response), RD = 1
+        query[5] = 1; // QDCount = 1
+        query.extend_from_slice(&[
+            6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
+        ]);
+
+        let mut cache = HashMap::new();
+        insert_cache(b"query_key".to_vec(), query, &mut cache);
+        assert!(!cache.contains_key(&b"query_key".to_vec()[..]));
     }
 }

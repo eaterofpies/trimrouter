@@ -63,10 +63,14 @@ The forwarder maintains an in-memory cache to reduce external latency and DNS tr
 
 *   **Cache Key**: Structured as `domain_name:query_type:query_class` (e.g., `google.com:A:IN`). Queries with non-standard opcodes or zero questions are rejected.
 *   **Bounded Capacity**: The cache is bounded to a maximum of 4096 entries (`MAX_CACHE_ENTRIES`). When full, the entry with the earliest expiry is evicted upon inserting a new entry.
-*   **TTL Calculation**:
-    *   Parses response packets using the `dns-parser` crate.
-    *   Finds the minimum TTL among all resource records in the answer section.
-    *   **RFC 2181 TTL Semantics**: If `TTL == 0`, the response is returned to the client and never cached. Non-zero TTLs are capped at a maximum of 3600 seconds (`MAX_TTL_SECS` / 1 hour), with a fallback of 30 seconds (`DEFAULT_TTL_SECS`) for empty answers.
+*   **TTL Calculation & Semantics**:
+    *   Parses response packets using the `hickory-proto` crate.
+    *   **Positive Answers (RFC 2181)**: Finds the minimum TTL among all resource records in the answer section. If `TTL == 0`, the response is returned to the client and never cached. Non-zero TTLs are capped at a maximum of 3600 seconds (`MAX_TTL_SECS` / 1 hour).
+    *   **Negative Caching (RFC 2308)**:
+        *   `NXDOMAIN` (Name Error) and `NODATA` (`NoError` with 0 answers) responses are cached to reduce redundant WAN traffic.
+        *   Extracts the SOA record from the Authority section and sets the negative TTL to $\min(\text{SOA.ttl}, \text{SOA.minimum})$, clamped between 5 seconds (`MIN_NEGATIVE_TTL_SECS`) and 300 seconds (`MAX_NEGATIVE_TTL_SECS`).
+        *   If no SOA record is present, defaults to 60 seconds (`DEFAULT_NEGATIVE_TTL_SECS`).
+        *   Server error responses (`SERVFAIL`, `REFUSED`, `FORMERR`, etc.) are never cached.
 *   **Cache Cleanup**: The unified event loop periodically ticks on `CLEANUP_INTERVAL` to prune expired cache entries and check pending query timeouts. Expired entries are also purged upon lookup.
 
 ---

@@ -10,6 +10,5 @@
 - IPv6 SLAAC & Router Advertisements (RAs)
 - Custom upstream DNS resolvers via trimrouter.toml / kernel cmdline
 - DNS query rate limiting / flooding protection
-- Negative DNS caching (RFC 2308)
 - DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH) upstream resolution
 - Network interface carrier & link state polling (watchdog carrier check)
