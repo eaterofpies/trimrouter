@@ -12,5 +12,4 @@
 - DNS query rate limiting / flooding protection
 - Negative DNS caching (RFC 2308)
 - DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH) upstream resolution
-- Dynamic temp / run filesystem sizing limits (tmpfs quotas)
 - Network interface carrier & link state polling (watchdog carrier check)

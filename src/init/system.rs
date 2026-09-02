@@ -63,6 +63,7 @@ impl MountOps for RealSystem {
             );
             return Ok(());
         }
+        let _ = fs::create_dir_all(target);
         nix::mount::mount(source, target, Some(fstype), flags, data)
     }
 }
@@ -99,6 +100,9 @@ impl ConfigReaderOps for RealSystem {
     }
 }
 
+pub const RUN_TMPFS_DATA: &str = "size=8M,mode=0755";
+pub const TMP_TMPFS_DATA: &str = "size=16M,mode=1777";
+
 pub fn mount_virtual_filesystems<S: MountOps>(sys: &S) -> Result<(), RouterError> {
     info!("[init] Mounting virtual filesystems...");
 
@@ -114,9 +118,31 @@ pub fn mount_virtual_filesystems<S: MountOps>(sys: &S) -> Result<(), RouterError
         .map_err(|e| RouterError::Generic(format!("Failed to mount /dev: {}", e)))?;
     info!("[init] Mounted /dev successfully.");
 
-    sys.mount(None, "/run", "tmpfs", MsFlags::empty(), None)
-        .map_err(|e| RouterError::Generic(format!("Failed to mount /run: {}", e)))?;
-    info!("[init] Mounted /run successfully.");
+    sys.mount(
+        None,
+        "/run",
+        "tmpfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some(RUN_TMPFS_DATA),
+    )
+    .map_err(|e| RouterError::Generic(format!("Failed to mount /run: {}", e)))?;
+    info!(
+        "[init] Mounted /run successfully (tmpfs quota: {}).",
+        RUN_TMPFS_DATA
+    );
+
+    sys.mount(
+        None,
+        "/tmp",
+        "tmpfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some(TMP_TMPFS_DATA),
+    )
+    .map_err(|e| RouterError::Generic(format!("Failed to mount /tmp: {}", e)))?;
+    info!(
+        "[init] Mounted /tmp successfully (tmpfs quota: {}).",
+        TMP_TMPFS_DATA
+    );
 
     // Set kernel modprobe helper path to trigger lazy loading
     if let Err(e) = fs::write("/proc/sys/kernel/modprobe", "/sbin/modprobe") {
@@ -214,7 +240,14 @@ pub mod mock {
     use super::*;
     use std::sync::Mutex;
 
-    type MountCall = (Option<String>, String, String, MsFlags);
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MountCall {
+        pub source: Option<String>,
+        pub target: String,
+        pub fstype: String,
+        pub flags: MsFlags,
+        pub data: Option<String>,
+    }
 
     pub struct MockSystem {
         pub pid: Pid,
@@ -251,14 +284,15 @@ pub mod mock {
             target: &str,
             fstype: &str,
             flags: MsFlags,
-            _data: Option<&str>,
+            data: Option<&str>,
         ) -> Result<(), nix::Error> {
-            self.mount_calls.lock().unwrap().push((
-                source.map(|s| s.to_string()),
-                target.to_string(),
-                fstype.to_string(),
+            self.mount_calls.lock().unwrap().push(MountCall {
+                source: source.map(|s| s.to_string()),
+                target: target.to_string(),
+                fstype: fstype.to_string(),
                 flags,
-            ));
+                data: data.map(|d| d.to_string()),
+            });
             Ok(())
         }
     }
@@ -318,15 +352,23 @@ mod tests {
 
         assert!(result.is_ok());
         let calls = sys.mount_calls.lock().unwrap();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0].1, "/proc");
-        assert_eq!(calls[0].2, "proc");
-        assert_eq!(calls[1].1, "/sys");
-        assert_eq!(calls[1].2, "sysfs");
-        assert_eq!(calls[2].1, "/dev");
-        assert_eq!(calls[2].2, "devtmpfs");
-        assert_eq!(calls[3].1, "/run");
-        assert_eq!(calls[3].2, "tmpfs");
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0].target, "/proc");
+        assert_eq!(calls[0].fstype, "proc");
+        assert_eq!(calls[1].target, "/sys");
+        assert_eq!(calls[1].fstype, "sysfs");
+        assert_eq!(calls[2].target, "/dev");
+        assert_eq!(calls[2].fstype, "devtmpfs");
+        assert_eq!(calls[3].target, "/run");
+        assert_eq!(calls[3].fstype, "tmpfs");
+        assert_eq!(calls[3].data.as_deref(), Some(RUN_TMPFS_DATA));
+        assert!(calls[3].flags.contains(MsFlags::MS_NOSUID));
+        assert!(calls[3].flags.contains(MsFlags::MS_NODEV));
+        assert_eq!(calls[4].target, "/tmp");
+        assert_eq!(calls[4].fstype, "tmpfs");
+        assert_eq!(calls[4].data.as_deref(), Some(TMP_TMPFS_DATA));
+        assert!(calls[4].flags.contains(MsFlags::MS_NOSUID));
+        assert!(calls[4].flags.contains(MsFlags::MS_NODEV));
     }
 
     #[test]

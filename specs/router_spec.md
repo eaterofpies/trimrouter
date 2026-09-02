@@ -36,7 +36,7 @@ Crucially, **no other files** will be present on the target filesystem other tha
 
 ### 2.1 PID 1 (Init) Responsibilities
 
-1. **Virtual Filesystem (VFS) Mounting**: Mount `/proc`, `/sys`, `/dev` (devtmpfs), and `/run` (tmpfs). Boot and log partition mounting is specified in [`partition_layout_spec.md`](partition_layout_spec.md).
+1. **Virtual Filesystem (VFS) Mounting**: Mount `/proc`, `/sys`, `/dev` (devtmpfs), `/run` (tmpfs with quota `size=8M,mode=0755`), and `/tmp` (tmpfs with quota `size=16M,mode=1777`) with `MS_NOSUID` and `MS_NODEV` security flags to prevent RAM exhaustion and privilege escalation. Boot and log partition mounting is specified in [`partition_layout_spec.md`](partition_layout_spec.md).
 2. **Signal Handling**: Traps `SIGINT`, `SIGTERM`, `SIGPWR`. On receipt, sets the shutdown flag, flushes log buffers, synchronizes all filesystems to persistent storage via `sync()`, and calls `nix::sys::reboot::reboot(RebootMode::RB_POWER_OFF)` to halt.
 3. **Orphan Reaping**: Runs a non-blocking reaping loop using `waitpid` to prevent zombie processes.
 4. **Configuration Extraction**: Reads and parses `/boot/config/trimrouter.toml`. `wan_mac` and `lan_mac` are strictly required — if either is missing or the file cannot be read, PID 1 panics (halts). See §3 for the full configuration schema.
@@ -45,6 +45,23 @@ Crucially, **no other files** will be present on the target filesystem other tha
 7. **ACPI Power Button**: Monitors `/dev/input/event0`–`event31` via the `evdev` crate with a dynamic background discovery loop for `KEY_POWER`, `KEY_POWER2`, or `KEY_SLEEP` key-down events to trigger a clean shutdown (flushing log buffers and synchronizing filesystems via `sync()` before poweroff), since no `acpid` or `systemd-logind` is present.
 8. **Local DNS Resolver Configuration**: Writes `/etc/resolv.conf` configured with `nameserver 127.0.0.1` so that standard library DNS lookups from PID 1 and local utilities resolve transparently through the embedded DNS forwarder. Failure to write `/etc/resolv.conf` is treated as a fatal initialization error (panic).
 9. **Hardware Watchdog Integration**: Discovers and opens `/dev/watchdog` if present to protect against deadlocks and hangs. An asynchronous keepalive monitor pets the watchdog periodically upon successful health checks. On clean system shutdown or reboot, it sends the magic close character (`'V'`) to disarm the hardware watchdog. See [`watchdog_spec.md`](watchdog_spec.md).
+
+### 2.1.1 Virtual Filesystems (VFS) & Runtime Memory Limits
+
+At early startup, PID 1 mounts the required pseudo-filesystems before initializing any network interfaces or services:
+
+| Target | Filesystem | Flags | Mount Options | Security & Sizing Rationale |
+| :--- | :--- | :--- | :--- | :--- |
+| `/proc` | `proc` | Default | None | Kernel process and subsystem status. |
+| `/sys` | `sysfs` | Default | None | Kernel device and driver topology. |
+| `/dev` | `devtmpfs` | Default | None | Device nodes populated dynamically by kernel driver core. |
+| `/run` | `tmpfs` | `MS_NOSUID \| MS_NODEV` | `size=8M,mode=0755` | Root-owned runtime IPC sockets, PID files, and state. Capped to 8 MiB to protect memory. |
+| `/tmp` | `tmpfs` | `MS_NOSUID \| MS_NODEV` | `size=16M,mode=1777` | Shared scratchpad with POSIX sticky bit (`mode=1777`) allowing unprivileged sandboxed workers to create temporary files while preventing cross-user file deletion. Capped to 16 MiB to prevent RAM exhaustion (OOM) attacks. |
+
+#### Security & Sizing Enforcement:
+1. **RAM Quota Bounding (`size=8M` & `size=16M`)**: Unconfigured Linux `tmpfs` mounts default to **50% of total physical RAM**. On low-memory embedded routers (128–512 MiB), unbounded mounts expose the router to Out-Of-Memory (OOM) panics if a rogue or sandboxed process fills `/tmp`. Explicit bounds restrict memory consumption to safe, deterministic ceilings.
+2. **Restricted Deletion (`mode=1777`)**: The sticky bit on `/tmp` ensures only root or the file's creator can delete or rename temporary files, preserving isolation between sandboxed workers.
+3. **Privilege Boundary (`MS_NOSUID | MS_NODEV`)**: Setuid/setgid execution and character/block device node interpretation are disallowed on all runtime tmpfs instances, eliminating local privilege escalation via binaries or device nodes planted in temporary filesystems.
 
 ### 2.2 Routing, Address & NAT Configuration
 
