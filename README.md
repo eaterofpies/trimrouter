@@ -15,7 +15,7 @@ It manages virtual filesystems, signal forwarding, orphan reaping, and launches 
 
 ## Key Features
 
-- **Init Process (PID 1)**: Mounts virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`), reaps orphaned processes, handles termination signals, and monitors ACPI power button events to gracefully power down the virtual machine.
+- **Init Process (PID 1)**: Mounts virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`), reaps orphaned processes, handles termination signals, integrates with hardware watchdog timers (`/dev/watchdog`) with asynchronous health checks, and monitors ACPI power button events to gracefully power down the virtual machine.
 - **Kernel Module Autoloading**: Bundles a built-in `modprobe` emulator; listens for `NETLINK_KOBJECT_UEVENT` broadcasts and automatically loads required kernel modules at startup and on device hotplug, with no external `modprobe` binary required.
 - **Dynamic Interface Lifecycle**: Monitors Linux kernel Netlink multicast link events to hotplug interfaces, rename them dynamically by MAC, configure IP addresses, and orchestrate service lifecycles.
 - **Kernel-Space NAT & Routing**: Interacts directly with the Linux kernel using Netlink sockets (`NETLINK_ROUTE` and `NETLINK_NETFILTER`) to manage interface states, IP assignments, default routes, and Source NAT (Masquerading).
@@ -72,6 +72,8 @@ level = "info"
 [system]
 # Optional reboot delay in seconds on panic (defaults to infinite hang if omitted)
 # reboot_delay = 10
+# Optional hardware watchdog supervision (/dev/watchdog) (default: true)
+# watchdog = true
 ```
 
 ### Testing

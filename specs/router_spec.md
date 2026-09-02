@@ -44,6 +44,7 @@ Crucially, **no other files** will be present on the target filesystem other tha
 6. **Panic Handling**: Registers a custom panic hook via `std::panic::set_hook`. On panic, logs the traceback to stdout and hangs indefinitely (to avoid an unclean kernel panic) rather than exiting.
 7. **ACPI Power Button**: Monitors `/dev/input/event0`–`event31` via the `evdev` crate with a dynamic background discovery loop for `KEY_POWER`, `KEY_POWER2`, or `KEY_SLEEP` key-down events to trigger a clean shutdown, since no `acpid` or `systemd-logind` is present.
 8. **Local DNS Resolver Configuration**: Writes `/etc/resolv.conf` configured with `nameserver 127.0.0.1` so that standard library DNS lookups from PID 1 and local utilities resolve transparently through the embedded DNS forwarder. Failure to write `/etc/resolv.conf` is treated as a fatal initialization error (panic).
+9. **Hardware Watchdog Integration**: Discovers and opens `/dev/watchdog` if present to protect against deadlocks and hangs. An asynchronous keepalive monitor pets the watchdog periodically upon successful health checks. On clean system shutdown or reboot, it sends the magic close character (`'V'`) to disarm the hardware watchdog. See [`watchdog_spec.md`](watchdog_spec.md).
 
 ### 2.2 Routing, Address & NAT Configuration
 
@@ -86,6 +87,7 @@ Creates an IPv4 table named `trimrouter` containing two chains:
 | DNS Forwarder | [`dns_forwarder_spec.md`](dns_forwarder_spec.md) |
 | NTP Client (SNTP) | [`sntp_client_spec.md`](sntp_client_spec.md) |
 | Interface Lifecycle | [`interface_di_spec.md`](interface_di_spec.md) |
+| Hardware Watchdog | [`watchdog_spec.md`](watchdog_spec.md) |
 
 ### 2.4 Privilege Separation
 
@@ -110,6 +112,7 @@ backup_lan_ip = "10.0.0.1/24"   # Optional — defaults to "10.0.0.1/24"
 
 [system]
 reboot_delay = 10               # Optional — seconds before reboot on panic (omit for infinite hang)
+watchdog = true                 # Optional — enable /dev/watchdog hardware supervisor (default: true)
 ```
 
 If `wan_mac` or `lan_mac` is missing, invalid (e.g. zero, broadcast, multicast, or identical MACs), if `lan_ip`/`backup_lan_ip` are invalid CIDRs (or overlap with each other), or if the configuration file cannot be read, PID 1 prints a descriptive configuration error and halts.

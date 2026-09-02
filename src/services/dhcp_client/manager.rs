@@ -1,4 +1,6 @@
 use super::worker::DhcpError;
+use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
+use crate::services::DHCP_CLIENT_SERVICE_NAME;
 use crate::services::ipc::{DhcpClientToParentMsg, async_unix_stream, recv_msg};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{
@@ -16,6 +18,7 @@ pub struct DhcpClient {
     pub(super) wan_interface: String,
     pub(super) lease_tx: WanLeaseSender,
     state: ExternalWorker,
+    heartbeat_tx: Option<HeartbeatSender>,
 }
 
 impl DhcpClient {
@@ -23,7 +26,21 @@ impl DhcpClient {
         Self {
             wan_interface,
             lease_tx,
-            state: ExternalWorker::new("dhcp-client"),
+            state: ExternalWorker::new(DHCP_CLIENT_SERVICE_NAME),
+            heartbeat_tx: None,
+        }
+    }
+
+    pub fn with_heartbeat(
+        wan_interface: String,
+        lease_tx: WanLeaseSender,
+        heartbeat_tx: HeartbeatSender,
+    ) -> Self {
+        Self {
+            wan_interface,
+            lease_tx,
+            state: ExternalWorker::new(DHCP_CLIENT_SERVICE_NAME),
+            heartbeat_tx: Some(heartbeat_tx),
         }
     }
 
@@ -85,6 +102,7 @@ fn start_parent_supervisor_task(
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
+    heartbeat_tx: Option<HeartbeatSender>,
 ) -> Result<JoinHandle<()>, ServiceError> {
     let parent_ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
 
@@ -93,6 +111,7 @@ fn start_parent_supervisor_task(
         child_pid,
         wan_interface,
         lease_tx,
+        heartbeat_tx,
     ));
 
     Ok(handle)
@@ -103,6 +122,7 @@ async fn run_parent_dhcp_monitor(
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
+    heartbeat_tx: Option<HeartbeatSender>,
 ) {
     info!(
         "[dhcp-client-parent] Supervising DHCP client worker (PID {})",
@@ -116,6 +136,7 @@ async fn run_parent_dhcp_monitor(
                 gateway,
                 dns_servers,
             })) => {
+                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::DhcpClient);
                 let mask = prefix_len_to_mask(prefix_len);
                 apply_parent_lease(
                     &lease_tx,
@@ -127,7 +148,11 @@ async fn run_parent_dhcp_monitor(
                 )
                 .await;
             }
+            Ok(Some(DhcpClientToParentMsg::Heartbeat)) => {
+                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::DhcpClient);
+            }
             Ok(Some(DhcpClientToParentMsg::ClearWanLease)) => {
+                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::DhcpClient);
                 clear_parent_lease(&lease_tx, &wan_interface).await;
             }
             Ok(None) => {
@@ -164,6 +189,7 @@ impl Service for DhcpClient {
         let wan_interface = self.wan_interface.clone();
         let wan_interface_setup = wan_interface.clone();
         let lease_tx = self.lease_tx.clone();
+        let heartbeat_tx = self.heartbeat_tx.clone();
 
         self.state.start_supervised(
             move || setup_dhcp_client_attempt(&wan_interface_setup),
@@ -173,6 +199,7 @@ impl Service for DhcpClient {
                     child_pid,
                     wan_interface.clone(),
                     lease_tx.clone(),
+                    heartbeat_tx.clone(),
                 )
             },
         )

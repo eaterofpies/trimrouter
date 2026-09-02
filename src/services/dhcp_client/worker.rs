@@ -1,4 +1,5 @@
 use crate::packet::build_raw_packet;
+use crate::services::DHCP_CLIENT_SERVICE_NAME;
 use crate::services::ipc::{DhcpClientToParentMsg, send_msg};
 use crate::services::utils::{
     CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, get_interface_mac,
@@ -11,13 +12,16 @@ use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
+use std::time::{Duration, Instant};
 use tokio::net::unix::OwnedReadHalf;
+use tokio::time::sleep;
 
 const DEFAULT_LEASE_SECS: u32 = 3600;
 const MAX_RETRY_DELAY_SECS: u32 = 64;
 const INITIAL_RETRY_DELAY_SECS: u32 = 4;
 const DEFAULT_SUBNET_MASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 const SOCKET_RESTART_DELAY_SECS: u64 = 5;
+const BOUND_HEARTBEAT_INTERVAL_SECS: u64 = 3;
 
 #[derive(Debug)]
 pub enum DhcpError {
@@ -198,15 +202,24 @@ impl DhcpClientInternal {
                 info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
                 false
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => true,
+            _ = sleep(Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => true,
         }
     }
 
-    async fn discover_phase(&self) -> Result<(u32, DhcpOffer), DhcpError> {
+    async fn send_heartbeat(&mut self) {
+        if let Some(ref mut writer) = self.ipc_writer
+            && let Err(e) = send_msg(writer, &DhcpClientToParentMsg::Heartbeat).await
+        {
+            debug!("[dhcp-client] Failed to send heartbeat to parent: {}", e);
+        }
+    }
+
+    async fn discover_phase(&mut self) -> Result<(u32, DhcpOffer), DhcpError> {
         let xid = rand::random::<u32>();
         let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
 
         loop {
+            self.send_heartbeat().await;
             self.send_discover(xid).await;
             let timeout = get_jittered_duration(retry_delay_secs);
 
@@ -239,10 +252,11 @@ fn handle_ack_result(ack_res: ParseAckResult) -> Option<Result<DhcpAck, DhcpErro
 }
 
 impl DhcpClientInternal {
-    async fn request_phase(&self, xid: u32, offer: DhcpOffer) -> Result<DhcpAck, DhcpError> {
+    async fn request_phase(&mut self, xid: u32, offer: DhcpOffer) -> Result<DhcpAck, DhcpError> {
         let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
 
         loop {
+            self.send_heartbeat().await;
             self.send_request(
                 xid,
                 offer.offered_ip,
@@ -268,7 +282,7 @@ impl DhcpClientInternal {
     async fn bound_phase(&mut self, mut ack: DhcpAck) -> Result<(), DhcpError> {
         self.apply_lease_config(ack.ip, ack.mask, ack.gateway, &ack.dns_servers)
             .await?;
-        let mut bound_at = std::time::Instant::now();
+        let mut bound_at = Instant::now();
 
         loop {
             let elapsed = bound_at.elapsed().as_secs() as u32;
@@ -281,8 +295,12 @@ impl DhcpClientInternal {
             // T1 Renewal time is lease_secs / 2
             let t1_secs = ack.lease_secs / 2;
             if elapsed < t1_secs {
-                let sleep_duration = std::time::Duration::from_secs((t1_secs - elapsed) as u64);
-                tokio::time::sleep(sleep_duration).await;
+                self.send_heartbeat().await;
+                let sleep_duration = Duration::from_secs(std::cmp::min(
+                    BOUND_HEARTBEAT_INTERVAL_SECS,
+                    (t1_secs - elapsed) as u64,
+                ));
+                sleep(sleep_duration).await;
                 continue;
             }
 
@@ -298,7 +316,7 @@ impl DhcpClientInternal {
                     ack = new_ack;
                     self.apply_lease_config(ack.ip, ack.mask, ack.gateway, &ack.dns_servers)
                         .await?;
-                    bound_at = std::time::Instant::now();
+                    bound_at = Instant::now();
                 }
                 Err(e) => {
                     self.deconfigure().await;
@@ -309,17 +327,18 @@ impl DhcpClientInternal {
     }
 
     async fn renew_lease(
-        &self,
+        &mut self,
         ip: Ipv4Addr,
         t2_secs: u32,
         lease_secs: u32,
         server_ip: Option<Ipv4Addr>,
-        bound_at: std::time::Instant,
+        bound_at: Instant,
     ) -> Result<DhcpAck, DhcpError> {
         let renew_xid = rand::random::<u32>();
-        let mut renew_sent: Option<std::time::Instant> = None;
+        let mut renew_sent: Option<Instant> = None;
 
         loop {
+            self.send_heartbeat().await;
             let current_elapsed = bound_at.elapsed().as_secs() as u32;
             if current_elapsed >= lease_secs {
                 return Err(DhcpError::Protocol(
@@ -342,10 +361,10 @@ impl DhcpClientInternal {
                     debug!("[dhcp-client] RENEWING: sending unicast DHCPREQUEST to server...");
                 }
                 self.send_request(renew_xid, ip, None, ip, dest_ip).await;
-                renew_sent = Some(std::time::Instant::now());
+                renew_sent = Some(Instant::now());
             }
 
-            let listen_timeout = std::time::Duration::from_secs(retry_interval as u64);
+            let listen_timeout = Duration::from_secs(retry_interval as u64);
             if let Some(ack_res) = self.wait_for_ack(renew_xid, listen_timeout).await? {
                 match ack_res {
                     ParseAckResult::Ack(new_ack) => {
@@ -443,7 +462,12 @@ impl DhcpClientInternal {
     async fn deconfigure(&mut self) {
         if let Some(ref mut writer) = self.ipc_writer {
             let msg = DhcpClientToParentMsg::ClearWanLease;
-            let _ = send_msg(writer, &msg).await;
+            if let Err(e) = send_msg(writer, &msg).await {
+                debug!(
+                    "[dhcp-client] Failed to send ClearWanLease to parent: {}",
+                    e
+                );
+            }
         }
     }
 
@@ -543,7 +567,7 @@ pub async fn run_dhcp_client_worker(
     let client_socket = DhcpClientSocket::from_raw_socket(socket, mac);
 
     run_sandboxed_worker(
-        "dhcp-client",
+        DHCP_CLIENT_SERVICE_NAME,
         DHCP_CLIENT_UID,
         DHCP_CLIENT_GID,
         ipc_fd,

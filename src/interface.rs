@@ -5,6 +5,7 @@
 //! and orchestrates starting/stopping dependent network services when links appear or disappear.
 
 use crate::error::RouterError;
+use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::network;
 use crate::services::{self, Service};
 use futures_util::{StreamExt, TryStreamExt};
@@ -15,6 +16,10 @@ use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
 use rtnetlink::{LinkUnspec, MulticastGroup};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+use tokio::time::sleep;
+
+const INTERFACE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Dynamic Router Service wrapper for execution management.
 pub enum RouterService {
@@ -172,7 +177,12 @@ async fn activate_startup_interfaces(
     }
 }
 
-pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
+pub async fn monitor_interfaces(
+    mut interfaces: Vec<ManagedInterface>,
+    heartbeat_tx: Option<HeartbeatSender>,
+) {
+    send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::InterfaceMonitor);
+
     let (connection, handle, mut messages) =
         match rtnetlink::new_multicast_connection(&[MulticastGroup::Link]) {
             Ok(res) => res,
@@ -190,20 +200,29 @@ pub async fn monitor_interfaces(mut interfaces: Vec<ManagedInterface>) {
 
     activate_startup_interfaces(&mut interfaces, &mut detected_indices).await;
 
-    while let Some((message, _addr)) = messages.next().await {
-        if let NetlinkPayload::InnerMessage(rtnl_msg) = message.payload {
-            let res = process_netlink_message(
-                rtnl_msg,
-                &mut interfaces,
-                &mut detected_indices,
-                &mut link_states,
-            )
-            .await;
-            if let Err(e) = res {
-                panic!(
-                    "CRITICAL: Interface monitoring or configuration failure: {}",
-                    e
-                );
+    loop {
+        tokio::select! {
+            _ = sleep(INTERFACE_HEARTBEAT_INTERVAL) => {
+                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::InterfaceMonitor);
+            }
+            msg = messages.next() => {
+                let Some((message, _addr)) = msg else { break; };
+                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::InterfaceMonitor);
+                if let NetlinkPayload::InnerMessage(rtnl_msg) = message.payload {
+                    let res = process_netlink_message(
+                        rtnl_msg,
+                        &mut interfaces,
+                        &mut detected_indices,
+                        &mut link_states,
+                    )
+                    .await;
+                    if let Err(e) = res {
+                        panic!(
+                            "CRITICAL: Interface monitoring or configuration failure: {}",
+                            e
+                        );
+                    }
+                }
             }
         }
     }

@@ -82,3 +82,9 @@ This skill provides code style and design standards for writing and modifying Ru
 ## 15. Full Version Number Pinning in `Cargo.toml`
 * **Always Pin Full Version Numbers**: All dependencies and build-dependencies in `Cargo.toml` must always specify full three-component semantic version numbers (`major.minor.patch`, e.g., `version = "1.53.1"`, `version = "0.4.34"`, `version = "10.0.3"`).
 * **No Partial Version Strings**: Never use truncated or partial versions such as `"1.53"`, `"0.4"`, or `"10"`. Full version numbers ensure deterministic dependency resolution and transparent auditing across builds.
+
+## 16. No Duplicate String Literals (Named Constants for Strings)
+* **Eliminate Repeated String Literals**: Do not scatter raw repeated string literals across functions, modules, or services (e.g., service identifiers like `"dns-forwarder"`, `"lan-manager"`, `"dhcp-client"`, `"dhcp-server"`, `"interface-monitor"`, sysfs paths, or configuration tags).
+* **Declare Module or Crate-Level `const`**: Declare reusable strings as `pub const` at the module level or in a centralized definitions module (e.g., `crate::services` or `crate::network`), or use strongly typed symbolic representations (enums).
+* **Consistency and Typo Prevention**: Using named constants ensures compile-time typo detection, simplifies audits, and guarantees single-point updates across supervisory, logging, IPC, and watchdog boundaries.
+

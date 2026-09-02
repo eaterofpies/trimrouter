@@ -36,11 +36,21 @@ pub enum DnsParentToWorkerMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum DnsWorkerToParentMsg {
+    Heartbeat,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DhcpServerParentToWorkerMsg {
     AddNeighbor {
         ip_address: Ipv4Addr,
         mac_address: [u8; 6],
     },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum DhcpServerWorkerToParentMsg {
+    Heartbeat,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -52,6 +62,7 @@ pub enum DhcpClientToParentMsg {
         dns_servers: Vec<Ipv4Addr>,
     },
     ClearWanLease,
+    Heartbeat,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -183,6 +194,25 @@ mod tests {
         send_msg(&mut w1, &resolved_msg).await.unwrap();
         let received: SntpParentToClientMsg = recv_msg(&mut r2).await.unwrap().unwrap();
         assert_eq!(received, resolved_msg);
+
+        // 8. Heartbeat messages
+        send_msg(&mut w2, &DnsWorkerToParentMsg::Heartbeat)
+            .await
+            .unwrap();
+        let received: DnsWorkerToParentMsg = recv_msg(&mut r1).await.unwrap().unwrap();
+        assert_eq!(received, DnsWorkerToParentMsg::Heartbeat);
+
+        send_msg(&mut w2, &DhcpServerWorkerToParentMsg::Heartbeat)
+            .await
+            .unwrap();
+        let received: DhcpServerWorkerToParentMsg = recv_msg(&mut r1).await.unwrap().unwrap();
+        assert_eq!(received, DhcpServerWorkerToParentMsg::Heartbeat);
+
+        send_msg(&mut w2, &DhcpClientToParentMsg::Heartbeat)
+            .await
+            .unwrap();
+        let received: DhcpClientToParentMsg = recv_msg(&mut r1).await.unwrap().unwrap();
+        assert_eq!(received, DhcpClientToParentMsg::Heartbeat);
     }
 
     #[tokio::test]

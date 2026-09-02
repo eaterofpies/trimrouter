@@ -17,6 +17,8 @@ pub const DHCP_CLIENT_SERVICE_NAME: &str = "dhcp-client";
 pub const DHCP_SERVER_SERVICE_NAME: &str = "dhcp-server";
 pub const DNS_FORWARDER_SERVICE_NAME: &str = "dns-forwarder";
 pub const SNTP_CLIENT_SERVICE_NAME: &str = "sntp-client";
+pub const LAN_MANAGER_SERVICE_NAME: &str = "lan-manager";
+pub const INTERFACE_MONITOR_SERVICE_NAME: &str = "interface-monitor";
 
 #[derive(Debug)]
 pub enum ServiceError {

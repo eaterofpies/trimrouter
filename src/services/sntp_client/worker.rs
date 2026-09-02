@@ -1,3 +1,4 @@
+use crate::services::SNTP_CLIENT_SERVICE_NAME;
 use crate::services::ipc::{SntpClientToParentMsg, SntpParentToClientMsg, recv_msg, send_msg};
 use crate::services::utils::{
     NTP_PORT, SNTP_GID, SNTP_UID, is_valid_ntp_server_ip, run_sandboxed_worker,
@@ -53,7 +54,7 @@ pub async fn run_sntp_client_worker(
     let ntp_socket = crate::services::utils::async_udp_socket(ntp_socket_fd)?;
 
     run_sandboxed_worker(
-        "sntp-client",
+        SNTP_CLIENT_SERVICE_NAME,
         SNTP_UID,
         SNTP_GID,
         ipc_fd,

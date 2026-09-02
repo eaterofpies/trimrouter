@@ -1,5 +1,8 @@
 use crate::packet::build_raw_packet;
-use crate::services::ipc::{DhcpServerParentToWorkerMsg, recv_msg};
+use crate::services::DHCP_SERVER_SERVICE_NAME;
+use crate::services::ipc::{
+    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, recv_msg, send_msg,
+};
 use crate::services::utils::{
     DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload, read_raw_packet,
     run_sandboxed_worker, send_raw_packet,
@@ -14,7 +17,8 @@ use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
-use tokio::net::unix::OwnedReadHalf;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::time::interval;
 
 use super::lease_table::{LeaseHandle, spawn_lease_actor};
 
@@ -22,6 +26,7 @@ const LAN_LEASE_SECS: u32 = 3600;
 const ARP_RESOLUTION_DELAY: Duration = Duration::from_millis(100);
 const DISCARD_PORT: u16 = 9;
 const CONFLICT_HOLD_DURATION: Duration = Duration::from_secs(300);
+const SERVER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 // =========================================================================
 // DHCP Server (LAN)
@@ -58,12 +63,11 @@ pub async fn run_dhcp_server_worker(
     let async_sock = AsyncFd::new(raw_socket_fd)?;
 
     run_sandboxed_worker(
-        "dhcp-server",
+        DHCP_SERVER_SERVICE_NAME,
         DHCP_SERVER_UID,
         DHCP_SERVER_GID,
         ipc_fd,
         |ipc| async move {
-            let _keep_writer = ipc.writer;
             let leases = spawn_lease_actor();
 
             let config = Arc::new(ServerConfig {
@@ -74,7 +78,8 @@ pub async fn run_dhcp_server_worker(
             });
 
             let async_sock_shared = Arc::new(async_sock);
-            let _ = run_server_loop(async_sock_shared, config, leases, ipc.reader).await;
+            let _ =
+                run_server_loop(async_sock_shared, config, leases, ipc.reader, ipc.writer).await;
             Ok(())
         },
     )
@@ -86,10 +91,18 @@ async fn run_server_loop(
     config: Arc<ServerConfig>,
     leases: LeaseHandle,
     mut ipc_reader: OwnedReadHalf,
+    mut ipc_writer: OwnedWriteHalf,
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 2048];
+    let mut heartbeat_timer = interval(SERVER_HEARTBEAT_INTERVAL);
+
     loop {
         tokio::select! {
+            _ = heartbeat_timer.tick() => {
+                if let Err(e) = send_msg(&mut ipc_writer, &DhcpServerWorkerToParentMsg::Heartbeat).await {
+                    debug!("[dhcp-server-worker] Failed to send heartbeat to parent: {}", e);
+                }
+            }
             ipc_msg = recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut ipc_reader) => {
                 match ipc_msg {
                     Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {

@@ -4,6 +4,7 @@ pub mod power;
 pub mod reaper;
 pub mod storage;
 pub mod system;
+pub mod watchdog;
 
 use crate::config::RouterConfig;
 use crate::interface;
@@ -23,18 +24,30 @@ use system::{
     ProcessOps, RealSystem, mount_virtual_filesystems, register_panic_handler, setup_resolv_conf,
 };
 use tokio::task::JoinHandle;
+use watchdog::{
+    HEARTBEAT_CHANNEL_CAPACITY, HeartbeatReceiver, HeartbeatSender, MonitoredService,
+    init_and_spawn_watchdog,
+};
 
 pub async fn run_as_init(sys: Arc<RealSystem>) {
     let config = early_boot(sys.clone());
 
+    let (heartbeat_tx, heartbeat_rx) = tokio::sync::mpsc::channel(HEARTBEAT_CHANNEL_CAPACITY);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let sig_handle = start_system_services(sys.clone(), shutdown_flag.clone());
+    let sig_handle = start_system_services(
+        sys.clone(),
+        shutdown_flag.clone(),
+        config.watchdog,
+        heartbeat_rx,
+    );
 
     let mut dns_forwarder =
-        configure_networking_and_services(sys, config, shutdown_flag.clone()).await;
+        configure_networking_and_services(sys, config, heartbeat_tx, shutdown_flag.clone()).await;
 
     // Keep the main thread alive waiting for the signal handler to finish
-    let _ = sig_handle.await;
+    if let Err(e) = sig_handle.await {
+        error!("[init] Signal handler task encountered an error: {}", e);
+    }
 
     info!("[init] Stopping services...");
     if let Err(e) = dns_forwarder.stop().await {
@@ -167,7 +180,12 @@ fn load_and_apply_config(sys: &RealSystem) -> RouterConfig {
     config
 }
 
-fn start_system_services(sys: Arc<RealSystem>, shutdown_flag: Arc<AtomicBool>) -> JoinHandle<()> {
+fn start_system_services(
+    sys: Arc<RealSystem>,
+    shutdown_flag: Arc<AtomicBool>,
+    watchdog_enabled: bool,
+    heartbeat_rx: HeartbeatReceiver,
+) -> JoinHandle<()> {
     // Spawn orphan process reaper
     let reaper_sys = sys.clone();
     let reaper_shutdown = shutdown_flag.clone();
@@ -182,6 +200,15 @@ fn start_system_services(sys: Arc<RealSystem>, shutdown_flag: Arc<AtomicBool>) -
         power::start_power_button_monitor(power_sys, power_shutdown).await;
     });
 
+    // Spawn hardware watchdog supervisor
+    let expected_services = MonitoredService::ALL.to_vec();
+    init_and_spawn_watchdog(
+        watchdog_enabled,
+        heartbeat_rx,
+        expected_services,
+        shutdown_flag.clone(),
+    );
+
     // Spawn system signal monitor
     let sig_sys = sys.clone();
     let sig_shutdown = shutdown_flag;
@@ -193,19 +220,25 @@ fn start_system_services(sys: Arc<RealSystem>, shutdown_flag: Arc<AtomicBool>) -
 async fn configure_networking_and_services(
     sys: Arc<RealSystem>,
     config: RouterConfig,
+    heartbeat_tx: HeartbeatSender,
     _shutdown_flag: Arc<AtomicBool>,
 ) -> services::DnsForwarder {
     setup_loopback_and_firewall(sys.as_ref()).await;
 
     let (lease_tx, lease_rx) = tokio::sync::watch::channel(services::WanLease::default());
 
-    let mut dns_forwarder = services::DnsForwarder::new(lease_rx.clone());
+    let mut dns_forwarder =
+        services::DnsForwarder::with_heartbeat(lease_rx.clone(), heartbeat_tx.clone());
     if let Err(e) = dns_forwarder.start().await {
         error!("[init] Failed to start DNS forwarder: {}", e);
     }
 
-    let managed_ifaces = build_managed_interfaces(&config, lease_tx, lease_rx);
-    tokio::spawn(interface::monitor_interfaces(managed_ifaces));
+    let managed_ifaces =
+        build_managed_interfaces(&config, lease_tx, lease_rx, heartbeat_tx.clone());
+    tokio::spawn(interface::monitor_interfaces(
+        managed_ifaces,
+        Some(heartbeat_tx),
+    ));
 
     info!("[init] System startup completed successfully. Entering main event loop.");
 
@@ -229,11 +262,13 @@ fn build_managed_interfaces(
     config: &RouterConfig,
     lease_tx: services::WanLeaseSender,
     lease_rx: services::WanLeaseReceiver,
+    heartbeat_tx: HeartbeatSender,
 ) -> Vec<interface::ManagedInterface> {
     let wan_services = vec![
-        interface::RouterService::DhcpClient(services::DhcpClient::new(
+        interface::RouterService::DhcpClient(services::DhcpClient::with_heartbeat(
             network::WAN_INTERFACE.to_string(),
             lease_tx,
+            heartbeat_tx.clone(),
         )),
         interface::RouterService::SntpClient(services::SntpClient::new(lease_rx.clone())),
     ];
@@ -244,11 +279,12 @@ fn build_managed_interfaces(
     );
 
     let lan_services = vec![interface::RouterService::LanManager(
-        services::LanManager::new(
+        services::LanManager::with_heartbeat(
             network::LAN_INTERFACE.to_string(),
             config.lan_ip.clone(),
             config.backup_lan_ip.clone(),
             lease_rx,
+            heartbeat_tx,
         ),
     )];
     let lan_iface = interface::ManagedInterface::new(

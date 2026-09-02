@@ -1,17 +1,18 @@
-use crate::services::ipc::{DnsParentToWorkerMsg, recv_msg};
+use crate::services::DNS_FORWARDER_SERVICE_NAME;
+use crate::services::ipc::{DnsParentToWorkerMsg, DnsWorkerToParentMsg, recv_msg, send_msg};
 use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_udp_socket, run_sandboxed_worker,
 };
 use hickory_proto::op::{Message, OpCode};
 use hickory_proto::serialize::binary::BinDecodable;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::io::Error as IoError;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::OwnedFd;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::net::unix::OwnedReadHalf;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 // =========================================================================
 // DNS Constants & Config
@@ -51,13 +52,12 @@ pub async fn run_dns_forwarder_worker(
     let upstream_socket = async_udp_socket(upstream_socket_fd)?;
 
     run_sandboxed_worker(
-        "dns-forwarder",
+        DNS_FORWARDER_SERVICE_NAME,
         DNS_FORWARDER_UID,
         DNS_FORWARDER_GID,
         ipc_fd,
         |ipc| async move {
-            let _ipc_writer = ipc.writer;
-            run_forwarder_loop(dns_socket, upstream_socket, ipc.reader).await;
+            run_forwarder_loop(dns_socket, upstream_socket, ipc.reader, ipc.writer).await;
             Ok(())
         },
     )
@@ -68,6 +68,7 @@ async fn run_forwarder_loop(
     dns_socket: UdpSocket,
     upstream_socket: UdpSocket,
     mut ipc_reader: OwnedReadHalf,
+    mut ipc_writer: OwnedWriteHalf,
 ) {
     let mut cache = HashMap::<Vec<u8>, CacheEntry>::new();
     let mut pending_queries = HashMap::<u16, PendingQuery>::new();
@@ -79,6 +80,9 @@ async fn run_forwarder_loop(
     loop {
         tokio::select! {
             _ = cleanup_timer.tick() => {
+                if let Err(e) = send_msg(&mut ipc_writer, &DnsWorkerToParentMsg::Heartbeat).await {
+                    debug!("[dns-forwarder-worker] Failed to send heartbeat to parent: {}", e);
+                }
                 evict_expired_cache(&mut cache);
                 check_pending_timeouts(&mut pending_queries, &upstream_socket).await;
             }

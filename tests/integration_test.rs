@@ -486,6 +486,15 @@ async fn startup_stage() -> TestEnv {
         ]);
     }
 
+    if test_arch == "x86_64" {
+        args.extend([
+            "-device".to_string(),
+            "i6300esb".to_string(),
+            "-watchdog-action".to_string(),
+            "none".to_string(),
+        ]);
+    }
+
     args.extend(
         [
             "-drive",

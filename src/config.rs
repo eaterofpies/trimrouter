@@ -1,5 +1,6 @@
 use crate::error::RouterError;
 use crate::init::system::ConfigReaderOps;
+use crate::services::utils::CleanOption;
 use pnet::util::MacAddr;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -27,6 +28,7 @@ pub struct RouterConfig {
     pub lan_mac: MacAddr,
     pub reboot_delay: Option<u32>, // Some(N) = N seconds, None = infinite
     pub logging: LoggingConfig,
+    pub watchdog: bool,
 }
 
 impl std::fmt::Debug for RouterConfig {
@@ -36,11 +38,9 @@ impl std::fmt::Debug for RouterConfig {
             .field("backup_lan_ip", &self.backup_lan_ip)
             .field("wan_mac", &self.wan_mac)
             .field("lan_mac", &self.lan_mac)
-            .field(
-                "reboot_delay",
-                &crate::services::utils::CleanOption(&self.reboot_delay),
-            )
+            .field("reboot_delay", &CleanOption(&self.reboot_delay))
             .field("logging", &self.logging)
+            .field("watchdog", &self.watchdog)
             .finish()
     }
 }
@@ -63,6 +63,7 @@ struct NetworkSection {
 #[derive(Deserialize)]
 struct SystemSection {
     reboot_delay: Option<u32>,
+    watchdog: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -189,8 +190,13 @@ impl RouterConfig {
             )));
         }
 
-        let reboot_delay = parsed.system.and_then(|s| s.reboot_delay);
+        let reboot_delay = parsed.system.as_ref().and_then(|s| s.reboot_delay);
         let logging = parse_logging_config(parsed.logging.as_ref())?;
+        let watchdog = parsed
+            .system
+            .as_ref()
+            .and_then(|s| s.watchdog)
+            .unwrap_or(true);
 
         Ok(RouterConfig {
             lan_ip,
@@ -199,6 +205,7 @@ impl RouterConfig {
             lan_mac,
             reboot_delay,
             logging,
+            watchdog,
         })
     }
 }
@@ -506,5 +513,33 @@ mod tests {
         "#
         .to_string();
         assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_watchdog_default() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert!(cfg.watchdog);
+    }
+
+    #[test]
+    fn test_config_parsing_watchdog_disabled() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            [system]
+            watchdog = false
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert!(!cfg.watchdog);
     }
 }

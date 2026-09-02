@@ -1,3 +1,4 @@
+use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::network;
 use crate::services::supervisor::ServiceController;
 use crate::services::utils::{WanLeaseReceiver, mask_to_prefix_len};
@@ -8,7 +9,11 @@ use log::{debug, error, info, warn};
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
+use std::time::Duration;
 use tokio::sync::watch::Receiver;
+use tokio::time::sleep;
+
+const LAN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 pub struct LanManager {
     lan_interface: String,
@@ -16,6 +21,7 @@ pub struct LanManager {
     backup_ip: String,
     lease_rx: WanLeaseReceiver,
     controller: ServiceController,
+    heartbeat_tx: Option<HeartbeatSender>,
 }
 
 impl LanManager {
@@ -31,6 +37,24 @@ impl LanManager {
             backup_ip,
             lease_rx,
             controller: ServiceController::new(),
+            heartbeat_tx: None,
+        }
+    }
+
+    pub fn with_heartbeat(
+        lan_interface: String,
+        initial_ip: String,
+        backup_ip: String,
+        lease_rx: WanLeaseReceiver,
+        heartbeat_tx: HeartbeatSender,
+    ) -> Self {
+        Self {
+            lan_interface,
+            initial_ip,
+            backup_ip,
+            lease_rx,
+            controller: ServiceController::new(),
+            heartbeat_tx: Some(heartbeat_tx),
         }
     }
 }
@@ -41,9 +65,18 @@ impl Service for LanManager {
         let initial_ip = self.initial_ip.clone();
         let backup_ip = self.backup_ip.clone();
         let lease_rx = self.lease_rx.clone();
+        let heartbeat_tx = self.heartbeat_tx.clone();
 
         self.controller.start(|shutdown_rx| async move {
-            run_lan_manager_loop(lan_interface, initial_ip, backup_ip, lease_rx, shutdown_rx).await;
+            run_lan_manager_loop(
+                lan_interface,
+                initial_ip,
+                backup_ip,
+                lease_rx,
+                shutdown_rx,
+                heartbeat_tx,
+            )
+            .await;
         })
     }
 
@@ -58,7 +91,9 @@ async fn run_lan_manager_loop(
     backup_ip: String,
     mut lease_rx: WanLeaseReceiver,
     mut shutdown_rx: Receiver<bool>,
+    heartbeat_tx: Option<HeartbeatSender>,
 ) {
+    send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::LanManager);
     info!(
         "[lan-manager] Starting LAN manager service on {}...",
         lan_interface
@@ -70,7 +105,12 @@ async fn run_lan_manager_loop(
         return;
     }
 
-    let mut dhcp_server = DhcpServer::new(lan_interface.clone(), current_ip.clone());
+    let mut dhcp_server = match &heartbeat_tx {
+        Some(tx) => {
+            DhcpServer::with_heartbeat(lan_interface.clone(), current_ip.clone(), tx.clone())
+        }
+        None => DhcpServer::new(lan_interface.clone(), current_ip.clone()),
+    };
     if let Err(e) = dhcp_server.start().await {
         error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
         return;
@@ -105,12 +145,17 @@ async fn run_lan_manager_loop(
     .await;
 
     loop {
+        send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::LanManager);
         tokio::select! {
             _ = shutdown_rx.changed() => break,
+            _ = sleep(LAN_HEARTBEAT_INTERVAL) => {
+                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::LanManager);
+            }
             res = lease_rx.changed() => {
                 if res.is_err() {
                     break;
                 }
+                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::LanManager);
                 check_and_resolve(
                     &lan_interface,
                     &mut current_ip,
