@@ -1,4 +1,4 @@
-# Interface Dependency Injection & Lifecycle Specification
+# Specification: Network Interface Lifecycle & Dependency Injection
 
 This specification details the architecture for unifying WAN and LAN interface lifecycles. Instead of separate event loops, watchdogs, and hardcoded service initializations, both interfaces will be managed by a common runtime component that dynamically spawns, monitors, and deletes relevant service containers depending on interface presence.
 
@@ -8,9 +8,9 @@ This specification details the architecture for unifying WAN and LAN interface l
 ---
 ## 1. Architectural Overview
 
-The network interface lifecycle management system employs an event-driven architecture utilizing the Linux kernel Netlink subsystem. Rather than relying on a polling watchdog, the system runs a single global Netlink monitoring task that establishes a Netlink socket subscribed to the `RTNLGRP_LINK` multicast group. The task remains suspended until the kernel broadcasts a link state event (`RTM_NEWLINK` or `RTM_DELLINK`), which it then routes to the respective managed interface event handler.
+The network interface lifecycle management system employs an event-driven architecture utilizing the Linux kernel Netlink subsystem combined with periodic hardware carrier polling. A single global Netlink monitoring task establishes a socket subscribed to the `RTNLGRP_LINK` multicast group, routing kernel link broadcasts (`RTM_NEWLINK` or `RTM_DELLINK`) to the respective interface event handler. In addition, the interface monitor periodically polls physical carrier state (`/sys/class/net/<ifname>/carrier`) on every watchdog heartbeat interval to ensure link state synchronization even if kernel Netlink broadcasts are delayed or dropped.
 
-This design eliminates periodic polling wakeups, triggering state machine transitions and service dependency injections only upon physical hardware insertion, removal, or link state changes:
+This design combines instantaneous event-driven response with periodic hardware watchdog verification:
 
 ```text
                      +---------------------------------------+

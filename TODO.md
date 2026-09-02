@@ -11,4 +11,3 @@
 - Custom upstream DNS resolvers via trimrouter.toml / kernel cmdline
 - DNS query rate limiting / flooding protection
 - DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH) upstream resolution
-- Network interface carrier & link state polling (watchdog carrier check)

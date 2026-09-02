@@ -103,7 +103,7 @@ Creates an IPv4 table named `trimrouter` containing two chains:
 | DHCP Server (LAN) | [`dhcp_server_spec.md`](dhcp_server_spec.md) |
 | DNS Forwarder | [`dns_forwarder_spec.md`](dns_forwarder_spec.md) |
 | NTP Client (SNTP) | [`sntp_client_spec.md`](sntp_client_spec.md) |
-| Interface Lifecycle | [`interface_di_spec.md`](interface_di_spec.md) |
+| Interface Lifecycle | [`interface_spec.md`](interface_spec.md) |
 | Hardware Watchdog | [`watchdog_spec.md`](watchdog_spec.md) |
 
 ### 2.4 Privilege Separation

@@ -64,7 +64,7 @@ The watchdog monitor gates keepalive petting on timely heartbeats from core subs
 | **`dns-forwarder`** | Child forwarder worker actively processing DNS queries and emitting IPC heartbeats; parent relays ticks to watchdog. |
 | **`lan-manager`** | LAN interface manager active; coordinates LAN IP configuration and DHCP server worker heartbeats. |
 | **`dhcp-client`** | WAN raw-socket listener and child DHCP client worker actively ticking state machine and emitting IPC heartbeats. |
-| **`interface-monitor`** | Netlink link multicast listener and carrier management loop active. |
+| **`interface-monitor`** | Netlink link multicast listener and periodic hardware carrier polling loop active. |
 
 ### 2.2 Non-Critical Auxiliary Services
 

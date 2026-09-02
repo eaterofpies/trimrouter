@@ -99,23 +99,118 @@ impl ManagedInterface {
     }
 }
 
-fn get_link_speed(iface_name: &str) -> String {
-    let path = format!("/sys/class/net/{}/speed", iface_name);
-    std::fs::read_to_string(path)
+fn read_sysfs_net_attr(iface_name: &str, attr: &str) -> Option<String> {
+    let path = format!("/sys/class/net/{}/{}", iface_name, attr);
+    std::fs::read_to_string(path).ok()
+}
+
+fn parse_link_speed_str(content: &str) -> String {
+    content
+        .trim()
+        .parse::<u32>()
         .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|&mbps| mbps > 0)
         .map(|mbps| format!("{} Mbps", mbps))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn get_link_speed(iface_name: &str) -> String {
+    read_sysfs_net_attr(iface_name, "speed")
+        .map(|s| parse_link_speed_str(&s))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn parse_carrier_file_content(content: &str) -> Option<bool> {
+    match content.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_operstate_str(content: &str) -> Option<bool> {
+    match content.trim() {
+        "up" => Some(true),
+        "down" | "lowerlayerdown" | "dormant" => Some(false),
+        _ => None,
+    }
+}
+
+fn get_interface_carrier(iface_name: &str) -> Option<bool> {
+    if let Some(content) = read_sysfs_net_attr(iface_name, "carrier")
+        && let Some(carrier) = parse_carrier_file_content(&content)
+    {
+        return Some(carrier);
+    }
+    read_sysfs_net_attr(iface_name, "operstate").and_then(|s| parse_operstate_str(&s))
+}
+
+fn poll_interface_carrier_states(
+    interfaces: &[ManagedInterface],
+    link_states: &mut HashMap<u32, (String, MacAddr, bool)>,
+) {
+    poll_interface_carrier_states_with_reader(interfaces, link_states, get_interface_carrier);
+}
+
+fn poll_interface_carrier_states_with_reader<F>(
+    interfaces: &[ManagedInterface],
+    link_states: &mut HashMap<u32, (String, MacAddr, bool)>,
+    carrier_reader: F,
+) where
+    F: Fn(&str) -> Option<bool>,
+{
+    for iface in interfaces {
+        let Some(index) = iface.active_index else {
+            continue;
+        };
+        let Some(carrier) = carrier_reader(&iface.name) else {
+            continue;
+        };
+        update_carrier_state(index, &iface.name, iface.mac, carrier, link_states);
+    }
+}
+
+fn log_carrier_transition(name: &str, mac: MacAddr, carrier: bool) {
+    if carrier {
+        let speed = get_link_speed(name);
+        info!(
+            "[interface] Interface {} (MAC: {}) got link (speed: {})",
+            name, mac, speed
+        );
+    } else {
+        warn!("[interface] Interface {} (MAC: {}) lost link", name, mac);
+    }
+}
+
+fn update_carrier_state(
+    index: u32,
+    name: &str,
+    mac: MacAddr,
+    carrier: bool,
+    link_states: &mut HashMap<u32, (String, MacAddr, bool)>,
+) {
+    match link_states.get_mut(&index) {
+        Some(state) => {
+            if state.2 == carrier {
+                return;
+            }
+            state.2 = carrier;
+            log_carrier_transition(name, mac, carrier);
+        }
+        None => {
+            link_states.insert(index, (name.to_string(), mac, carrier));
+            if carrier {
+                log_carrier_transition(name, mac, carrier);
+            }
+        }
+    }
 }
 
 fn if_indextoname(index: u32) -> Option<String> {
     std::fs::read_dir("/sys/class/net").ok()?.find_map(|entry| {
         let entry = entry.ok()?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let ifindex_path = format!("/sys/class/net/{}/ifindex", name);
-        let ifindex = std::fs::read_to_string(ifindex_path)
-            .ok()?
+        let ifindex = read_sysfs_net_attr(&name, "ifindex")?
             .trim()
             .parse::<u32>()
             .ok()?;
@@ -142,15 +237,7 @@ async fn initial_link_scan(handle: &rtnetlink::Handle) -> HashMap<u32, (String, 
             }
 
             let has_link = link_msg.header.flags.contains(LinkFlags::LowerUp);
-            link_states.insert(index, (n.clone(), addr, has_link));
-
-            if has_link {
-                let speed = get_link_speed(&n);
-                info!(
-                    "[interface] Interface {} (MAC: {}) got link (speed: {})",
-                    n, addr, speed
-                );
-            }
+            update_carrier_state(index, &n, addr, has_link, &mut link_states);
         }
     }
     link_states
@@ -204,6 +291,7 @@ pub async fn monitor_interfaces(
         tokio::select! {
             _ = sleep(INTERFACE_HEARTBEAT_INTERVAL) => {
                 send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::InterfaceMonitor);
+                poll_interface_carrier_states(&interfaces, &mut link_states);
             }
             msg = messages.next() => {
                 let Some((message, _addr)) = msg else { break; };
@@ -300,19 +388,7 @@ async fn handle_new_link_event(
     }
 
     let has_link = link_msg.header.flags.contains(LinkFlags::LowerUp);
-    let prev_link = link_states.get(&index).map(|s| s.2);
-    if prev_link != Some(has_link) {
-        if has_link {
-            let speed = get_link_speed(&n);
-            info!(
-                "[interface] Interface {} (MAC: {}) got link (speed: {})",
-                n, addr, speed
-            );
-        } else {
-            warn!("[interface] Interface {} (MAC: {}) lost link", n, addr);
-        }
-        link_states.insert(index, (n.clone(), addr, has_link));
-    }
+    update_carrier_state(index, &n, addr, has_link, link_states);
 
     // 1. Dedup and log detection of any new physical/USB interface
     if detected_indices.insert(index) {
@@ -405,12 +481,15 @@ async fn handle_del_link(iface: &mut ManagedInterface, index: u32) {
     }
 }
 
+fn create_rtnetlink_handle() -> Result<rtnetlink::Handle, RouterError> {
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
+    Ok(handle)
+}
+
 /// Finds the kernel interface index and current name matching the target MAC address.
 pub async fn find_interface_by_mac(target_mac: MacAddr) -> Option<(u32, String)> {
-    let Ok((connection, handle, _)) = rtnetlink::new_connection() else {
-        return None;
-    };
-    tokio::spawn(connection);
+    let handle = create_rtnetlink_handle().ok()?;
 
     let mut links = handle.link().get().execute();
     while let Ok(Some(link)) = links.try_next().await {
@@ -451,8 +530,7 @@ pub async fn rename_and_up_interface(
 
 /// Utility function to rename an interface by kernel index via netlink.
 async fn rename_interface_by_index(index: u32, new_name: &str) -> Result<(), RouterError> {
-    let (connection, handle, _) = rtnetlink::new_connection()?;
-    tokio::spawn(connection);
+    let handle = create_rtnetlink_handle()?;
 
     let msg_down = LinkUnspec::new_with_index(index).down().build();
     handle.link().change(msg_down).execute().await?;
@@ -466,4 +544,106 @@ async fn rename_interface_by_index(index: u32, new_name: &str) -> Result<(), Rou
     handle.link().change(msg_up).execute().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_carrier_file_content() {
+        assert_eq!(parse_carrier_file_content("1\n"), Some(true));
+        assert_eq!(parse_carrier_file_content("1"), Some(true));
+        assert_eq!(parse_carrier_file_content("0\n"), Some(false));
+        assert_eq!(parse_carrier_file_content("0"), Some(false));
+        assert_eq!(parse_carrier_file_content("invalid"), None);
+        assert_eq!(parse_carrier_file_content(""), None);
+    }
+
+    #[test]
+    fn test_parse_link_speed_str() {
+        assert_eq!(parse_link_speed_str("1000\n"), "1000 Mbps");
+        assert_eq!(parse_link_speed_str("100"), "100 Mbps");
+        assert_eq!(parse_link_speed_str("0"), "unknown");
+        assert_eq!(parse_link_speed_str("-1"), "unknown");
+        assert_eq!(parse_link_speed_str("invalid"), "unknown");
+    }
+
+    #[test]
+    fn test_update_carrier_state_transitions() {
+        let mut link_states = HashMap::new();
+        let mac = MacAddr::new(0x02, 0x00, 0x00, 0x00, 0x00, 0x01);
+
+        // Initial insertion with carrier = true
+        update_carrier_state(10, "eth0", mac, true, &mut link_states);
+        assert_eq!(link_states.get(&10), Some(&("eth0".to_string(), mac, true)));
+
+        // No transition (carrier = true again) -> remains true
+        update_carrier_state(10, "eth0", mac, true, &mut link_states);
+        assert_eq!(link_states.get(&10), Some(&("eth0".to_string(), mac, true)));
+
+        // Transition to carrier = false
+        update_carrier_state(10, "eth0", mac, false, &mut link_states);
+        assert_eq!(
+            link_states.get(&10),
+            Some(&("eth0".to_string(), mac, false))
+        );
+
+        // Transition back to carrier = true
+        update_carrier_state(10, "eth0", mac, true, &mut link_states);
+        assert_eq!(link_states.get(&10), Some(&("eth0".to_string(), mac, true)));
+    }
+
+    #[test]
+    fn test_parse_operstate_str() {
+        assert_eq!(parse_operstate_str("up\n"), Some(true));
+        assert_eq!(parse_operstate_str("up"), Some(true));
+        assert_eq!(parse_operstate_str("down\n"), Some(false));
+        assert_eq!(parse_operstate_str("lowerlayerdown"), Some(false));
+        assert_eq!(parse_operstate_str("dormant"), Some(false));
+        assert_eq!(parse_operstate_str("unknown"), None);
+        assert_eq!(parse_operstate_str(""), None);
+    }
+
+    #[test]
+    fn test_poll_interface_carrier_states_mock_reader() {
+        let mac = MacAddr::new(0x02, 0x00, 0x00, 0x00, 0x00, 0x01);
+        let mut iface = ManagedInterface::new("wan".to_string(), mac, vec![]);
+        iface.active_index = Some(5);
+        let interfaces = vec![iface];
+
+        let mut link_states = HashMap::new();
+        link_states.insert(5, ("wan".to_string(), mac, true));
+
+        // Poll with reader reporting carrier down (false)
+        poll_interface_carrier_states_with_reader(&interfaces, &mut link_states, |_| Some(false));
+        assert_eq!(link_states.get(&5), Some(&("wan".to_string(), mac, false)));
+
+        // Poll with reader reporting carrier restored (true)
+        poll_interface_carrier_states_with_reader(&interfaces, &mut link_states, |_| Some(true));
+        assert_eq!(link_states.get(&5), Some(&("wan".to_string(), mac, true)));
+
+        // Poll with reader reporting None (driver error/missing) -> state unchanged
+        poll_interface_carrier_states_with_reader(&interfaces, &mut link_states, |_| None);
+        assert_eq!(link_states.get(&5), Some(&("wan".to_string(), mac, true)));
+    }
+
+    #[test]
+    fn test_parse_link_attributes() {
+        let attributes = vec![
+            LinkAttribute::IfName("wan".to_string()),
+            LinkAttribute::Address(vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+        ];
+        let (name, mac) = parse_link_attributes(attributes);
+        assert_eq!(name, Some("wan".to_string()));
+        assert_eq!(mac, Some(MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)));
+    }
+
+    #[test]
+    fn test_read_sysfs_net_attr_nonexistent() {
+        assert_eq!(
+            read_sysfs_net_attr("non_existent_device_12345", "speed"),
+            None
+        );
+    }
 }
