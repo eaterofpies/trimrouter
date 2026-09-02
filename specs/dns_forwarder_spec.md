@@ -75,7 +75,35 @@ The forwarder maintains an in-memory cache to reduce external latency and DNS tr
 
 ---
 
-## 4. Limitations
+## 4. Local Split-Horizon LAN Hostname Resolution
+
+To allow LAN devices to discover and address each other using human-readable names without external DNS dependency, the DNS Forwarder implements local split-horizon resolution:
+
+### 4.1 Local Domain & Host Registration
+*   **Designated Local Domain**: `.lan` (e.g., `printer.lan`, `router.lan`).
+*   **Dynamic IPC Registration**: Receives dynamic host registrations (`AddLocalHost { name, ip }` and `RemoveLocalHost { name }`) from the parent supervisor as LAN DHCP leases are allocated or released.
+*   **Router Gateway Hostname**: Automatically registers the router's own LAN gateway IP under `router` and `router.lan`.
+
+### 4.2 Query Interception & Authoritative Response
+Before forwarding a query upstream or checking the cache, the forwarder inspects the question `QNAME` and `QTYPE`:
+1.  **Forward Lookups (`A` & Other Types)**:
+    *   **Single-Label & Local Domain `A` Queries**: If the query is for `<name>` or `<name>.lan`, and `<name>` matches a registered local host, the forwarder synthesizes an authoritative `A` record response returning the registered LAN IP.
+    *   **Dual-Stack Non-`A` Queries (`AAAA`, `HTTPS`, etc.)**: If a query is for a registered local host but requests a non-`A` record type (such as `AAAA`), the forwarder returns an authoritative `NoError` response with an empty answer section (`NODATA` per RFC 4074 / RFC 2308), allowing dual-stack clients to immediately proceed to IPv4 without leaking queries upstream.
+    *   **Non-Existent `.lan` Names**: If a query ends with `.lan` but does not match any registered local host, the forwarder immediately returns an authoritative `NXDOMAIN` for all query types without forwarding the request upstream to public DNS resolvers.
+2.  **Reverse Lookups (`PTR` Records)**:
+    *   If a reverse DNS query (`*.in-addr.arpa`) corresponds to an active local host IP in the LAN subnet (or the gateway IP), the forwarder returns an authoritative `PTR` record mapping the IP back to `<hostname>.lan`.
+3.  **Authoritative Answer Flags & TTL**:
+    *   Local responses are returned with the `AA` (Authoritative Answer) bit set.
+    *   Local records are served with a fixed short TTL of 60 seconds (`LOCAL_DNS_TTL_SECS`).
+4.  **Security & Public TLD Isolation**:
+    *   Queries for public domains (e.g., `example.com`, `google.com`, `apple.com`) are **never** intercepted by local DHCP hostnames and are strictly resolved via upstream DNS servers.
+5.  **Multicast DNS (`.local`) Query Isolation (RFC 6762)**:
+    *   Queries for `*.local` received on standard unicast DNS port 53 are **never forwarded upstream to WAN resolvers** (preventing internal LAN query leaks and redundant WAN traffic).
+    *   The forwarder immediately returns an authoritative `NXDOMAIN` on port 53, allowing mDNS-capable clients to resolve peer-to-peer over UDP port 5353.
+
+---
+
+## 5. Limitations
 
 *   **UDP Only**: The DNS forwarder supports only UDP DNS queries. TCP DNS queries (such as large zones or DNSSEC fallbacks) are not supported.
 *   **Upstream Timeout**: Upstream queries time out after 3 seconds (`UPSTREAM_TIMEOUT`), at which point the pending query entry is evicted to prevent memory growth.

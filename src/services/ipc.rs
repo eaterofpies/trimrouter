@@ -30,9 +30,20 @@ impl IpcEndpoint {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum LocalHostEvent {
+    Register { name: String, ip: Ipv4Addr },
+    Deregister { name: String },
+}
+
+pub type LocalHostSender = tokio::sync::mpsc::Sender<LocalHostEvent>;
+pub type LocalHostReceiver = tokio::sync::mpsc::Receiver<LocalHostEvent>;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DnsParentToWorkerMsg {
     SetUpstreamResolvers { servers: Vec<Ipv4Addr> },
+    RegisterLocalHost { name: String, ip: Ipv4Addr },
+    DeregisterLocalHost { name: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -51,6 +62,8 @@ pub enum DhcpServerParentToWorkerMsg {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DhcpServerWorkerToParentMsg {
     Heartbeat,
+    RegisterLocalHost { name: String, ip: Ipv4Addr },
+    DeregisterLocalHost { name: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

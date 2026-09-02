@@ -42,6 +42,11 @@ pub const DNS_FORWARDER_GID: u32 = 10004;
 pub const DNS_PORT: u16 = 53;
 pub const NTP_PORT: u16 = 123;
 
+// Local LAN domain, mDNS, and gateway host constants
+pub const LOCAL_DOMAIN: &str = "lan";
+pub const MDNS_DOMAIN: &str = "local";
+pub const ROUTER_HOSTNAME: &str = "router";
+
 // =========================================================================
 // Shared WAN Lease Info
 // =========================================================================

@@ -226,15 +226,32 @@ async fn configure_networking_and_services(
     setup_loopback_and_firewall(sys.as_ref()).await;
 
     let (lease_tx, lease_rx) = tokio::sync::watch::channel(services::WanLease::default());
+    let (local_hosts_tx, local_hosts_rx) =
+        tokio::sync::mpsc::channel::<services::LocalHostEvent>(64);
 
-    let mut dns_forwarder =
-        services::DnsForwarder::with_heartbeat(lease_rx.clone(), heartbeat_tx.clone());
+    if let Ok(lan_net) = config.lan_ip.parse::<ipnet::Ipv4Net>() {
+        let _ = local_hosts_tx.try_send(services::LocalHostEvent::Register {
+            name: services::utils::ROUTER_HOSTNAME.to_string(),
+            ip: lan_net.addr(),
+        });
+    }
+
+    let mut dns_forwarder = services::DnsForwarder::with_local_hosts(
+        lease_rx.clone(),
+        Some(heartbeat_tx.clone()),
+        Some(local_hosts_rx),
+    );
     if let Err(e) = dns_forwarder.start().await {
         error!("[init] Failed to start DNS forwarder: {}", e);
     }
 
-    let managed_ifaces =
-        build_managed_interfaces(&config, lease_tx, lease_rx, heartbeat_tx.clone());
+    let managed_ifaces = build_managed_interfaces(
+        &config,
+        lease_tx,
+        lease_rx,
+        heartbeat_tx.clone(),
+        local_hosts_tx,
+    );
     tokio::spawn(interface::monitor_interfaces(
         managed_ifaces,
         Some(heartbeat_tx),
@@ -263,6 +280,7 @@ fn build_managed_interfaces(
     lease_tx: services::WanLeaseSender,
     lease_rx: services::WanLeaseReceiver,
     heartbeat_tx: HeartbeatSender,
+    local_hosts_tx: services::LocalHostSender,
 ) -> Vec<interface::ManagedInterface> {
     let wan_services = vec![
         interface::RouterService::DhcpClient(services::DhcpClient::with_heartbeat(
@@ -279,12 +297,13 @@ fn build_managed_interfaces(
     );
 
     let lan_services = vec![interface::RouterService::LanManager(
-        services::LanManager::with_heartbeat(
+        services::LanManager::with_local_hosts(
             network::LAN_INTERFACE.to_string(),
             config.lan_ip.clone(),
             config.backup_lan_ip.clone(),
             lease_rx,
-            heartbeat_tx,
+            Some(heartbeat_tx),
+            Some(local_hosts_tx),
         ),
     )];
     let lan_iface = interface::ManagedInterface::new(

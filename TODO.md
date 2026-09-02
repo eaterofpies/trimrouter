@@ -5,7 +5,6 @@
 - Add some basic observability and metrics
 - Panic doesn't stop routing / other services. Should it?
 - Static DHCP lease reservations via trimrouter.toml
-- Local LAN DNS / DHCP hostname resolution (split-horizon)
 - Inbound port forwarding (DNAT rules in trimrouter.toml)
 - IPv6 SLAAC & Router Advertisements (RAs)
 - Custom upstream DNS resolvers via trimrouter.toml / kernel cmdline

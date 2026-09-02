@@ -1,5 +1,6 @@
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::network;
+use crate::services::ipc::LocalHostSender;
 use crate::services::supervisor::ServiceController;
 use crate::services::utils::{WanLeaseReceiver, mask_to_prefix_len};
 use crate::services::{DhcpServer, Service, ServiceError};
@@ -22,6 +23,7 @@ pub struct LanManager {
     lease_rx: WanLeaseReceiver,
     controller: ServiceController,
     heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts_tx: Option<LocalHostSender>,
 }
 
 impl LanManager {
@@ -38,6 +40,7 @@ impl LanManager {
             lease_rx,
             controller: ServiceController::new(),
             heartbeat_tx: None,
+            local_hosts_tx: None,
         }
     }
 
@@ -55,6 +58,26 @@ impl LanManager {
             lease_rx,
             controller: ServiceController::new(),
             heartbeat_tx: Some(heartbeat_tx),
+            local_hosts_tx: None,
+        }
+    }
+
+    pub fn with_local_hosts(
+        lan_interface: String,
+        initial_ip: String,
+        backup_ip: String,
+        lease_rx: WanLeaseReceiver,
+        heartbeat_tx: Option<HeartbeatSender>,
+        local_hosts_tx: Option<LocalHostSender>,
+    ) -> Self {
+        Self {
+            lan_interface,
+            initial_ip,
+            backup_ip,
+            lease_rx,
+            controller: ServiceController::new(),
+            heartbeat_tx,
+            local_hosts_tx,
         }
     }
 }
@@ -66,6 +89,7 @@ impl Service for LanManager {
         let backup_ip = self.backup_ip.clone();
         let lease_rx = self.lease_rx.clone();
         let heartbeat_tx = self.heartbeat_tx.clone();
+        let local_hosts_tx = self.local_hosts_tx.clone();
 
         self.controller.start(|shutdown_rx| async move {
             run_lan_manager_loop(
@@ -75,6 +99,7 @@ impl Service for LanManager {
                 lease_rx,
                 shutdown_rx,
                 heartbeat_tx,
+                local_hosts_tx,
             )
             .await;
         })
@@ -92,6 +117,7 @@ async fn run_lan_manager_loop(
     mut lease_rx: WanLeaseReceiver,
     mut shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts_tx: Option<LocalHostSender>,
 ) {
     send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::LanManager);
     info!(
@@ -105,12 +131,12 @@ async fn run_lan_manager_loop(
         return;
     }
 
-    let mut dhcp_server = match &heartbeat_tx {
-        Some(tx) => {
-            DhcpServer::with_heartbeat(lan_interface.clone(), current_ip.clone(), tx.clone())
-        }
-        None => DhcpServer::new(lan_interface.clone(), current_ip.clone()),
-    };
+    let mut dhcp_server = DhcpServer::with_local_hosts(
+        lan_interface.clone(),
+        current_ip.clone(),
+        heartbeat_tx.clone(),
+        local_hosts_tx.clone(),
+    );
     if let Err(e) = dhcp_server.start().await {
         error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
         return;
@@ -141,6 +167,8 @@ async fn run_lan_manager_loop(
         &backup_ip,
         &lease_rx,
         &mut dhcp_server,
+        heartbeat_tx.clone(),
+        local_hosts_tx.clone(),
     )
     .await;
 
@@ -162,6 +190,8 @@ async fn run_lan_manager_loop(
                     &backup_ip,
                     &lease_rx,
                     &mut dhcp_server,
+                    heartbeat_tx.clone(),
+                    local_hosts_tx.clone(),
                 )
                 .await;
             }
@@ -173,6 +203,8 @@ async fn run_lan_manager_loop(
                         &backup_ip,
                         &lease_rx,
                         &mut dhcp_server,
+                        heartbeat_tx.clone(),
+                        local_hosts_tx.clone(),
                     )
                     .await;
                 }
@@ -204,6 +236,8 @@ async fn shift_lan_subnet(
     current_ip: &mut String,
     new_ip: String,
     dhcp_server: &mut DhcpServer,
+    heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts_tx: Option<LocalHostSender>,
 ) {
     info!("[lan-manager] Stopping LAN DHCP server...");
     if let Err(e) = dhcp_server.stop().await {
@@ -233,8 +267,22 @@ async fn shift_lan_subnet(
 
     *current_ip = new_ip.clone();
 
+    if let Some(ref tx) = local_hosts_tx
+        && let Ok(new_net) = new_ip.parse::<Ipv4Net>()
+    {
+        let _ = tx.try_send(crate::services::LocalHostEvent::Register {
+            name: crate::services::utils::ROUTER_HOSTNAME.to_string(),
+            ip: new_net.addr(),
+        });
+    }
+
     info!("[lan-manager] Restarting LAN DHCP server on new subnet...");
-    *dhcp_server = DhcpServer::new(lan_interface.to_string(), current_ip.clone());
+    *dhcp_server = DhcpServer::with_local_hosts(
+        lan_interface.to_string(),
+        current_ip.clone(),
+        heartbeat_tx,
+        local_hosts_tx,
+    );
     if let Err(e) = dhcp_server.start().await {
         error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
     }
@@ -260,6 +308,8 @@ async fn check_and_resolve(
     backup_ip: &str,
     lease_rx: &WanLeaseReceiver,
     dhcp_server: &mut DhcpServer,
+    heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts_tx: Option<LocalHostSender>,
 ) {
     let wan_opt = {
         let lease = lease_rx.borrow();
@@ -273,50 +323,50 @@ async fn check_and_resolve(
     let Ok(wan_prefix) = mask_to_prefix_len(wan_mask) else {
         return;
     };
+
     if !is_valid_subnet_prefix(wan_prefix) {
         return;
     }
+
     let Ok(wan_net) = Ipv4Net::new(wan_ip, wan_prefix) else {
         return;
     };
-    let Ok(lan_net) = current_ip.parse::<Ipv4Net>() else {
-        return;
-    };
-    let Ok(backup_net) = backup_ip.parse::<Ipv4Net>() else {
-        error!(
-            "[lan-manager] Invalid backup IP configuration: {}",
-            backup_ip
-        );
+
+    let Ok(current_net) = current_ip.parse::<Ipv4Net>() else {
         return;
     };
 
-    if is_subnet_overlap(&wan_net, &lan_net) {
-        warn!(
-            "[lan-manager] CONFLICT DETECTED: WAN subnet ({}) overlaps with LAN subnet ({}).",
-            wan_net, lan_net
-        );
-
-        if *current_ip == backup_ip {
-            // Already on backup subnet, can't shift further
-            return;
-        }
-
-        if is_subnet_overlap(&wan_net, &backup_net) {
-            warn!(
-                "[lan-manager] WARNING: Backup LAN subnet ({}) also conflicts with WAN subnet ({}). Cannot migrate.",
-                backup_net, wan_net
-            );
-            return;
-        }
-
-        shift_lan_subnet(
-            lan_interface,
-            current_ip,
-            backup_ip.to_string(),
-            dhcp_server,
-        )
-        .await;
+    if !is_subnet_overlap(&wan_net, &current_net) {
+        return;
     }
+
+    warn!(
+        "[lan-manager] CONFLICT DETECTED: WAN subnet ({}) overlaps with LAN subnet ({}).",
+        wan_net, current_net
+    );
+
+    let Ok(backup_net) = backup_ip.parse::<Ipv4Net>() else {
+        error!("[lan-manager] Invalid backup IP format: {}", backup_ip);
+        return;
+    };
+
+    if is_subnet_overlap(&wan_net, &backup_net) {
+        error!(
+            "[lan-manager] ERROR: Backup subnet ({}) also conflicts with WAN ({}).",
+            backup_net, wan_net
+        );
+        return;
+    }
+
+    shift_lan_subnet(
+        lan_interface,
+        current_ip,
+        backup_ip.to_string(),
+        dhcp_server,
+        heartbeat_tx,
+        local_hosts_tx,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -364,6 +414,8 @@ mod tests {
             backup_ip,
             &lease_rx,
             &mut dhcp_server,
+            None,
+            None,
         )
         .await;
 
@@ -389,6 +441,8 @@ mod tests {
             backup_ip,
             &lease_rx,
             &mut dhcp_server,
+            None,
+            None,
         )
         .await;
 
@@ -414,6 +468,8 @@ mod tests {
             backup_ip,
             &lease_rx,
             &mut dhcp_server,
+            None,
+            None,
         )
         .await;
 
@@ -467,6 +523,8 @@ mod tests {
             backup_ip,
             &lease_rx,
             &mut dhcp_server,
+            None,
+            None,
         )
         .await;
 
@@ -492,6 +550,8 @@ mod tests {
             backup_ip,
             &lease_rx,
             &mut dhcp_server,
+            None,
+            None,
         )
         .await;
 
@@ -517,6 +577,8 @@ mod tests {
             backup_ip,
             &lease_rx,
             &mut dhcp_server,
+            None,
+            None,
         )
         .await;
 
@@ -542,6 +604,8 @@ mod tests {
             backup_ip,
             &lease_rx,
             &mut dhcp_server,
+            None,
+            None,
         )
         .await;
 

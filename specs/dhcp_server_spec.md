@@ -70,7 +70,40 @@ Every successful `DHCPOFFER` and `DHCPACK` includes the following configuration 
 
 ---
 
-## 5. LAN Manager Service & Dynamic Subnet Reconfiguration
+## 5. Dynamic Hostname Registration (Option 12) & Collision Handling
+
+When clients negotiate an IP lease, they may provide their local hostname via DHCP Option 12 (`Host Name`, RFC 2132 Section 3.14):
+
+### 5.1 Hostname Extraction & Validation (First-Label Extraction & DNS Hijack Prevention)
+To accommodate operating systems that send fully qualified domain names (FQDNs), `.local`, or dotted strings (e.g. `server01.lab.internal`, `printer.local`, `laptop.lan`) while preventing DNS hijacking of external domains:
+1.  **First-Label Extraction**:
+    *   If Option 12 contains dots (`.`), the server extracts the first label (the substring preceding the first dot).
+    *   *Examples*: `printer.local` $\rightarrow$ `printer`, `server01.lab.internal` $\rightarrow$ `server01`, `laptop.lan` $\rightarrow$ `laptop`.
+2.  **Single-Label RFC 1123 Validation**:
+    *   The extracted label must consist exclusively of ASCII alphanumeric characters (`a-z`, `A-Z`, `0-9`) and hyphens (`-`).
+    *   Length must be between 1 and 63 characters.
+    *   Must not start or end with a hyphen.
+    *   Hostnames are normalized to lowercase.
+3.  **Strict Local Domain Qualification**:
+    *   The validated label is registered exclusively in the local `.lan` zone (`<label>` and `<label>.lan`).
+    *   External domains (such as `.com`, `.org`, `.internal`) and `.local` (reserved for peer-to-peer mDNS per RFC 6762) are **never** registered in unicast DNS.
+    *   If the extracted label fails RFC 1123 validation, the client is still granted its IP lease normally, but hostname registration for DNS is skipped.
+
+### 5.2 Hostname Collision Resolution (RFC 4703)
+When multiple devices on the LAN request the same hostname (e.g., two devices requesting `laptop`):
+1.  **First-Come, First-Served**:
+    *   The first device (by MAC address) to register an active lease claims the hostname (e.g., `laptop` / `laptop.lan`).
+2.  **Conflict Handling (No Synthetic Mutated Names)**:
+    *   If a second device with a different MAC address requests a lease with the same hostname while the primary lease is active, the server grants the IP lease normally per RFC 2131 / RFC 2132, but **skips DNS hostname registration** (`None`) for the second device per RFC 4703. No synthetic or mutated hostnames (such as MAC suffixes) are generated.
+3.  **Same-MAC Renewal & Hostname Change**:
+    *   If an existing client renews with the same hostname, its lease is refreshed without triggering a collision.
+    *   If an existing client renews with a changed hostname or without a hostname, the server automatically emits a deregistration event for its previous hostname to remove stale DNS records before registering the new one.
+4.  **Lease Expiration & Deletion**:
+    *   When a lease expires or is released, its hostname mapping is evicted, and an IPC deregistration event is sent to the DNS Forwarder. If another device requests or renews the hostname afterwards, it may claim the name.
+
+---
+
+## 6. LAN Manager Service & Dynamic Subnet Reconfiguration
 
 The `LanManager` service manages the LAN interface configuration and encapsulates self-healing conflict resolution. It runs the DHCP Server as a child service and reacts to Netlink address and link events:
 1.  **Conflict Detection**: If a conflict/overlap between the WAN subnet and the active LAN subnet is detected (ignoring degenerate prefixes like `/0` or `/32`), the `LanManager` checks if the configured `backup_lan_ip` is safe from collisions.

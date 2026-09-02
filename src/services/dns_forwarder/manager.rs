@@ -1,22 +1,33 @@
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::services::DNS_FORWARDER_SERVICE_NAME;
 use crate::services::ipc::{
-    DnsParentToWorkerMsg, DnsWorkerToParentMsg, async_unix_stream, recv_msg, send_msg,
+    DnsParentToWorkerMsg, DnsWorkerToParentMsg, LocalHostEvent, LocalHostReceiver,
+    async_unix_stream, recv_msg, send_msg,
 };
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{DNS_PORT, WanLeaseReceiver, create_ipc_fds, terminate_worker};
 use log::{error, info};
+use std::collections::HashMap;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::unix::io::OwnedFd;
+use std::sync::Arc;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
+
+#[derive(Clone)]
+struct LocalHostsState {
+    rx: Arc<Mutex<Option<LocalHostReceiver>>>,
+    cache: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
+}
 
 pub struct DnsForwarder {
     lease_rx: WanLeaseReceiver,
     state: ExternalWorker,
     heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts: LocalHostsState,
 }
 
 impl DnsForwarder {
@@ -25,6 +36,10 @@ impl DnsForwarder {
             lease_rx,
             state: ExternalWorker::new(DNS_FORWARDER_SERVICE_NAME),
             heartbeat_tx: None,
+            local_hosts: LocalHostsState {
+                rx: Arc::new(Mutex::new(None)),
+                cache: Arc::new(Mutex::new(HashMap::new())),
+            },
         }
     }
 
@@ -33,6 +48,26 @@ impl DnsForwarder {
             lease_rx,
             state: ExternalWorker::new(DNS_FORWARDER_SERVICE_NAME),
             heartbeat_tx: Some(heartbeat_tx),
+            local_hosts: LocalHostsState {
+                rx: Arc::new(Mutex::new(None)),
+                cache: Arc::new(Mutex::new(HashMap::new())),
+            },
+        }
+    }
+
+    pub fn with_local_hosts(
+        lease_rx: WanLeaseReceiver,
+        heartbeat_tx: Option<HeartbeatSender>,
+        local_hosts_rx: Option<LocalHostReceiver>,
+    ) -> Self {
+        Self {
+            lease_rx,
+            state: ExternalWorker::new(DNS_FORWARDER_SERVICE_NAME),
+            heartbeat_tx,
+            local_hosts: LocalHostsState {
+                rx: Arc::new(Mutex::new(local_hosts_rx)),
+                cache: Arc::new(Mutex::new(HashMap::new())),
+            },
         }
     }
 
@@ -48,6 +83,7 @@ async fn run_parent_dns_monitor(
     mut lease_rx: WanLeaseReceiver,
     mut shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts: LocalHostsState,
 ) {
     info!(
         "[dns-forwarder-parent] Supervising DNS forwarder worker (PID {})",
@@ -56,7 +92,7 @@ async fn run_parent_dns_monitor(
 
     let mut last_dns_servers: Vec<Ipv4Addr> = Vec::new();
 
-    // 1. Initial sync on startup (marks version as seen)
+    // 1. Initial sync of upstream resolvers on startup
     {
         let initial_servers = lease_rx.borrow_and_update().dns_servers.clone();
         if !initial_servers.is_empty() {
@@ -70,7 +106,21 @@ async fn run_parent_dns_monitor(
         }
     }
 
-    // 2. Reactive loop: receive worker heartbeats and update upstream resolvers
+    // 2. Initial sync of cached local hostnames to worker
+    {
+        let cached = local_hosts.cache.lock().await.clone();
+        for (name, ip) in cached {
+            let msg = DnsParentToWorkerMsg::RegisterLocalHost { name, ip };
+            if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+                error!(
+                    "[dns-forwarder-parent] Failed to send cached host to worker: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // 3. Reactive supervisor loop
     while !*shutdown_rx.borrow() {
         tokio::select! {
             _ = shutdown_rx.changed() => break,
@@ -95,6 +145,31 @@ async fn run_parent_dns_monitor(
                         break;
                     }
                     last_dns_servers = current_servers;
+                }
+            }
+            Some(event) = async {
+                let mut guard = local_hosts.rx.lock().await;
+                if let Some(ref mut rx) = *guard {
+                    rx.recv().await
+                } else {
+                    futures_util::future::pending().await
+                }
+            } => {
+                match event {
+                    LocalHostEvent::Register { name, ip } => {
+                        local_hosts.cache.lock().await.insert(name.clone(), ip);
+                        let msg = DnsParentToWorkerMsg::RegisterLocalHost { name, ip };
+                        if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+                            error!("[dns-forwarder-parent] Failed to send RegisterLocalHost: {}", e);
+                        }
+                    }
+                    LocalHostEvent::Deregister { name } => {
+                        local_hosts.cache.lock().await.remove(&name);
+                        let msg = DnsParentToWorkerMsg::DeregisterLocalHost { name };
+                        if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+                            error!("[dns-forwarder-parent] Failed to send DeregisterLocalHost: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -123,6 +198,7 @@ fn start_parent_dns_monitor(
     lease_rx: WanLeaseReceiver,
     shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts: LocalHostsState,
 ) -> Result<JoinHandle<()>, ServiceError> {
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
@@ -134,6 +210,7 @@ fn start_parent_dns_monitor(
         lease_rx,
         shutdown_rx,
         heartbeat_tx,
+        local_hosts,
     ));
 
     Ok(handle)
@@ -158,6 +235,7 @@ impl Service for DnsForwarder {
     async fn start(&mut self) -> Result<(), ServiceError> {
         let lease_rx = self.lease_rx.clone();
         let heartbeat_tx = self.heartbeat_tx.clone();
+        let local_hosts = self.local_hosts.clone();
 
         self.state.start_supervised(
             setup_dns_forwarder_attempt,
@@ -168,6 +246,7 @@ impl Service for DnsForwarder {
                     lease_rx.clone(),
                     shutdown_rx,
                     heartbeat_tx.clone(),
+                    local_hosts.clone(),
                 )
             },
         )

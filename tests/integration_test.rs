@@ -1477,6 +1477,7 @@ fn build_dhcp_request_lan(
     opts.insert(DhcpOption::MessageType(MessageType::Request));
     opts.insert(DhcpOption::RequestedIpAddress(requested_ip));
     opts.insert(DhcpOption::ServerIdentifier(server_ip));
+    opts.insert(DhcpOption::Hostname("printer.local".to_string()));
 
     let mut payload = Vec::new();
     req.encode(&mut Encoder::new(&mut payload)).unwrap();

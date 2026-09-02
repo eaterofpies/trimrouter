@@ -4,7 +4,8 @@ use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_udp_socket, run_sandboxed_worker,
 };
 use hickory_proto::op::{Message, OpCode};
-use hickory_proto::serialize::binary::BinDecodable;
+use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::A, rdata::PTR};
+use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::io::Error as IoError;
@@ -76,6 +77,8 @@ async fn run_forwarder_loop(
     let mut cache = HashMap::<Vec<u8>, CacheEntry>::new();
     let mut pending_queries = HashMap::<u16, PendingQuery>::new();
     let mut upstream_servers = Vec::<Ipv4Addr>::new();
+    let mut local_hosts = HashMap::<String, Ipv4Addr>::new();
+    let mut local_ips = HashMap::<Ipv4Addr, String>::new();
     let mut client_buf = [0u8; RECV_BUF_SIZE];
     let mut upstream_buf = [0u8; RECV_BUF_SIZE];
     let mut cleanup_timer = tokio::time::interval(CLEANUP_INTERVAL);
@@ -94,6 +97,17 @@ async fn run_forwarder_loop(
                     Ok(Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })) => {
                         upstream_servers = servers;
                     }
+                    Ok(Some(DnsParentToWorkerMsg::RegisterLocalHost { name, ip })) => {
+                        if let Some(old_ip) = local_hosts.insert(name.clone(), ip) {
+                            local_ips.remove(&old_ip);
+                        }
+                        local_ips.insert(ip, name);
+                    }
+                    Ok(Some(DnsParentToWorkerMsg::DeregisterLocalHost { name })) => {
+                        if let Some(ip) = local_hosts.remove(&name) {
+                            local_ips.remove(&ip);
+                        }
+                    }
                     Ok(None) | Err(_) => {
                         info!("[dns-forwarder-worker] Parent IPC closed. Shutting down.");
                         break;
@@ -102,14 +116,22 @@ async fn run_forwarder_loop(
             }
             client_recv = dns_socket.recv_from(&mut client_buf) => {
                 if let Ok((len, src)) = client_recv {
+                    let local_table = LocalDnsTable {
+                        hosts: &local_hosts,
+                        ips: &local_ips,
+                    };
+                    let sockets = ForwarderSockets {
+                        dns: &dns_socket,
+                        upstream: &upstream_socket,
+                    };
                     handle_client_query(
                         &client_buf[..len],
                         src,
-                        &dns_socket,
-                        &upstream_socket,
+                        &sockets,
                         &mut cache,
                         &mut pending_queries,
                         &upstream_servers,
+                        &local_table,
                     ).await;
                 }
             }
@@ -128,18 +150,34 @@ async fn run_forwarder_loop(
     }
 }
 
+struct ForwarderSockets<'a> {
+    dns: &'a UdpSocket,
+    upstream: &'a UdpSocket,
+}
+
+struct LocalDnsTable<'a> {
+    hosts: &'a HashMap<String, Ipv4Addr>,
+    ips: &'a HashMap<Ipv4Addr, String>,
+}
+
 async fn handle_client_query(
     query: &[u8],
     src: SocketAddr,
-    dns_socket: &UdpSocket,
-    upstream_socket: &UdpSocket,
+    sockets: &ForwarderSockets<'_>,
     cache: &mut HashMap<Vec<u8>, CacheEntry>,
     pending: &mut HashMap<u16, PendingQuery>,
     configured_servers: &[Ipv4Addr],
+    local_table: &LocalDnsTable<'_>,
 ) {
     if query.len() < DNS_HEADER_SIZE {
         return;
     }
+
+    if let Some(local_resp) = try_resolve_local_query(query, local_table.hosts, local_table.ips) {
+        let _ = sockets.dns.send_to(&local_resp, src).await;
+        return;
+    }
+
     let Some(cache_key) = get_cache_key(query) else {
         return;
     };
@@ -147,7 +185,7 @@ async fn handle_client_query(
     if let Some(mut response) = lookup_cache(&cache_key, cache) {
         response[0] = query[0];
         response[1] = query[1];
-        let _ = dns_socket.send_to(&response, src).await;
+        let _ = sockets.dns.send_to(&response, src).await;
         return;
     }
 
@@ -155,7 +193,7 @@ async fn handle_client_query(
         query,
         src,
         cache_key,
-        upstream_socket,
+        sockets.upstream,
         pending,
         configured_servers,
     )
@@ -405,6 +443,134 @@ fn allocate_unique_xid(pending: &HashMap<u16, PendingQuery>) -> Option<u16> {
         rng_xid = rand::random::<u16>();
     }
     Some(rng_xid)
+}
+
+fn extract_local_forward_name(name: &str) -> Option<(String, bool)> {
+    let lower = name.trim_end_matches('.').to_ascii_lowercase();
+    if lower == crate::services::utils::LOCAL_DOMAIN || lower.is_empty() {
+        return None;
+    }
+    let dot_suffix = format!(".{}", crate::services::utils::LOCAL_DOMAIN);
+    if let Some(prefix) = lower.strip_suffix(&dot_suffix) {
+        if !prefix.contains('.') {
+            return Some((prefix.to_string(), true));
+        }
+        return None;
+    }
+    if !lower.contains('.') {
+        return Some((lower, false));
+    }
+    None
+}
+
+fn is_mdns_local_domain(name: &str) -> bool {
+    let lower = name.trim_end_matches('.').to_ascii_lowercase();
+    let dot_suffix = format!(".{}", crate::services::utils::MDNS_DOMAIN);
+    lower == crate::services::utils::MDNS_DOMAIN || lower.ends_with(&dot_suffix)
+}
+
+fn try_resolve_local_query(
+    query_bytes: &[u8],
+    local_hosts: &HashMap<String, Ipv4Addr>,
+    local_ips: &HashMap<Ipv4Addr, String>,
+) -> Option<Vec<u8>> {
+    let query_msg = Message::from_bytes(query_bytes).ok()?;
+    if query_msg.op_code != OpCode::Query || query_msg.queries.is_empty() {
+        return None;
+    }
+    let question = &query_msg.queries[0];
+    let qname = question.name();
+    let qname_str = qname.to_utf8();
+    let qtype = question.query_type();
+
+    if let Some((label, is_lan_qualified)) = extract_local_forward_name(&qname_str) {
+        if let Some(&ip) = local_hosts.get(&label) {
+            return match qtype {
+                RecordType::A => Some(build_authoritative_a_response(&query_msg, qname, ip)),
+                _ => Some(build_authoritative_nodata_response(&query_msg)),
+            };
+        } else if is_lan_qualified {
+            return Some(build_authoritative_nxdomain_response(&query_msg));
+        }
+    }
+
+    if qtype == RecordType::PTR {
+        if let Ok(ipnet::IpNet::V4(v4)) = qname.parse_arpa_name()
+            && v4.prefix_len() == 32
+            && let Some(hostname) = local_ips.get(&v4.addr())
+        {
+            let ptr_target = format!("{}.{}.", hostname, crate::services::utils::LOCAL_DOMAIN);
+            if let Ok(target_name) = Name::from_ascii(&ptr_target) {
+                return Some(build_authoritative_ptr_response(
+                    &query_msg,
+                    qname,
+                    target_name,
+                ));
+            }
+        }
+        return None;
+    }
+
+    if is_mdns_local_domain(&qname_str) {
+        return Some(build_authoritative_nxdomain_response(&query_msg));
+    }
+
+    None
+}
+
+fn build_authoritative_response(
+    query_msg: &Message,
+    rcode: hickory_proto::op::ResponseCode,
+    answer: Option<Record>,
+) -> Vec<u8> {
+    let mut response = Message::response(query_msg.id, OpCode::Query);
+    response.metadata.response_code = rcode;
+    response.metadata.authoritative = true;
+    response.metadata.recursion_available = true;
+    response.metadata.recursion_desired = query_msg.recursion_desired;
+    response.queries = query_msg.queries.clone();
+    if let Some(rec) = answer {
+        response.add_answer(rec);
+    }
+
+    let mut buf = Vec::new();
+    let mut encoder = BinEncoder::new(&mut buf);
+    let _ = response.emit(&mut encoder);
+    buf
+}
+
+fn build_authoritative_nodata_response(query_msg: &Message) -> Vec<u8> {
+    build_authoritative_response(query_msg, hickory_proto::op::ResponseCode::NoError, None)
+}
+
+fn build_authoritative_a_response(query_msg: &Message, qname: &Name, ip: Ipv4Addr) -> Vec<u8> {
+    let record = Record::from_rdata(qname.clone(), DEFAULT_TTL_SECS, RData::A(A(ip)));
+    build_authoritative_response(
+        query_msg,
+        hickory_proto::op::ResponseCode::NoError,
+        Some(record),
+    )
+}
+
+fn build_authoritative_ptr_response(
+    query_msg: &Message,
+    qname: &Name,
+    target_name: Name,
+) -> Vec<u8> {
+    let record = Record::from_rdata(
+        qname.clone(),
+        DEFAULT_TTL_SECS,
+        RData::PTR(PTR(target_name)),
+    );
+    build_authoritative_response(
+        query_msg,
+        hickory_proto::op::ResponseCode::NoError,
+        Some(record),
+    )
+}
+
+fn build_authoritative_nxdomain_response(query_msg: &Message) -> Vec<u8> {
+    build_authoritative_response(query_msg, hickory_proto::op::ResponseCode::NXDomain, None)
 }
 
 // =========================================================================
@@ -752,5 +918,335 @@ mod tests {
         let mut cache = HashMap::new();
         insert_cache(b"query_key".to_vec(), query, &mut cache);
         assert!(!cache.contains_key(&b"query_key".to_vec()[..]));
+    }
+
+    #[test]
+    fn test_extract_local_forward_name_and_mdns() {
+        assert_eq!(
+            extract_local_forward_name("printer"),
+            Some(("printer".to_string(), false))
+        );
+        assert_eq!(
+            extract_local_forward_name("printer.lan"),
+            Some(("printer".to_string(), true))
+        );
+        assert_eq!(
+            extract_local_forward_name("printer.lan."),
+            Some(("printer".to_string(), true))
+        );
+        assert_eq!(
+            extract_local_forward_name("PRINTER.LAN"),
+            Some(("printer".to_string(), true))
+        );
+        assert_eq!(extract_local_forward_name("google.com"), None);
+        assert_eq!(extract_local_forward_name("foo.bar.lan"), None);
+        assert_eq!(extract_local_forward_name("lan"), None);
+
+        assert!(is_mdns_local_domain("printer.local"));
+        assert!(is_mdns_local_domain("device.local."));
+        assert!(is_mdns_local_domain("local"));
+        assert!(!is_mdns_local_domain("printer.lan"));
+        assert!(!is_mdns_local_domain("example.com"));
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_a_record_hit() {
+        let mut local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+        local_hosts.insert("printer".to_string(), Ipv4Addr::new(192, 168, 1, 50));
+
+        let mut query = Message::new(1234, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("printer.lan.").unwrap();
+        let query_item = hickory_proto::op::Query::query(qname, RecordType::A);
+        query.add_query(query_item);
+
+        let mut query_bytes = Vec::new();
+        let mut encoder = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut encoder).unwrap();
+
+        let resp_bytes = try_resolve_local_query(&query_bytes, &local_hosts, &local_ips)
+            .expect("must resolve printer.lan");
+        let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+
+        assert_eq!(resp_msg.id, 1234);
+        assert!(resp_msg.authoritative);
+        assert_eq!(
+            resp_msg.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(resp_msg.answers.len(), 1);
+        if let RData::A(A(ip)) = &resp_msg.answers[0].data {
+            assert_eq!(*ip, Ipv4Addr::new(192, 168, 1, 50));
+        } else {
+            panic!("expected A record");
+        }
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_aaaa_nodata_hit() {
+        let mut local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+        local_hosts.insert("printer".to_string(), Ipv4Addr::new(192, 168, 1, 50));
+
+        let mut query = Message::new(1235, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("printer.lan.").unwrap();
+        let query_item = hickory_proto::op::Query::query(qname, RecordType::AAAA);
+        query.add_query(query_item);
+
+        let mut query_bytes = Vec::new();
+        let mut encoder = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut encoder).unwrap();
+
+        let resp_bytes = try_resolve_local_query(&query_bytes, &local_hosts, &local_ips)
+            .expect("must resolve printer.lan with NODATA");
+        let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+
+        assert_eq!(resp_msg.id, 1235);
+        assert!(resp_msg.authoritative);
+        assert_eq!(
+            resp_msg.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(resp_msg.answers.len(), 0);
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_lan_nxdomain() {
+        let local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+
+        let mut query = Message::new(5678, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("unknown.lan.").unwrap();
+        let query_item = hickory_proto::op::Query::query(qname, RecordType::A);
+        query.add_query(query_item);
+
+        let mut query_bytes = Vec::new();
+        let mut encoder = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut encoder).unwrap();
+
+        let resp_bytes = try_resolve_local_query(&query_bytes, &local_hosts, &local_ips)
+            .expect("must return authoritative NXDOMAIN for unknown .lan");
+        let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+
+        assert_eq!(resp_msg.id, 5678);
+        assert!(resp_msg.authoritative);
+        assert_eq!(
+            resp_msg.response_code,
+            hickory_proto::op::ResponseCode::NXDomain
+        );
+        assert_eq!(resp_msg.answers.len(), 0);
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_local_mdns_nxdomain() {
+        let local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+
+        let mut query = Message::new(9999, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("printer.local.").unwrap();
+        let query_item = hickory_proto::op::Query::query(qname, RecordType::A);
+        query.add_query(query_item);
+
+        let mut query_bytes = Vec::new();
+        let mut encoder = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut encoder).unwrap();
+
+        let resp_bytes = try_resolve_local_query(&query_bytes, &local_hosts, &local_ips)
+            .expect("must return authoritative NXDOMAIN for .local query on port 53");
+        let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+
+        assert_eq!(resp_msg.id, 9999);
+        assert!(resp_msg.authoritative);
+        assert_eq!(
+            resp_msg.response_code,
+            hickory_proto::op::ResponseCode::NXDomain
+        );
+        assert_eq!(resp_msg.answers.len(), 0);
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_ptr_reverse_lookup() {
+        let local_hosts = HashMap::new();
+        let mut local_ips = HashMap::new();
+        local_ips.insert(Ipv4Addr::new(192, 168, 1, 50), "printer".to_string());
+
+        let mut query = Message::new(4321, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("50.1.168.192.in-addr.arpa.").unwrap();
+        let query_item = hickory_proto::op::Query::query(qname, RecordType::PTR);
+        query.add_query(query_item);
+
+        let mut query_bytes = Vec::new();
+        let mut encoder = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut encoder).unwrap();
+
+        let resp_bytes = try_resolve_local_query(&query_bytes, &local_hosts, &local_ips)
+            .expect("must resolve reverse PTR query");
+        let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+
+        assert_eq!(resp_msg.id, 4321);
+        assert!(resp_msg.authoritative);
+        assert_eq!(
+            resp_msg.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(resp_msg.answers.len(), 1);
+        if let RData::PTR(name) = &resp_msg.answers[0].data {
+            assert_eq!(name.to_utf8(), "printer.lan.");
+        } else {
+            panic!("expected PTR record");
+        }
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_external_domain_returns_none() {
+        let local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+
+        let mut query = Message::new(1111, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("google.com.").unwrap();
+        let query_item = hickory_proto::op::Query::query(qname, RecordType::A);
+        query.add_query(query_item);
+
+        let mut query_bytes = Vec::new();
+        let mut encoder = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut encoder).unwrap();
+
+        assert_eq!(
+            try_resolve_local_query(&query_bytes, &local_hosts, &local_ips),
+            None
+        );
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_case_insensitive() {
+        let mut local_hosts = HashMap::new();
+        let mut local_ips = HashMap::new();
+        local_hosts.insert("printer".to_string(), Ipv4Addr::new(192, 168, 1, 50));
+        local_ips.insert(Ipv4Addr::new(192, 168, 1, 50), "printer".to_string());
+
+        // Forward uppercase query
+        let mut query = Message::new(2222, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("PRINTER.LAN.").unwrap();
+        let query_item = hickory_proto::op::Query::query(qname, RecordType::A);
+        query.add_query(query_item);
+
+        let mut query_bytes = Vec::new();
+        let mut encoder = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut encoder).unwrap();
+
+        let resp_bytes = try_resolve_local_query(&query_bytes, &local_hosts, &local_ips)
+            .expect("must resolve uppercase PRINTER.LAN");
+        let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_msg.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(resp_msg.answers.len(), 1);
+
+        // Reverse uppercase query
+        let mut ptr_query =
+            Message::new(3333, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let ptr_qname = Name::from_ascii("50.1.168.192.IN-ADDR.ARPA.").unwrap();
+        let ptr_item = hickory_proto::op::Query::query(ptr_qname, RecordType::PTR);
+        ptr_query.add_query(ptr_item);
+
+        let mut ptr_bytes = Vec::new();
+        let mut ptr_encoder = BinEncoder::new(&mut ptr_bytes);
+        ptr_query.emit(&mut ptr_encoder).unwrap();
+
+        let ptr_resp_bytes = try_resolve_local_query(&ptr_bytes, &local_hosts, &local_ips)
+            .expect("must resolve uppercase IN-ADDR.ARPA");
+        let ptr_resp_msg = Message::from_bytes(&ptr_resp_bytes).unwrap();
+        assert_eq!(
+            ptr_resp_msg.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_single_label_hit_and_miss() {
+        let mut local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+        local_hosts.insert("printer".to_string(), Ipv4Addr::new(192, 168, 1, 50));
+
+        // Single label hit: "printer"
+        let mut query_hit =
+            Message::new(4444, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname_hit = Name::from_ascii("printer.").unwrap();
+        let item_hit = hickory_proto::op::Query::query(qname_hit, RecordType::A);
+        query_hit.add_query(item_hit);
+
+        let mut bytes_hit = Vec::new();
+        let mut enc_hit = BinEncoder::new(&mut bytes_hit);
+        query_hit.emit(&mut enc_hit).unwrap();
+
+        let resp_bytes = try_resolve_local_query(&bytes_hit, &local_hosts, &local_ips)
+            .expect("must resolve single-label printer");
+        let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_msg.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(resp_msg.answers.len(), 1);
+
+        // Single label miss: "unregistered" -> returns None to fall through to search list / upstream
+        let mut query_miss =
+            Message::new(5555, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname_miss = Name::from_ascii("unregistered.").unwrap();
+        let item_miss = hickory_proto::op::Query::query(qname_miss, RecordType::A);
+        query_miss.add_query(item_miss);
+
+        let mut bytes_miss = Vec::new();
+        let mut enc_miss = BinEncoder::new(&mut bytes_miss);
+        query_miss.emit(&mut enc_miss).unwrap();
+
+        assert_eq!(
+            try_resolve_local_query(&bytes_miss, &local_hosts, &local_ips),
+            None
+        );
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_unknown_lan_all_types_return_nxdomain() {
+        let local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+
+        // AAAA query on unknown .lan -> NXDOMAIN
+        let mut query = Message::new(6666, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("unknown.lan.").unwrap();
+        let item = hickory_proto::op::Query::query(qname, RecordType::AAAA);
+        query.add_query(item);
+
+        let mut bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut bytes);
+        query.emit(&mut enc).unwrap();
+
+        let resp_bytes = try_resolve_local_query(&bytes, &local_hosts, &local_ips)
+            .expect("must return NXDOMAIN for unknown.lan AAAA");
+        let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_msg.response_code,
+            hickory_proto::op::ResponseCode::NXDomain
+        );
+    }
+
+    #[test]
+    fn test_try_resolve_local_query_ptr_unknown_ip_returns_none() {
+        let local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+
+        let mut query = Message::new(7777, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("99.1.168.192.in-addr.arpa.").unwrap();
+        let item = hickory_proto::op::Query::query(qname, RecordType::PTR);
+        query.add_query(item);
+
+        let mut bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut bytes);
+        query.emit(&mut enc).unwrap();
+
+        assert_eq!(
+            try_resolve_local_query(&bytes, &local_hosts, &local_ips),
+            None
+        );
     }
 }

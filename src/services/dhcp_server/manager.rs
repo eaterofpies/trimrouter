@@ -1,7 +1,8 @@
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{
-    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, async_unix_stream, recv_msg, send_msg,
+    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, LocalHostEvent, LocalHostSender,
+    async_unix_stream, recv_msg, send_msg,
 };
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{setup_worker_sockets, terminate_worker};
@@ -22,6 +23,7 @@ pub struct DhcpServer {
     lan_ip: String,
     state: ExternalWorker,
     heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts_tx: Option<LocalHostSender>,
 }
 
 impl DhcpServer {
@@ -31,6 +33,7 @@ impl DhcpServer {
             lan_ip,
             state: ExternalWorker::new(DHCP_SERVER_SERVICE_NAME),
             heartbeat_tx: None,
+            local_hosts_tx: None,
         }
     }
 
@@ -44,6 +47,22 @@ impl DhcpServer {
             lan_ip,
             state: ExternalWorker::new(DHCP_SERVER_SERVICE_NAME),
             heartbeat_tx: Some(heartbeat_tx),
+            local_hosts_tx: None,
+        }
+    }
+
+    pub fn with_local_hosts(
+        lan_interface: String,
+        lan_ip: String,
+        heartbeat_tx: Option<HeartbeatSender>,
+        local_hosts_tx: Option<LocalHostSender>,
+    ) -> Self {
+        Self {
+            lan_interface,
+            lan_ip,
+            state: ExternalWorker::new(DHCP_SERVER_SERVICE_NAME),
+            heartbeat_tx,
+            local_hosts_tx,
         }
     }
 
@@ -57,6 +76,7 @@ fn start_parent_arp_listener(
     child_pid: u32,
     shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts_tx: Option<LocalHostSender>,
 ) -> Result<JoinHandle<()>, ServiceError> {
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
@@ -67,6 +87,7 @@ fn start_parent_arp_listener(
         ipc_reader,
         shutdown_rx,
         heartbeat_tx,
+        local_hosts_tx,
     ));
 
     Ok(handle)
@@ -78,6 +99,7 @@ async fn run_parent_dhcp_server_monitor(
     mut ipc_reader: OwnedReadHalf,
     mut shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
+    local_hosts_tx: Option<LocalHostSender>,
 ) {
     let (connection, _handle, mut messages) =
         match rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]) {
@@ -104,6 +126,16 @@ async fn run_parent_dhcp_server_monitor(
                 match ipc_msg {
                     Ok(Some(DhcpServerWorkerToParentMsg::Heartbeat)) => {
                         send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::LanManager);
+                    }
+                    Ok(Some(DhcpServerWorkerToParentMsg::RegisterLocalHost { name, ip })) => {
+                        if let Some(ref tx) = local_hosts_tx {
+                            let _ = tx.send(LocalHostEvent::Register { name, ip }).await;
+                        }
+                    }
+                    Ok(Some(DhcpServerWorkerToParentMsg::DeregisterLocalHost { name })) => {
+                        if let Some(ref tx) = local_hosts_tx {
+                            let _ = tx.send(LocalHostEvent::Deregister { name }).await;
+                        }
                     }
                     Ok(None) | Err(_) => {
                         info!("[dhcp-server-parent] Worker closed IPC. Shutting down monitor.");
@@ -178,6 +210,7 @@ impl Service for DhcpServer {
         let lan_interface = self.lan_interface.clone();
         let lan_ip = self.lan_ip.clone();
         let heartbeat_tx = self.heartbeat_tx.clone();
+        let local_hosts_tx = self.local_hosts_tx.clone();
 
         self.state.start_supervised(
             move || setup_dhcp_server_attempt(&lan_interface, &lan_ip),
@@ -187,6 +220,7 @@ impl Service for DhcpServer {
                     child_pid,
                     shutdown_rx,
                     heartbeat_tx.clone(),
+                    local_hosts_tx.clone(),
                 )
             },
         )

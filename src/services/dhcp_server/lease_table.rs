@@ -14,6 +14,7 @@ const LEASE_CHANNEL_CAPACITY: usize = 64;
 pub struct ClientLease {
     pub ip: Ipv4Addr,
     pub expiry: Instant,
+    pub hostname: Option<String>,
 }
 
 /// Encapsulates the lease map and IP allocation index as a single unit.
@@ -38,6 +39,15 @@ impl LeaseTable {
     /// Returns the active lease for this MAC address, if one exists.
     pub fn get(&self, mac: &MacAddr) -> Option<&ClientLease> {
         self.by_mac.get(mac)
+    }
+
+    /// Returns `true` if `hostname` is actively leased to a MAC *other* than `client_mac`.
+    pub fn is_hostname_taken_by_other(&self, hostname: &str, client_mac: MacAddr) -> bool {
+        self.by_mac.iter().any(|(mac, lease)| {
+            *mac != client_mac
+                && lease.expiry > Instant::now()
+                && lease.hostname.as_deref() == Some(hostname)
+        })
     }
 
     /// Inserts or replaces the lease for `mac`, updating the IP index atomically.
@@ -80,11 +90,23 @@ impl LeaseTable {
             .any(|(mac, l)| l.ip == ip && l.expiry > Instant::now() && *mac != client_mac)
     }
 
-    /// Evicts all expired leases and conflict holds, returning their IPs to the available pool.
-    pub fn evict_expired(&mut self) {
-        self.by_mac.retain(|_, l| l.expiry > Instant::now());
+    /// Evicts all expired leases and conflict holds, returning a list of expired hostnames.
+    pub fn evict_expired(&mut self) -> Vec<String> {
+        let now = Instant::now();
+        let mut expired_hostnames = Vec::new();
+        self.by_mac.retain(|_, l| {
+            if l.expiry > now {
+                true
+            } else {
+                if let Some(ref h) = l.hostname {
+                    expired_hostnames.push(h.clone());
+                }
+                false
+            }
+        });
         self.allocated_ips = self.by_mac.values().map(|l| l.ip).collect();
-        self.conflicts.retain(|_, expiry| *expiry > Instant::now());
+        self.conflicts.retain(|_, expiry| *expiry > now);
+        expired_hostnames
     }
 
     /// Evicts expired leases, then finds the first available host IP in
@@ -120,12 +142,14 @@ impl LeaseTable {
             ClientLease {
                 ip,
                 expiry: Instant::now() + CANDIDATE_HOLD_DURATION,
+                hostname: None,
             },
         );
         Some(ip)
     }
 
     /// Validates a requested IP (or existing lease) and confirms the lease duration.
+    /// Returns `(assigned_ip, assigned_hostname, old_hostname_to_deregister)`.
     pub fn validate_and_confirm(
         &mut self,
         client_mac: MacAddr,
@@ -133,7 +157,8 @@ impl LeaseTable {
         server_ip: Ipv4Addr,
         net: ipnet::Ipv4Net,
         duration: Duration,
-    ) -> Option<Ipv4Addr> {
+        requested_hostname: Option<String>,
+    ) -> Option<LeaseConfirmation> {
         let target_ip = requested_ip.or_else(|| self.get(&client_mac).map(|l| l.ip))?;
         if target_ip == server_ip
             || target_ip == net.network()
@@ -143,14 +168,30 @@ impl LeaseTable {
         {
             return None;
         }
+
+        let old_hostname = self.get(&client_mac).and_then(|l| l.hostname.clone());
+        let effective_hostname =
+            requested_hostname.filter(|base| !self.is_hostname_taken_by_other(base, client_mac));
+
+        let old_hostname_to_deregister = match (&old_hostname, &effective_hostname) {
+            (Some(old), Some(new)) if old != new => Some(old.clone()),
+            (Some(old), None) => Some(old.clone()),
+            _ => None,
+        };
+
         self.insert(
             client_mac,
             ClientLease {
                 ip: target_ip,
                 expiry: Instant::now() + duration,
+                hostname: effective_hostname.clone(),
             },
         );
-        Some(target_ip)
+        Some(LeaseConfirmation {
+            ip: target_ip,
+            hostname: effective_hostname,
+            old_hostname_to_deregister,
+        })
     }
 
     /// Records or updates an active neighbor mapping received from Netlink.
@@ -166,6 +207,7 @@ impl LeaseTable {
             ClientLease {
                 ip,
                 expiry: Instant::now() + NEIGHBOR_HOLD_DURATION,
+                hostname: None,
             },
         );
     }
@@ -183,6 +225,13 @@ impl LeaseTable {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseConfirmation {
+    pub ip: Ipv4Addr,
+    pub hostname: Option<String>,
+    pub old_hostname_to_deregister: Option<String>,
+}
+
 pub enum LeaseCommand {
     GetExistingIp {
         client_mac: MacAddr,
@@ -198,6 +247,7 @@ pub enum LeaseCommand {
         client_mac: MacAddr,
         ip: Ipv4Addr,
         duration: Duration,
+        hostname: Option<String>,
     },
     ValidateAndConfirmRequest {
         client_mac: MacAddr,
@@ -205,7 +255,8 @@ pub enum LeaseCommand {
         server_ip: Ipv4Addr,
         net: ipnet::Ipv4Net,
         duration: Duration,
-        reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
+        requested_hostname: Option<String>,
+        reply_tx: oneshot::Sender<Option<LeaseConfirmation>>,
     },
     CheckConflict {
         target_ip: Ipv4Addr,
@@ -218,7 +269,10 @@ pub enum LeaseCommand {
     },
     Release {
         client_mac: MacAddr,
-        reply_tx: oneshot::Sender<Option<Ipv4Addr>>,
+        reply_tx: oneshot::Sender<Option<(Ipv4Addr, Option<String>)>>,
+    },
+    EvictExpired {
+        reply_tx: oneshot::Sender<Vec<String>>,
     },
     AddNeighbor {
         mac: MacAddr,
@@ -263,13 +317,20 @@ impl LeaseHandle {
         reply_rx.await.ok()?
     }
 
-    pub async fn confirm_lease(&self, client_mac: MacAddr, ip: Ipv4Addr, duration: Duration) {
+    pub async fn confirm_lease(
+        &self,
+        client_mac: MacAddr,
+        ip: Ipv4Addr,
+        duration: Duration,
+        hostname: Option<String>,
+    ) {
         let _ = self
             .sender
             .send(LeaseCommand::ConfirmLease {
                 client_mac,
                 ip,
                 duration,
+                hostname,
             })
             .await;
     }
@@ -281,7 +342,8 @@ impl LeaseHandle {
         server_ip: Ipv4Addr,
         net: ipnet::Ipv4Net,
         duration: Duration,
-    ) -> Option<Ipv4Addr> {
+        requested_hostname: Option<String>,
+    ) -> Option<LeaseConfirmation> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(LeaseCommand::ValidateAndConfirmRequest {
@@ -290,6 +352,7 @@ impl LeaseHandle {
                 server_ip,
                 net,
                 duration,
+                requested_hostname,
                 reply_tx,
             })
             .await
@@ -321,7 +384,7 @@ impl LeaseHandle {
             .await;
     }
 
-    pub async fn release(&self, client_mac: MacAddr) -> Option<Ipv4Addr> {
+    pub async fn release(&self, client_mac: MacAddr) -> Option<(Ipv4Addr, Option<String>)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(LeaseCommand::Release {
@@ -331,6 +394,19 @@ impl LeaseHandle {
             .await
             .ok()?;
         reply_rx.await.ok()?
+    }
+
+    pub async fn evict_expired(&self) -> Vec<String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(LeaseCommand::EvictExpired { reply_tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.await.unwrap_or_default()
     }
 
     pub async fn add_neighbor(&self, mac: MacAddr, ip: Ipv4Addr) {
@@ -384,12 +460,14 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             client_mac,
             ip,
             duration,
+            hostname,
         } => {
             leases.insert(
                 client_mac,
                 ClientLease {
                     ip,
                     expiry: Instant::now() + duration,
+                    hostname,
                 },
             );
         }
@@ -399,11 +477,18 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             server_ip,
             net,
             duration,
+            requested_hostname,
             reply_tx,
         } => {
-            let ip =
-                leases.validate_and_confirm(client_mac, requested_ip, server_ip, net, duration);
-            let _ = reply_tx.send(ip);
+            let result = leases.validate_and_confirm(
+                client_mac,
+                requested_ip,
+                server_ip,
+                net,
+                duration,
+                requested_hostname,
+            );
+            let _ = reply_tx.send(result);
         }
         LeaseCommand::CheckConflict {
             target_ip,
@@ -422,8 +507,12 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             client_mac,
             reply_tx,
         } => {
-            let removed = leases.remove(&client_mac).map(|l| l.ip);
+            let removed = leases.remove(&client_mac).map(|l| (l.ip, l.hostname));
             let _ = reply_tx.send(removed);
+        }
+        LeaseCommand::EvictExpired { reply_tx } => {
+            let expired = leases.evict_expired();
+            let _ = reply_tx.send(expired);
         }
         LeaseCommand::AddNeighbor { mac, ip } => {
             leases.update_from_neighbor(mac, ip);

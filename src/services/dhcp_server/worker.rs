@@ -95,12 +95,25 @@ async fn run_server_loop(
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 2048];
     let mut heartbeat_timer = interval(SERVER_HEARTBEAT_INTERVAL);
+    let (ipc_tx, mut ipc_rx) = tokio::sync::mpsc::channel::<DhcpServerWorkerToParentMsg>(32);
 
     loop {
         tokio::select! {
             _ = heartbeat_timer.tick() => {
                 if let Err(e) = send_msg(&mut ipc_writer, &DhcpServerWorkerToParentMsg::Heartbeat).await {
                     debug!("[dhcp-server-worker] Failed to send heartbeat to parent: {}", e);
+                }
+                let expired_hostnames = leases.evict_expired().await;
+                for name in expired_hostnames {
+                    let msg = DhcpServerWorkerToParentMsg::DeregisterLocalHost { name };
+                    if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+                        debug!("[dhcp-server-worker] Failed to send DeregisterLocalHost: {}", e);
+                    }
+                }
+            }
+            Some(msg) = ipc_rx.recv() => {
+                if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+                    debug!("[dhcp-server-worker] Failed to send IPC msg to parent: {}", e);
                 }
             }
             ipc_msg = recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut ipc_reader) => {
@@ -125,6 +138,7 @@ async fn run_server_loop(
                         let async_sock_clone = Arc::clone(&async_sock);
                         let config_clone = Arc::clone(&config);
                         let leases_clone = leases.clone();
+                        let ipc_tx_clone = ipc_tx.clone();
 
                         tokio::spawn(async move {
                             process_incoming_packet(
@@ -132,6 +146,7 @@ async fn run_server_loop(
                                 async_sock_clone,
                                 config_clone,
                                 leases_clone,
+                                ipc_tx_clone,
                             )
                             .await;
                         });
@@ -152,6 +167,7 @@ async fn process_incoming_packet(
     async_sock: Arc<AsyncFd<OwnedFd>>,
     config: Arc<ServerConfig>,
     leases: LeaseHandle,
+    ipc_tx: tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
 ) {
     let dhcp = match parse_dhcp_payload(&buf, dhcproto::v4::SERVER_PORT) {
         Some(d) => d,
@@ -191,7 +207,7 @@ async fn process_incoming_packet(
             handle_dhcp_discover(async_sock, &config, &dhcp, client_mac, leases).await;
         }
         MessageType::Request => {
-            handle_dhcp_request(async_sock, &config, &dhcp, client_mac, leases).await;
+            handle_dhcp_request(async_sock, &config, &dhcp, client_mac, leases, ipc_tx).await;
         }
         MessageType::Decline | MessageType::Release => {
             let label = if msg_type == MessageType::Decline {
@@ -199,11 +215,16 @@ async fn process_incoming_packet(
             } else {
                 "DHCPRELEASE"
             };
-            if let Some(ip) = leases.release(client_mac).await {
+            if let Some((ip, maybe_name)) = leases.release(client_mac).await {
                 info!(
                     "[dhcp-server] Received {} from client MAC: {}. Released lease for IP: {}.",
                     label, client_mac, ip
                 );
+                if let Some(name) = maybe_name {
+                    let _ = ipc_tx
+                        .send(DhcpServerWorkerToParentMsg::DeregisterLocalHost { name })
+                        .await;
+                }
             }
         }
         _ => {}
@@ -417,11 +438,13 @@ async fn handle_dhcp_discover(
         return;
     };
 
+    let requested_hostname = extract_sanitized_hostname(dhcp);
     leases
         .confirm_lease(
             client_mac,
             leased_ip,
             Duration::from_secs(LAN_LEASE_SECS as u64),
+            requested_hostname,
         )
         .await;
 
@@ -479,6 +502,7 @@ async fn handle_dhcp_request(
     dhcp: &Message,
     client_mac: MacAddr,
     leases: LeaseHandle,
+    ipc_tx: tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
 ) {
     debug!(
         "[dhcp-server] Received DHCPREQUEST from client MAC: {}",
@@ -498,13 +522,16 @@ async fn handle_dhcp_request(
         _ => None,
     };
 
-    let Some(leased_ip) = leases
+    let requested_hostname = extract_sanitized_hostname(dhcp);
+
+    let Some(confirmation) = leases
         .validate_and_confirm_request(
             client_mac,
             requested_ip_opt,
             config.server_ip,
             config.net,
             Duration::from_secs(LAN_LEASE_SECS as u64),
+            requested_hostname,
         )
         .await
     else {
@@ -516,12 +543,57 @@ async fn handle_dhcp_request(
         return;
     };
 
+    let leased_ip = confirmation.ip;
     if verify_arp_conflict(leased_ip, client_mac, config, &leases).await {
         send_dhcp_nak(&async_sock, dhcp, client_mac, config).await;
         return;
     }
 
     send_dhcp_ack(&async_sock, dhcp, client_mac, leased_ip, config).await;
+
+    if let Some(old_name) = confirmation.old_hostname_to_deregister {
+        info!(
+            "[dhcp-server] Deregistering previous local hostname '{}' for client MAC: {}",
+            old_name, client_mac
+        );
+        let _ = ipc_tx
+            .send(DhcpServerWorkerToParentMsg::DeregisterLocalHost { name: old_name })
+            .await;
+    }
+
+    if let Some(name) = confirmation.hostname {
+        info!(
+            "[dhcp-server] Registered local hostname '{}' for IP {} (MAC: {})",
+            name, leased_ip, client_mac
+        );
+        let _ = ipc_tx
+            .send(DhcpServerWorkerToParentMsg::RegisterLocalHost {
+                name,
+                ip: leased_ip,
+            })
+            .await;
+    }
+}
+
+pub fn sanitize_hostname(raw: &str) -> Option<String> {
+    let label = raw.split('.').next()?.trim();
+    if label.is_empty() || label.len() > 63 {
+        return None;
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return None;
+    }
+    if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    Some(label.to_ascii_lowercase())
+}
+
+fn extract_sanitized_hostname(dhcp: &Message) -> Option<String> {
+    match dhcp.opts().get(OptionCode::Hostname) {
+        Some(DhcpOption::Hostname(name)) => sanitize_hostname(name),
+        _ => None,
+    }
 }
 
 fn get_dest_mac_ip(
@@ -539,7 +611,7 @@ fn get_dest_mac_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::dhcp_server::{ClientLease, LeaseTable};
+    use crate::services::dhcp_server::{ClientLease, LeaseConfirmation, LeaseTable};
     use dhcproto::{Decodable, Decoder};
     use std::time::Instant;
 
@@ -629,6 +701,7 @@ mod tests {
             ClientLease {
                 ip: Ipv4Addr::new(192, 168, 1, 2),
                 expiry: Instant::now() - Duration::from_secs(1),
+                hostname: Some("old-host".to_string()),
             },
         );
         assert_eq!(leases.len(), 1);
@@ -657,7 +730,7 @@ mod tests {
             .await
             .unwrap();
         leases
-            .confirm_lease(client, ip_first, Duration::from_secs(3600))
+            .confirm_lease(client, ip_first, Duration::from_secs(3600), None)
             .await;
 
         let ip_second = leases.get_existing_ip(client).await.unwrap();
@@ -676,6 +749,7 @@ mod tests {
             config.server_ip,
             config.net,
             Duration::from_secs(3600),
+            None,
         );
         assert_eq!(result, None);
     }
@@ -692,6 +766,7 @@ mod tests {
             config.server_ip,
             config.net,
             Duration::from_secs(3600),
+            None,
         );
         assert_eq!(result, None);
     }
@@ -710,6 +785,7 @@ mod tests {
             ClientLease {
                 ip: contested_ip,
                 expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
+                hostname: None,
             },
         );
 
@@ -721,6 +797,7 @@ mod tests {
                 config.server_ip,
                 config.net,
                 Duration::from_secs(3600),
+                None,
             ),
             None
         );
@@ -732,8 +809,13 @@ mod tests {
                 config.server_ip,
                 config.net,
                 Duration::from_secs(3600),
+                None,
             ),
-            Some(contested_ip)
+            Some(LeaseConfirmation {
+                ip: contested_ip,
+                hostname: None,
+                old_hostname_to_deregister: None,
+            })
         );
     }
 
@@ -750,8 +832,16 @@ mod tests {
             config.server_ip,
             config.net,
             Duration::from_secs(3600),
+            Some("printer".to_string()),
         );
-        assert_eq!(res, Some(valid_ip));
+        assert_eq!(
+            res,
+            Some(LeaseConfirmation {
+                ip: valid_ip,
+                hostname: Some("printer".to_string()),
+                old_hostname_to_deregister: None,
+            })
+        );
     }
 
     #[tokio::test]
@@ -815,6 +905,7 @@ mod tests {
             config.server_ip,
             config.net,
             Duration::from_secs(3600),
+            None,
         );
         assert_eq!(res, None);
     }
@@ -832,6 +923,7 @@ mod tests {
             config.server_ip,
             config.net,
             Duration::from_secs(3600),
+            None,
         );
         assert_eq!(res, None);
     }
@@ -849,8 +941,163 @@ mod tests {
             config.server_ip,
             config.net,
             Duration::from_secs(3600),
+            None,
         );
         assert_eq!(res, None);
+    }
+
+    #[test]
+    fn test_sanitize_hostname_valid_and_edge_cases() {
+        assert_eq!(sanitize_hostname("printer"), Some("printer".to_string()));
+        assert_eq!(
+            sanitize_hostname("PRINTER-01"),
+            Some("printer-01".to_string())
+        );
+        assert_eq!(
+            sanitize_hostname("printer.local"),
+            Some("printer".to_string())
+        );
+        assert_eq!(
+            sanitize_hostname("server01.lab.internal"),
+            Some("server01".to_string())
+        );
+        assert_eq!(sanitize_hostname("laptop.lan"), Some("laptop".to_string()));
+        assert_eq!(
+            sanitize_hostname("my-box.home.arpa"),
+            Some("my-box".to_string())
+        );
+
+        // Invalid cases
+        assert_eq!(sanitize_hostname(""), None);
+        assert_eq!(sanitize_hostname("-invalid"), None);
+        assert_eq!(sanitize_hostname("invalid-"), None);
+        assert_eq!(sanitize_hostname("invalid_underscore"), None);
+        assert_eq!(sanitize_hostname("a".repeat(64).as_str()), None);
+    }
+
+    #[test]
+    fn test_hostname_collision_rfc4703_skips_registration() {
+        let config = make_config("192.168.1.1/24");
+        let mut leases = LeaseTable::new();
+
+        let client1 = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let client2 = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0xAA, 0xBB);
+
+        // Client 1 registers "laptop"
+        let res1 = leases.validate_and_confirm(
+            client1,
+            Some(Ipv4Addr::new(192, 168, 1, 10)),
+            config.server_ip,
+            config.net,
+            Duration::from_secs(3600),
+            Some("laptop".to_string()),
+        );
+        assert_eq!(
+            res1,
+            Some(LeaseConfirmation {
+                ip: Ipv4Addr::new(192, 168, 1, 10),
+                hostname: Some("laptop".to_string()),
+                old_hostname_to_deregister: None,
+            })
+        );
+
+        // Client 2 requests "laptop" -> lease granted, but hostname registration skipped per RFC 4703
+        let res2 = leases.validate_and_confirm(
+            client2,
+            Some(Ipv4Addr::new(192, 168, 1, 20)),
+            config.server_ip,
+            config.net,
+            Duration::from_secs(3600),
+            Some("laptop".to_string()),
+        );
+        assert_eq!(
+            res2,
+            Some(LeaseConfirmation {
+                ip: Ipv4Addr::new(192, 168, 1, 20),
+                hostname: None,
+                old_hostname_to_deregister: None,
+            })
+        );
+
+        // Client 1 renews "laptop" -> retains "laptop" without collision
+        let res1_renew = leases.validate_and_confirm(
+            client1,
+            Some(Ipv4Addr::new(192, 168, 1, 10)),
+            config.server_ip,
+            config.net,
+            Duration::from_secs(3600),
+            Some("laptop".to_string()),
+        );
+        assert_eq!(
+            res1_renew,
+            Some(LeaseConfirmation {
+                ip: Ipv4Addr::new(192, 168, 1, 10),
+                hostname: Some("laptop".to_string()),
+                old_hostname_to_deregister: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_validate_and_confirm_hostname_change_deregisters_old() {
+        let config = make_config("192.168.1.1/24");
+        let mut leases = LeaseTable::new();
+        let client = MacAddr::new(1, 2, 3, 4, 5, 6);
+        let valid_ip = Ipv4Addr::new(192, 168, 1, 100);
+
+        // Initial lease with "laptop"
+        let res1 = leases.validate_and_confirm(
+            client,
+            Some(valid_ip),
+            config.server_ip,
+            config.net,
+            Duration::from_secs(3600),
+            Some("laptop".to_string()),
+        );
+        assert_eq!(
+            res1,
+            Some(LeaseConfirmation {
+                ip: valid_ip,
+                hostname: Some("laptop".to_string()),
+                old_hostname_to_deregister: None,
+            })
+        );
+
+        // Renewal with changed hostname "workstation" -> returns old "laptop" to deregister
+        let res2 = leases.validate_and_confirm(
+            client,
+            Some(valid_ip),
+            config.server_ip,
+            config.net,
+            Duration::from_secs(3600),
+            Some("workstation".to_string()),
+        );
+        assert_eq!(
+            res2,
+            Some(LeaseConfirmation {
+                ip: valid_ip,
+                hostname: Some("workstation".to_string()),
+                old_hostname_to_deregister: Some("laptop".to_string()),
+            })
+        );
+
+        // Renewal with no hostname -> returns old "workstation" to deregister
+        let res3 = leases.validate_and_confirm(
+            client,
+            Some(valid_ip),
+            config.server_ip,
+            config.net,
+            Duration::from_secs(3600),
+            None,
+        );
+        assert_eq!(
+            res3,
+            Some(LeaseConfirmation {
+                ip: valid_ip,
+                hostname: None,
+                old_hostname_to_deregister: Some("workstation".to_string()),
+            })
+        );
     }
 
     #[test]
@@ -981,6 +1228,7 @@ mod tests {
             ClientLease {
                 ip,
                 expiry: Instant::now() + Duration::from_secs(3600),
+                hostname: None,
             },
         );
         assert!(!leases.is_ip_available(ip));
