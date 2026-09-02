@@ -400,4 +400,79 @@ mod tests {
     fn test_parse_cli_fd_invalid() {
         assert!(parse_cli_fd("not-a-number").is_err());
     }
+
+    #[test]
+    fn test_cli_fd_conversions_and_clone() {
+        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let owned_fd: OwnedFd = s1.into();
+        let cli_fd: CliFd = owned_fd.into();
+
+        // Clone
+        let cloned = cli_fd.clone();
+        assert_ne!(cli_fd.as_raw_fd(), cloned.as_raw_fd());
+        assert!(cli_fd.as_fd().as_raw_fd() >= 0);
+
+        // Convert back to OwnedFd
+        let back_to_owned: OwnedFd = cli_fd.into();
+        assert!(back_to_owned.as_raw_fd() >= 0);
+
+        // From UdpSocket
+        let udp_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let cli_udp: CliFd = udp_sock.into();
+        assert!(cli_udp.as_raw_fd() >= 0);
+    }
+
+    #[test]
+    fn test_modprobe_cli_parsing_flags_and_params() {
+        let args = vec![
+            "modprobe".to_string(),
+            "-q".to_string(),
+            "-s".to_string(),
+            "-b".to_string(),
+            "e1000".to_string(),
+            "param1=val1".to_string(),
+            "param2=val2".to_string(),
+        ];
+        let cli = Cli::try_parse_from(&args).expect("parse modprobe");
+        if let Some(Commands::Modprobe {
+            quiet,
+            syslog,
+            use_blacklist,
+            module_name,
+            params,
+        }) = cli.command
+        {
+            assert!(quiet);
+            assert!(syslog);
+            assert!(use_blacklist);
+            assert_eq!(module_name, "e1000");
+            assert_eq!(params, vec!["param1=val1", "param2=val2"]);
+        } else {
+            panic!("Expected Modprobe command variant");
+        }
+    }
+
+    #[test]
+    fn test_trimrouter_subcommands_modprobe() {
+        let args = vec![
+            "trimrouter".to_string(),
+            "modprobe".to_string(),
+            "-q".to_string(),
+            "crc32c".to_string(),
+        ];
+        let cli = Cli::try_parse_from(&args).expect("parse trimrouter modprobe");
+        if let Some(Commands::Trimrouter { sub }) = cli.command {
+            if let Some(TrimrouterSubcommands::Modprobe {
+                quiet, module_name, ..
+            }) = sub
+            {
+                assert!(quiet);
+                assert_eq!(module_name, "crc32c");
+            } else {
+                panic!("Expected TrimrouterSubcommands::Modprobe");
+            }
+        } else {
+            panic!("Expected Commands::Trimrouter");
+        }
+    }
 }

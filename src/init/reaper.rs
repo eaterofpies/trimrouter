@@ -100,4 +100,51 @@ mod tests {
         let results = sys.waitpid_results.lock().unwrap();
         assert_eq!(results.len(), 0);
     }
+
+    #[test]
+    fn test_try_reap_zombie_statuses() {
+        let sys = MockSystem::new();
+
+        // StillAlive returns false
+        sys.waitpid_results
+            .lock()
+            .unwrap()
+            .push(Ok(WaitStatus::StillAlive));
+        assert!(!try_reap_zombie(&sys));
+
+        // Unexpected error (e.g. EINVAL) returns false
+        sys.waitpid_results
+            .lock()
+            .unwrap()
+            .push(Err(nix::Error::EINVAL));
+        assert!(!try_reap_zombie(&sys));
+
+        // Other status (e.g. Stopped) returns false
+        sys.waitpid_results
+            .lock()
+            .unwrap()
+            .push(Ok(WaitStatus::Stopped(
+                Pid::from_raw(100),
+                nix::sys::signal::Signal::SIGSTOP,
+            )));
+        assert!(!try_reap_zombie(&sys));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_polling_reaper_stops_on_flag() {
+        let sys = Arc::new(MockSystem::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let sys_clone = Arc::clone(&sys);
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        let handle = tokio::spawn(async move {
+            fallback_polling_reaper(sys_clone, shutdown_clone).await;
+        });
+
+        // Set shutdown flag and wait for reaper to stop cleanly
+        shutdown.store(true, Ordering::Relaxed);
+        let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(res.is_ok());
+    }
 }

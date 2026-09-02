@@ -211,4 +211,12 @@ mod tests {
         // 6 rules: 1. Invalid Drop, 2. Lo Accept, 3. CT Accept, 4. LAN Accept, 5. WAN DHCP Accept, 6. ICMP Accept
         assert_eq!(rules.len(), 6);
     }
+
+    #[test]
+    fn test_build_nat_rule_structure() {
+        let table = Table::new(ProtocolFamily::Ipv4).with_name("nat_table");
+        let nat_chain = Chain::new(&table).with_name("nat_chain");
+        let rule = build_nat_rule(&nat_chain, "wan");
+        assert!(rule.is_ok());
+    }
 }

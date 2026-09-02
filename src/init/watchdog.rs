@@ -431,4 +431,50 @@ pub mod tests {
             assert_eq!(svc.index(), i);
         }
     }
+
+    #[test]
+    fn test_monitored_service_display_and_as_str() {
+        assert_eq!(MonitoredService::DnsForwarder.as_str(), "dns-forwarder");
+        assert_eq!(
+            MonitoredService::InterfaceMonitor.as_str(),
+            "interface-monitor"
+        );
+        assert_eq!(MonitoredService::DhcpClient.as_str(), "dhcp-client");
+        assert_eq!(MonitoredService::LanManager.as_str(), "lan-manager");
+
+        assert_eq!(
+            format!("{}", MonitoredService::DnsForwarder),
+            "dns-forwarder"
+        );
+        assert_eq!(
+            format!("{}", MonitoredService::InterfaceMonitor),
+            "interface-monitor"
+        );
+        assert_eq!(format!("{}", MonitoredService::DhcpClient), "dhcp-client");
+        assert_eq!(format!("{}", MonitoredService::LanManager), "lan-manager");
+    }
+
+    #[test]
+    fn test_send_service_heartbeat_none_and_closed() {
+        // None sender should not panic
+        send_service_heartbeat(None, MonitoredService::DnsForwarder);
+
+        // Sender with dropped receiver should not panic
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        send_service_heartbeat(Some(&tx), MonitoredService::DnsForwarder);
+    }
+
+    #[test]
+    fn test_evaluate_health_unseen_service_fails() {
+        let liveness: ServiceLivenessMap = [None; MONITORED_SERVICE_COUNT];
+        let timeout = Duration::from_secs(30);
+
+        // A service with None liveness fails health evaluation
+        assert!(!evaluate_health(
+            &[MonitoredService::DnsForwarder],
+            &liveness,
+            timeout
+        ));
+    }
 }

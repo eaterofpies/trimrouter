@@ -1241,4 +1241,47 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn test_calculate_cache_ttl_and_negative_ttl_bounds() {
+        use hickory_proto::rr::rdata::SOA;
+
+        // Truncated packet returns None
+        let mut msg_tc = Message::new(100, hickory_proto::op::MessageType::Response, OpCode::Query);
+        msg_tc.metadata.truncation = true;
+        assert_eq!(calculate_cache_ttl(&msg_tc), None);
+
+        // Query packet (not response) returns None
+        let msg_query = Message::new(101, hickory_proto::op::MessageType::Query, OpCode::Query);
+        assert_eq!(calculate_cache_ttl(&msg_query), None);
+
+        // NXDomain without SOA returns DEFAULT_NEGATIVE_TTL_SECS (60s)
+        let mut msg_nx = Message::new(102, hickory_proto::op::MessageType::Response, OpCode::Query);
+        msg_nx.metadata.response_code = hickory_proto::op::ResponseCode::NXDomain;
+        assert_eq!(
+            calculate_cache_ttl(&msg_nx),
+            Some(Duration::from_secs(DEFAULT_NEGATIVE_TTL_SECS as u64))
+        );
+
+        // NXDomain with SOA minimum = 30s
+        let mut msg_soa =
+            Message::new(103, hickory_proto::op::MessageType::Response, OpCode::Query);
+        msg_soa.metadata.response_code = hickory_proto::op::ResponseCode::NXDomain;
+        let soa = SOA::new(
+            Name::from_ascii("ns1.example.com.").unwrap(),
+            Name::from_ascii("hostmaster.example.com.").unwrap(),
+            1,
+            7200,
+            3600,
+            1209600,
+            30, // minimum TTL = 30s
+        );
+        let record = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            120,
+            hickory_proto::rr::RData::SOA(soa),
+        );
+        msg_soa.add_authority(record);
+        assert_eq!(calculate_cache_ttl(&msg_soa), Some(Duration::from_secs(30)));
+    }
 }

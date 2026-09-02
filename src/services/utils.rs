@@ -793,4 +793,87 @@ mod tests {
             Duration::from_secs(60)
         );
     }
+
+    #[test]
+    fn test_is_valid_upstream_resolver_all_classes() {
+        assert!(is_valid_upstream_resolver(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(is_valid_upstream_resolver(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(is_valid_upstream_resolver(Ipv4Addr::new(9, 9, 9, 9)));
+
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::UNSPECIFIED));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::BROADCAST));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(224, 0, 0, 1)));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(169, 254, 1, 1)));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(198, 51, 100, 1)));
+        assert!(!is_valid_upstream_resolver(Ipv4Addr::new(203, 0, 113, 1)));
+    }
+
+    #[test]
+    fn test_prefix_len_to_mask() {
+        assert_eq!(prefix_len_to_mask(0), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(prefix_len_to_mask(8), Ipv4Addr::new(255, 0, 0, 0));
+        assert_eq!(prefix_len_to_mask(16), Ipv4Addr::new(255, 255, 0, 0));
+        assert_eq!(prefix_len_to_mask(24), Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(prefix_len_to_mask(30), Ipv4Addr::new(255, 255, 255, 252));
+        assert_eq!(prefix_len_to_mask(32), Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(prefix_len_to_mask(33), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(prefix_len_to_mask(255), Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn test_clean_option_display_and_debug() {
+        let some_ip: Option<Ipv4Addr> = Some(Ipv4Addr::new(192, 168, 1, 1));
+        let none_ip: Option<Ipv4Addr> = None;
+
+        assert_eq!(format!("{}", CleanOption(&some_ip)), "\"192.168.1.1\"");
+        assert_eq!(format!("{:?}", CleanOption(&some_ip)), "\"192.168.1.1\"");
+        assert_eq!(format!("{}", CleanOption(&none_ip)), "None");
+        assert_eq!(format!("{:?}", CleanOption(&none_ip)), "None");
+    }
+
+    #[test]
+    fn test_wan_lease_debug_formatting() {
+        let lease = WanLease {
+            ip: Some(Ipv4Addr::new(10, 0, 2, 15)),
+            mask: Some(Ipv4Addr::new(255, 255, 255, 0)),
+            gateway: None,
+            dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8)],
+        };
+        let debug_str = format!("{:?}", lease);
+        assert!(debug_str.contains("ip: \"10.0.2.15\""));
+        assert!(debug_str.contains("mask: \"255.255.255.0\""));
+        assert!(debug_str.contains("gateway: None"));
+        assert!(!debug_str.contains("Some("));
+    }
+
+    #[test]
+    fn test_mac_from_slice_valid_and_invalid() {
+        let valid_slice = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+        let mac = mac_from_slice(&valid_slice).expect("valid mac");
+        assert_eq!(mac, MacAddr::new(0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC));
+
+        let short_slice = [0x12, 0x34, 0x56];
+        assert!(mac_from_slice(&short_slice).is_err());
+
+        let long_slice = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE];
+        assert!(mac_from_slice(&long_slice).is_err());
+
+        let empty_slice: [u8; 0] = [];
+        assert!(mac_from_slice(&empty_slice).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_ntp_server_ip_all_classes() {
+        assert!(is_valid_ntp_server_ip(Ipv4Addr::new(216, 239, 35, 0))); // Google NTP
+        assert!(is_valid_ntp_server_ip(Ipv4Addr::new(129, 6, 15, 28))); // NIST NTP
+
+        assert!(!is_valid_ntp_server_ip(Ipv4Addr::UNSPECIFIED));
+        assert!(!is_valid_ntp_server_ip(Ipv4Addr::BROADCAST));
+        assert!(!is_valid_ntp_server_ip(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_valid_ntp_server_ip(Ipv4Addr::new(224, 0, 1, 1))); // Multicast
+        assert!(!is_valid_ntp_server_ip(Ipv4Addr::new(169, 254, 0, 1))); // Link-local
+        assert!(!is_valid_ntp_server_ip(Ipv4Addr::new(192, 0, 2, 1))); // Documentation
+    }
 }

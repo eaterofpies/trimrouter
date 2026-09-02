@@ -649,4 +649,66 @@ mod tests {
         .to_string();
         assert!(RouterConfig::parse(&sys).is_err());
     }
+
+    #[test]
+    fn test_config_parsing_custom_dns_deduplication_and_whitespace() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            dns_servers = [" 1.1.1.1 ", "8.8.8.8", "1.1.1.1"]
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(
+            cfg.dns_servers,
+            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_custom_dns_empty_list() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            dns_servers = []
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert!(cfg.dns_servers.is_empty());
+    }
+
+    #[test]
+    fn test_config_parsing_custom_dns_rejects_special_addresses() {
+        let invalid_addrs = [
+            "0.0.0.0",         // Unspecified
+            "255.255.255.255", // Broadcast
+            "224.0.0.1",       // Multicast
+            "169.254.1.1",     // Link-local
+            "192.0.2.1",       // TEST-NET-1 documentation
+            "198.51.100.1",    // TEST-NET-2 documentation
+            "203.0.113.1",     // TEST-NET-3 documentation
+        ];
+
+        for addr in invalid_addrs {
+            let mut sys = MockSystem::new();
+            sys.config_content = format!(
+                r#"
+                [network]
+                wan_mac = "52:54:00:12:34:56"
+                lan_mac = "52:54:00:12:34:57"
+                dns_servers = ["{}"]
+                "#,
+                addr
+            );
+            assert!(
+                RouterConfig::parse(&sys).is_err(),
+                "Expected address {} to be rejected",
+                addr
+            );
+        }
+    }
 }

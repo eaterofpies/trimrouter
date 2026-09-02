@@ -283,4 +283,52 @@ mod tests {
         let pre_epoch_dt = Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap();
         assert_eq!(datetime_to_time_components(pre_epoch_dt), None);
     }
+
+    #[test]
+    fn test_calculate_next_retry_delay_exponential() {
+        assert_eq!(
+            calculate_next_retry_delay(Duration::from_secs(60)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            calculate_next_retry_delay(Duration::from_secs(120)),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            calculate_next_retry_delay(Duration::from_secs(240)),
+            Duration::from_secs(480)
+        );
+        assert_eq!(
+            calculate_next_retry_delay(Duration::from_secs(480)),
+            Duration::from_secs(900) // Capped at MAX_RETRY_INTERVAL (15 mins = 900s)
+        );
+        assert_eq!(
+            calculate_next_retry_delay(Duration::from_secs(900)),
+            Duration::from_secs(900)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_time_server_resolved_invalid_ip() {
+        let (s1, _s2) = tokio::net::UnixStream::pair().unwrap();
+        let (_r1, mut w1) = s1.into_split();
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // 127.0.0.1 is rejected as invalid NTP server IP
+        let res = handle_time_server_resolved(
+            Ok(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            &mut w1,
+            &udp_sock,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert_eq!(
+            res,
+            SyncScheduleResult {
+                next_sync_delay: Duration::from_secs(60),
+                next_retry_delay: Duration::from_secs(120),
+            }
+        );
+    }
 }

@@ -242,4 +242,10 @@ mod tests {
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("Failed to resolve"));
     }
+
+    #[test]
+    fn test_sntp_client_new() {
+        let (_tx, lease_rx) = tokio::sync::watch::channel(crate::services::WanLease::default());
+        let _client = SntpClient::new(lease_rx);
+    }
 }

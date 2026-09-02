@@ -753,4 +753,82 @@ alias usb:v045Ep* usbnet\n\
         assert_eq!(find_module_file("evil\0module"), None);
         assert_eq!(find_module_file("pci:v00008086d0000100E"), None);
     }
+
+    #[test]
+    fn test_parse_modules_alias_line_edge_cases() {
+        assert_eq!(parse_modules_alias_line("# This is a comment"), None);
+        assert_eq!(parse_modules_alias_line(""), None);
+        assert_eq!(parse_modules_alias_line("options e1000 foo=bar"), None);
+        assert_eq!(parse_modules_alias_line("alias"), None);
+        assert_eq!(
+            parse_modules_alias_line("alias pci:v00008086d0000100E*"),
+            None
+        );
+
+        let parsed = parse_modules_alias_line("alias pci:v00008086* e1000").unwrap();
+        let pattern: String = parsed.0.into_iter().collect();
+        assert_eq!(pattern, "pci:v00008086*");
+        assert_eq!(parsed.1, "e1000");
+    }
+
+    #[test]
+    fn test_parse_modules_dep_empty_and_missing() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("kmod_dep_test_{}", rand::random::<u64>()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // Non-existent dep file returns empty map
+        let missing_path = temp_dir.join("modules.dep");
+        let map = parse_modules_dep(&missing_path, &temp_dir);
+        assert!(map.is_empty());
+
+        // Empty file returns empty map
+        fs::write(&missing_path, "").unwrap();
+        let map = parse_modules_dep(&missing_path, &temp_dir);
+        assert!(map.is_empty());
+
+        // Valid dep lines
+        let content = "kernel/drivers/net/e1000/e1000.ko: kernel/net/core/netcore.ko\nkernel/net/core/netcore.ko:\n";
+        fs::write(&missing_path, content).unwrap();
+        let map = parse_modules_dep(&missing_path, &temp_dir);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("e1000"));
+        assert_eq!(map.get("e1000").unwrap().1, vec!["netcore".to_string()]);
+        assert!(map.contains_key("netcore"));
+        assert!(map.get("netcore").unwrap().1.is_empty());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_handle_uevent_actions() {
+        use kobject_uevent::{ActionType, UEvent};
+        use std::collections::HashMap;
+
+        // Add action without MODALIAS
+        let uevent_no_alias = UEvent {
+            action: ActionType::Add,
+            devpath: std::path::PathBuf::from("/devices/pci0000:00"),
+            subsystem: "pci".to_string(),
+            env: HashMap::new(),
+            seq: 1,
+        };
+        handle_uevent(uevent_no_alias);
+
+        // Remove action with MODALIAS (ignored)
+        let mut env_remove = HashMap::new();
+        env_remove.insert(
+            "MODALIAS".to_string(),
+            "pci:v00008086d0000100E*".to_string(),
+        );
+        let uevent_remove = UEvent {
+            action: ActionType::Remove,
+            devpath: std::path::PathBuf::from("/devices/pci0000:00"),
+            subsystem: "pci".to_string(),
+            env: env_remove,
+            seq: 2,
+        };
+        handle_uevent(uevent_remove);
+    }
 }

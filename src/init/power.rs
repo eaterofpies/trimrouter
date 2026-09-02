@@ -185,4 +185,36 @@ mod tests {
             Some(RebootMode::RB_POWER_OFF)
         );
     }
+
+    #[test]
+    fn test_execute_clean_poweroff_fallback_on_error() {
+        use std::sync::Mutex;
+
+        struct FallbackMockSystem {
+            reboot_calls: Mutex<Vec<RebootMode>>,
+        }
+
+        impl PowerOps for FallbackMockSystem {
+            fn reboot(&self, mode: RebootMode) -> Result<(), nix::Error> {
+                self.reboot_calls.lock().unwrap().push(mode);
+                if mode == RebootMode::RB_POWER_OFF {
+                    Err(nix::Error::EPERM)
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn sync(&self) {}
+        }
+
+        let mock = FallbackMockSystem {
+            reboot_calls: Mutex::new(Vec::new()),
+        };
+        execute_clean_poweroff(&mock, "test-fallback");
+
+        let calls = mock.reboot_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], RebootMode::RB_POWER_OFF);
+        assert_eq!(calls[1], RebootMode::RB_AUTOBOOT);
+    }
 }

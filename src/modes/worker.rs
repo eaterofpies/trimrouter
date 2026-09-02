@@ -57,3 +57,25 @@ pub async fn run_worker(service: WorkerService) {
     }
     exit(0);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::CliFd;
+
+    #[test]
+    fn test_worker_service_properties() {
+        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let udp_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let service = WorkerService::SntpClient {
+            ipc_fd: CliFd(s1.into()),
+            ntp_socket_fd: CliFd(udp_sock.into()),
+        };
+
+        let fds = service.child_fds();
+        assert_eq!(fds.len(), 2);
+        let args = service.to_args();
+        assert_eq!(args.len(), 2);
+    }
+}

@@ -414,4 +414,18 @@ mod tests {
         assert_eq!(content, RESOLV_CONF_CONTENT);
         let _ = fs::remove_dir_all(temp_dir);
     }
+
+    #[test]
+    fn test_real_system_basic_methods() {
+        let sys = RealSystem;
+        let pid = sys.getpid();
+        assert!(pid.as_raw() > 0);
+        sys.sync();
+    }
+
+    #[test]
+    fn test_mock_system_read_config_empty_returns_err() {
+        let sys = MockSystem::new();
+        assert!(sys.read_config_file().is_err());
+    }
 }

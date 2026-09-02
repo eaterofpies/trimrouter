@@ -293,3 +293,77 @@ fn stream_to_logger<R: Read + Send + 'static>(pipe: R) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_service_error_display_and_from_io() {
+        let err_already = ServiceError::AlreadyRunning;
+        assert_eq!(err_already.to_string(), "Service is already running");
+
+        let err_not_running = ServiceError::NotRunning;
+        assert_eq!(err_not_running.to_string(), "Service is not running");
+
+        let io_err = io::Error::new(io::ErrorKind::ConnectionReset, "socket dropped");
+        let err_io = ServiceError::from(io_err);
+        assert!(err_io.to_string().contains("IO error: socket dropped"));
+
+        let err_failed = ServiceError::FailedToStart("missing executable".to_string());
+        assert_eq!(
+            err_failed.to_string(),
+            "Failed to start: missing executable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_controller_lifecycle_and_error_states() {
+        let mut controller = ServiceController::new();
+        assert!(!controller.is_running());
+
+        // Stopping a non-running controller returns NotRunning
+        let stop_res = controller.stop().await;
+        assert!(matches!(stop_res, Err(ServiceError::NotRunning)));
+
+        // Start controller
+        let start_res = controller.start(|mut shutdown_rx| async move {
+            let _ = shutdown_rx.changed().await;
+        });
+        assert!(start_res.is_ok());
+        assert!(controller.is_running());
+
+        // Starting an already-running controller returns AlreadyRunning
+        let double_start = controller.start(|_| async {});
+        assert!(matches!(double_start, Err(ServiceError::AlreadyRunning)));
+
+        // Stop running controller
+        let stop_res = controller.stop().await;
+        assert!(stop_res.is_ok());
+        assert!(!controller.is_running());
+
+        // Stopping again returns NotRunning
+        let stop_again = controller.stop().await;
+        assert!(matches!(stop_again, Err(ServiceError::NotRunning)));
+    }
+
+    #[test]
+    fn test_external_worker_initial_pid() {
+        let worker = ExternalWorker::new("test-worker");
+        assert_eq!(worker.get_worker_pid(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_external_worker_start_supervised_lifecycle() {
+        let mut worker = ExternalWorker::new("test-worker");
+
+        let res = worker.start_supervised(
+            || Err(ServiceError::FailedToStart("test failure".to_string())),
+            |_fd, _pid, _shutdown| Ok(tokio::spawn(async {})),
+        );
+        assert!(res.is_ok());
+
+        let stop_res = worker.stop().await;
+        assert!(stop_res.is_ok());
+    }
+}

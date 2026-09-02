@@ -1241,4 +1241,40 @@ mod tests {
         // Unknown client2 still returns None
         assert_eq!(leases.remove(&client2), None);
     }
+
+    #[test]
+    fn test_build_dhcp_reply_payload_offer_and_ack() {
+        let config = make_config("192.168.1.1/24");
+        let mut req = Message::default();
+        req.set_xid(0x1234);
+        req.set_chaddr(&[1, 2, 3, 4, 5, 6]);
+
+        let leased_ip = Ipv4Addr::new(192, 168, 1, 100);
+
+        // Test Offer payload
+        let offer_bytes =
+            build_dhcp_reply_payload(MessageType::Offer, &req, leased_ip, &config).unwrap();
+        let offer_msg = Message::decode(&mut Decoder::new(&offer_bytes)).unwrap();
+        assert_eq!(offer_msg.opcode(), Opcode::BootReply);
+        assert_eq!(offer_msg.xid(), 0x1234);
+        assert_eq!(offer_msg.yiaddr(), leased_ip);
+        assert_eq!(offer_msg.siaddr(), config.server_ip);
+        assert_eq!(
+            offer_msg.opts().get(OptionCode::MessageType),
+            Some(&DhcpOption::MessageType(MessageType::Offer))
+        );
+        assert_eq!(
+            offer_msg.opts().get(OptionCode::SubnetMask),
+            Some(&DhcpOption::SubnetMask(config.subnet_mask))
+        );
+
+        // Test Ack payload
+        let ack_bytes =
+            build_dhcp_reply_payload(MessageType::Ack, &req, leased_ip, &config).unwrap();
+        let ack_msg = Message::decode(&mut Decoder::new(&ack_bytes)).unwrap();
+        assert_eq!(
+            ack_msg.opts().get(OptionCode::MessageType),
+            Some(&DhcpOption::MessageType(MessageType::Ack))
+        );
+    }
 }

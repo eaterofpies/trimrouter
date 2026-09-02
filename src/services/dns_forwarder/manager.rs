@@ -253,3 +253,46 @@ impl Service for DnsForwarder {
         self.state.stop().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::WanLease;
+    use tokio::net::UnixStream;
+
+    #[test]
+    fn test_dns_forwarder_constructors_and_pid() {
+        let (_tx, lease_rx) = tokio::sync::watch::channel(WanLease::default());
+        let fwd = DnsForwarder::new(lease_rx.clone());
+        assert_eq!(fwd.get_worker_pid(), 0);
+
+        let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(1);
+        let fwd_hb = DnsForwarder::with_heartbeat(lease_rx.clone(), hb_tx);
+        assert_eq!(fwd_hb.get_worker_pid(), 0);
+
+        let (_lh_tx, lh_rx) = tokio::sync::mpsc::channel(1);
+        let fwd_lh = DnsForwarder::with_local_hosts(lease_rx.clone(), None, Some(lh_rx));
+        assert_eq!(fwd_lh.get_worker_pid(), 0);
+
+        let custom = vec![Ipv4Addr::new(1, 1, 1, 1)];
+        let fwd_custom = DnsForwarder::with_custom_dns(lease_rx, custom, None, None);
+        assert_eq!(fwd_custom.get_worker_pid(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_upstream_resolvers_ipc_message() {
+        let (s1, s2) = UnixStream::pair().unwrap();
+        let (_r1, mut w1) = s1.into_split();
+        let (mut r2, _w2) = s2.into_split();
+
+        let servers = vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)];
+        let res = update_upstream_resolvers(&mut w1, &servers).await;
+        assert!(res.is_ok());
+
+        let received: Option<DnsParentToWorkerMsg> = recv_msg(&mut r2).await.unwrap();
+        assert_eq!(
+            received,
+            Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })
+        );
+    }
+}

@@ -636,4 +636,61 @@ mod tests {
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_clean_target_variants() {
+        assert_eq!(
+            clean_target("trimrouter::services::dns_forwarder"),
+            "dns-forwarder"
+        );
+        assert_eq!(clean_target("trimrouter::init::watchdog"), "watchdog");
+        assert_eq!(clean_target("custom_service_name"), "custom-service-name");
+    }
+
+    #[test]
+    fn test_parse_line_level_all() {
+        assert_eq!(
+            parse_line_level("A fatal system crash occurred"),
+            Level::Error
+        );
+        assert_eq!(parse_line_level("Error: unable to bind port"), Level::Error);
+        assert_eq!(parse_line_level("Service failed to start"), Level::Error);
+        assert_eq!(parse_line_level("Kernel panic - not syncing"), Level::Error);
+
+        assert_eq!(parse_line_level("Warning: lease near expiry"), Level::Warn);
+        assert_eq!(parse_line_level("warn: dropping packet"), Level::Warn);
+
+        assert_eq!(
+            parse_line_level("debug: parsing query payload"),
+            Level::Debug
+        );
+        assert_eq!(parse_line_level("trace: entering state loop"), Level::Trace);
+        assert_eq!(parse_line_level("System started successfully"), Level::Info);
+    }
+
+    #[test]
+    fn test_format_raw_line_with_explicit_level_variants() {
+        let ts = Utc.with_ymd_and_hms(2026, 8, 14, 14, 30, 0).unwrap();
+
+        // Already formatted line
+        let already = "[2026-08-14T14:30:00Z] [INFO] [init] Ready\n";
+        assert_eq!(
+            format_raw_line_with_explicit_level(ts, None, already),
+            already
+        );
+
+        // Line with service header [dhcp]
+        let svc_line = "[dhcp] IP assigned to client";
+        assert_eq!(
+            format_raw_line_with_explicit_level(ts, Some(Level::Info), svc_line),
+            "[2026-08-14T14:30:00Z] [INFO] [dhcp] IP assigned to client\n"
+        );
+
+        // Plain line without service
+        let plain = "Boot completed";
+        assert_eq!(
+            format_raw_line_with_explicit_level(ts, Some(Level::Info), plain),
+            "[2026-08-14T14:30:00Z] [INFO] [system] Boot completed\n"
+        );
+    }
 }

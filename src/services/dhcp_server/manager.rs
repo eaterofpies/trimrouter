@@ -230,3 +230,71 @@ impl Service for DhcpServer {
         self.state.stop().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtnetlink::packet_route::neighbour::NeighbourMessage;
+
+    #[test]
+    fn test_dhcp_server_constructors_and_pid() {
+        let srv = DhcpServer::new("lan".to_string(), "192.168.1.1/24".to_string());
+        assert_eq!(srv.get_worker_pid(), 0);
+
+        let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(1);
+        let srv_hb = DhcpServer::with_heartbeat(
+            "lan".to_string(),
+            "192.168.1.1/24".to_string(),
+            hb_tx.clone(),
+        );
+        assert_eq!(srv_hb.get_worker_pid(), 0);
+
+        let (lh_tx, _lh_rx) = tokio::sync::mpsc::channel(1);
+        let srv_lh = DhcpServer::with_local_hosts(
+            "lan".to_string(),
+            "192.168.1.1/24".to_string(),
+            Some(hb_tx),
+            Some(lh_tx),
+        );
+        assert_eq!(srv_lh.get_worker_pid(), 0);
+    }
+
+    #[test]
+    fn test_parse_neighbor_update_valid_and_invalid() {
+        // Non-NewNeighbour payload
+        let non_neigh = NetlinkPayload::Noop;
+        assert_eq!(parse_neighbor_update(&non_neigh), None);
+
+        // Valid NewNeighbour message with IP and MAC
+        let mut msg = NeighbourMessage::default();
+        msg.attributes
+            .push(NeighbourAttribute::Destination(NeighbourAddress::Inet(
+                Ipv4Addr::new(192, 168, 1, 50),
+            )));
+        msg.attributes
+            .push(NeighbourAttribute::LinkLayerAddress(vec![
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            ]));
+
+        let payload = NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg));
+        let parsed = parse_neighbor_update(&payload);
+        assert_eq!(
+            parsed,
+            Some((
+                Ipv4Addr::new(192, 168, 1, 50),
+                [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+            ))
+        );
+
+        // Missing MAC attribute
+        let mut msg_no_mac = NeighbourMessage::default();
+        msg_no_mac
+            .attributes
+            .push(NeighbourAttribute::Destination(NeighbourAddress::Inet(
+                Ipv4Addr::new(192, 168, 1, 50),
+            )));
+        let payload_no_mac =
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg_no_mac));
+        assert_eq!(parse_neighbor_update(&payload_no_mac), None);
+    }
+}

@@ -646,4 +646,44 @@ mod tests {
             None
         );
     }
+
+    #[tokio::test]
+    async fn test_managed_interface_creation_and_lifecycle() {
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let mut iface = ManagedInterface::new("wan".to_string(), mac, Vec::new());
+        assert_eq!(iface.name, "wan");
+        assert_eq!(iface.mac, mac);
+        assert_eq!(iface.active_index, None);
+        assert!(iface.active_services.is_empty());
+
+        iface.start_services().await;
+        iface.stop_services().await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_del_link_resets_active_index() {
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let mut iface = ManagedInterface::new("wan".to_string(), mac, Vec::new());
+        iface.active_index = Some(42);
+
+        // Deleting non-matching index does nothing
+        handle_del_link(&mut iface, 99).await;
+        assert_eq!(iface.active_index, Some(42));
+
+        // Deleting matching index stops services and resets active_index
+        handle_del_link(&mut iface, 42).await;
+        assert_eq!(iface.active_index, None);
+    }
+
+    #[test]
+    fn test_if_indextoname_nonexistent() {
+        assert_eq!(if_indextoname(999999), None);
+    }
+
+    #[test]
+    fn test_log_carrier_transition() {
+        let mac = MacAddr::new(0x52, 0x54, 0x00, 0x12, 0x34, 0x56);
+        log_carrier_transition("eth0", mac, true);
+        log_carrier_transition("eth0", mac, false);
+    }
 }

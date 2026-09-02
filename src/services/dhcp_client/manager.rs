@@ -368,4 +368,15 @@ mod tests {
         assert!(!is_valid_gateway(Ipv4Addr::UNSPECIFIED, ip, prefix_len));
         assert!(!is_valid_gateway(Ipv4Addr::BROADCAST, ip, prefix_len));
     }
+
+    #[test]
+    fn test_dhcp_client_constructors_and_pid() {
+        let (lease_tx, _lease_rx) = tokio::sync::watch::channel(WanLease::default());
+        let client = DhcpClient::new("wan".to_string(), lease_tx.clone());
+        assert_eq!(client.get_worker_pid(), 0);
+
+        let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(1);
+        let client_hb = DhcpClient::with_heartbeat("wan".to_string(), lease_tx, hb_tx);
+        assert_eq!(client_hb.get_worker_pid(), 0);
+    }
 }

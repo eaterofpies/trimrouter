@@ -433,4 +433,31 @@ mod tests {
         assert!(derive_p2_device_name("/dev/sda").is_err());
         assert!(derive_p2_device_name("/dev/sda2").is_err());
     }
+
+    #[test]
+    fn test_mount_boot_partition_mock() {
+        let sys = crate::init::system::mock::MockSystem::new();
+        let res = mount_boot_partition(&sys, "/dev/vda1");
+        assert!(res.is_ok());
+
+        let calls = sys.mount_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].source.as_deref(), Some("/dev/vda1"));
+        assert_eq!(calls[0].target, "/boot");
+        assert_eq!(calls[0].fstype, "vfat");
+        assert_eq!(calls[0].flags, nix::mount::MsFlags::MS_RDONLY);
+    }
+
+    #[test]
+    fn test_setup_log_partition_mock() {
+        let sys = crate::init::system::mock::MockSystem::new();
+        let res = setup_log_partition(&sys, "/dev/vda1", "/dev/vda");
+        assert!(res.is_ok());
+
+        let calls = sys.mount_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].source.as_deref(), Some("/dev/vda2"));
+        assert_eq!(calls[0].target, "/var/log");
+        assert_eq!(calls[0].fstype, "vfat");
+    }
 }

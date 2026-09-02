@@ -104,10 +104,27 @@ mod tests {
         ));
         assert!(io_err.source().is_some());
 
+        let addr_err: RouterError = "invalid".parse::<std::net::Ipv4Addr>().unwrap_err().into();
+        assert!(addr_err.source().is_some());
+
+        let parse_int_err: RouterError = "invalid".parse::<u32>().unwrap_err().into();
+        assert!(parse_int_err.source().is_some());
+
         let generic = RouterError::Generic("none".to_string());
         assert!(generic.source().is_none());
 
         let iface = RouterError::InterfaceNotFound("lan".to_string());
         assert!(iface.source().is_none());
+    }
+
+    #[test]
+    fn test_router_error_from_conversions() {
+        let ipnet_err = "192.168.1.1/99".parse::<ipnet::Ipv4Net>().unwrap_err();
+        let router_err: RouterError = ipnet_err.into();
+        assert!(router_err.to_string().contains("Router error:"));
+
+        let boxed_err: Box<dyn std::error::Error> = Box::new(std::io::Error::other("boxed"));
+        let from_box: RouterError = boxed_err.into();
+        assert_eq!(from_box.to_string(), "Router error: boxed");
     }
 }

@@ -596,11 +596,8 @@ fn calculate_next_delay(current_delay: u32) -> u32 {
 
 fn get_jittered_duration(base_secs: u32) -> std::time::Duration {
     let jitter = (rand::random::<f64>() * 2.0) - 1.0;
-    let secs = base_secs as f64 + jitter;
-    std::cmp::max(
-        std::time::Duration::from_secs(1),
-        std::time::Duration::from_secs_f64(secs),
-    )
+    let secs = (base_secs as f64 + jitter).max(1.0);
+    std::time::Duration::from_secs_f64(secs)
 }
 
 fn calculate_renewal_params(
@@ -1133,5 +1130,71 @@ mod tests {
         assert!(!rebinding);
         assert_eq!(dest, MOCK_SERVER_IP);
         assert_eq!(interval, remaining_to_t2 / 2);
+    }
+
+    #[test]
+    fn test_calculate_next_delay_bounds() {
+        assert_eq!(calculate_next_delay(4), 8);
+        assert_eq!(calculate_next_delay(8), 16);
+        assert_eq!(calculate_next_delay(16), 32);
+        assert_eq!(calculate_next_delay(32), 64);
+        assert_eq!(calculate_next_delay(64), 64);
+        assert_eq!(calculate_next_delay(100), 64);
+    }
+
+    #[test]
+    fn test_get_jittered_duration_bounds() {
+        for _ in 0..100 {
+            let dur = get_jittered_duration(4);
+            assert!(dur.as_secs_f64() >= 3.0);
+            assert!(dur.as_secs_f64() <= 5.0);
+        }
+
+        for _ in 0..50 {
+            let dur = get_jittered_duration(0);
+            assert_eq!(dur, Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn test_build_discover_message_structure() {
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let msg = build_discover_message(mac, 0x12345678);
+
+        assert_eq!(msg.opcode(), Opcode::BootRequest);
+        assert_eq!(msg.xid(), 0x12345678);
+        assert!(msg.flags().broadcast());
+        assert_eq!(
+            msg.opts().get(OptionCode::MessageType),
+            Some(&DhcpOption::MessageType(MessageType::Discover))
+        );
+    }
+
+    #[test]
+    fn test_build_request_message_selecting_and_renewing() {
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let req_ip = Ipv4Addr::new(192, 168, 1, 100);
+        let srv_ip = Ipv4Addr::new(192, 168, 1, 1);
+
+        // Selecting request (ciaddr = 0.0.0.0)
+        let msg_sel =
+            build_request_message(mac, 0x1111, req_ip, Some(srv_ip), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(msg_sel.ciaddr(), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            msg_sel.opts().get(OptionCode::RequestedIpAddress),
+            Some(&DhcpOption::RequestedIpAddress(req_ip))
+        );
+        assert_eq!(
+            msg_sel.opts().get(OptionCode::ServerIdentifier),
+            Some(&DhcpOption::ServerIdentifier(srv_ip))
+        );
+        assert!(msg_sel.flags().broadcast());
+
+        // Renewing request (ciaddr = req_ip)
+        let msg_ren = build_request_message(mac, 0x2222, req_ip, Some(srv_ip), req_ip);
+        assert_eq!(msg_ren.ciaddr(), req_ip);
+        assert_eq!(msg_ren.opts().get(OptionCode::RequestedIpAddress), None);
+        assert_eq!(msg_ren.opts().get(OptionCode::ServerIdentifier), None);
+        assert!(!msg_ren.flags().broadcast());
     }
 }

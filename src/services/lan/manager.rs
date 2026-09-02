@@ -611,4 +611,34 @@ mod tests {
 
         assert_eq!(current_ip, "10.0.0.1/24");
     }
+
+    #[test]
+    fn test_lan_manager_constructors() {
+        let (_tx, lease_rx) = tokio::sync::watch::channel(WanLease::default());
+        let _mgr = LanManager::new(
+            "lan".to_string(),
+            "192.168.1.1/24".to_string(),
+            "10.0.0.1/24".to_string(),
+            lease_rx.clone(),
+        );
+
+        let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(1);
+        let _mgr_hb = LanManager::with_heartbeat(
+            "lan".to_string(),
+            "192.168.1.1/24".to_string(),
+            "10.0.0.1/24".to_string(),
+            lease_rx.clone(),
+            hb_tx.clone(),
+        );
+
+        let (lh_tx, _lh_rx) = tokio::sync::mpsc::channel(1);
+        let _mgr_lh = LanManager::with_local_hosts(
+            "lan".to_string(),
+            "192.168.1.1/24".to_string(),
+            "10.0.0.1/24".to_string(),
+            lease_rx,
+            Some(hb_tx),
+            Some(lh_tx),
+        );
+    }
 }

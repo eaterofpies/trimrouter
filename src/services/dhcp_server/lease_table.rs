@@ -519,3 +519,63 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lease_table_is_empty_and_get_mac_by_ip() {
+        let mut table = LeaseTable::new();
+        assert!(table.is_empty());
+
+        let mac1 = MacAddr::new(1, 2, 3, 4, 5, 6);
+        let ip1 = Ipv4Addr::new(192, 168, 1, 10);
+
+        table.insert(
+            mac1,
+            ClientLease {
+                ip: ip1,
+                expiry: Instant::now() + Duration::from_secs(3600),
+                hostname: Some("printer".to_string()),
+            },
+        );
+        assert!(!table.is_empty());
+        assert_eq!(table.get_mac_by_ip(ip1), Some(mac1));
+        assert_eq!(table.get_mac_by_ip(Ipv4Addr::new(192, 168, 1, 99)), None);
+    }
+
+    #[test]
+    fn test_lease_table_is_hostname_taken_by_other() {
+        let mut table = LeaseTable::new();
+        let mac1 = MacAddr::new(1, 2, 3, 4, 5, 6);
+        let mac2 = MacAddr::new(1, 2, 3, 4, 5, 7);
+
+        table.insert(
+            mac1,
+            ClientLease {
+                ip: Ipv4Addr::new(192, 168, 1, 10),
+                expiry: Instant::now() + Duration::from_secs(3600),
+                hostname: Some("laptop".to_string()),
+            },
+        );
+
+        // Taken by other
+        assert!(table.is_hostname_taken_by_other("laptop", mac2));
+        // Same client can renew its own hostname
+        assert!(!table.is_hostname_taken_by_other("laptop", mac1));
+        // Different hostname not taken
+        assert!(!table.is_hostname_taken_by_other("desktop", mac2));
+
+        // Expired lease does not block hostname
+        table.insert(
+            mac1,
+            ClientLease {
+                ip: Ipv4Addr::new(192, 168, 1, 10),
+                expiry: Instant::now() - Duration::from_secs(1),
+                hostname: Some("laptop".to_string()),
+            },
+        );
+        assert!(!table.is_hostname_taken_by_other("laptop", mac2));
+    }
+}
