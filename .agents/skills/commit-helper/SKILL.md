@@ -19,4 +19,5 @@ This skill provides the instructions for performing git commits securely and res
 
 ## 2. Resolving Permission / Context Cancellation Errors
 If a command like `git commit` fails with `permission check failed` or `context canceled`, it means the terminal sandbox or authorization layer blocked the command prefix. To resolve this:
-Never ask for permission to run `git` always try to run the subcommands with full arguments
+* Always execute git subcommands directly with full, explicit argument flags (e.g. `git commit -m "..."`) rather than interactive or wrapped invocations.
+* Note: Explicit user confirmation in chat remains strictly required before running any git commit command.

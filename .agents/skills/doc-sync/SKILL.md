@@ -19,9 +19,9 @@ Before proposing or running a `git commit`:
 1.  **Scan for Renames**: Check that all documents use the current project name `trimrouter` and contain no stale names.
 2.  **Relative Link Verification**: Verify all markdown links are relative. Never use absolute paths (like `file:///workspaces/...` or `/workspaces/...`) which break on other host systems.
 3.  **Auditing Code vs Docs**:
-    *   Verify the Netfilter table/chain rules and library names in `specs/router_spec.md` match the current crate in `Cargo.toml` and implementation in `src/netfilter.rs`.
+    *   Verify the Netfilter table/chain rules and library names in `specs/router_spec.md` match the current crate in `Cargo.toml` and implementation in `src/init/firewall.rs`.
     *   Verify service lifecycles and injected dependency mappings in `specs/interface_spec.md` exactly align with the interface loop in `src/interface.rs`.
-    *   Ensure the Raspberry Pi bootloader/initramfs paths in `specs/sd_card_image_spec.md` match the target output files built by the Makefile and packaging scripts.
+    *   Ensure the Raspberry Pi bootloader/initramfs paths in `specs/partition_layout_spec.md` match the target output files built by the Makefile and packaging scripts.
 
 ## 3. TODO List Guidelines
 *   **No Checkboxes in TODO.md**: Do not use checkboxes (such as `- [ ]` or `- [x]`) in `TODO.md` or any task list. Simply remove task items entirely from the document once they are completed.
