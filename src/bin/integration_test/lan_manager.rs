@@ -2,6 +2,7 @@ use futures_util::TryStreamExt;
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::address::AddressAttribute;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use trimrouter::network;
@@ -21,6 +22,9 @@ pub async fn test_lan_wan_conflict(
         "192.168.1.1/24".to_string(),
         "10.0.0.1/24".to_string(),
         lease_rx,
+        None,
+        None,
+        HashMap::new(),
     );
 
     if let Err(e) = lan_manager.start().await {
@@ -140,6 +144,9 @@ pub async fn test_lan_dhcp_handshake(lease_rx: WanLeaseReceiver) -> Result<LanMa
         "192.168.1.1/24".to_string(),
         "10.0.0.1/24".to_string(),
         lease_rx,
+        None,
+        None,
+        HashMap::new(),
     );
     if let Err(e) = lan_manager.start().await {
         return Err(format!("Failed to start LanManager: {}", e));

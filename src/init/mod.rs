@@ -298,13 +298,14 @@ fn build_managed_interfaces(
     );
 
     let lan_services = vec![interface::RouterService::LanManager(
-        services::LanManager::with_local_hosts(
+        services::LanManager::new(
             network::LAN_INTERFACE.to_string(),
             config.lan_ip.clone(),
             config.backup_lan_ip.clone(),
             lease_rx,
             Some(heartbeat_tx),
             Some(local_hosts_tx),
+            config.static_leases.clone(),
         ),
     )];
     let lan_iface = interface::ManagedInterface::new(
@@ -320,6 +321,7 @@ fn build_managed_interfaces(
 mod tests {
     use super::*;
     use pnet::util::MacAddr;
+    use std::collections::HashMap;
 
     #[test]
     fn test_build_managed_interfaces_structure() {
@@ -336,6 +338,7 @@ mod tests {
             logging: Default::default(),
             watchdog: true,
             dns_servers: Vec::new(),
+            static_leases: HashMap::new(),
         };
 
         let ifaces = build_managed_interfaces(&config, lease_tx, lease_rx, hb_tx, lh_tx);

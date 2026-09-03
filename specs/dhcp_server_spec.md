@@ -112,3 +112,36 @@ The `LanManager` service manages the LAN interface configuration and encapsulate
 4.  **Reconfiguration**: If the `backup_lan_ip` does not also collide with the WAN subnet, the LAN interface is configured with the backup IP address specified by `backup_lan_ip` (e.g. `10.0.0.1/24`).
 5.  **Child DHCP Server Restart**: The child DHCP Server is re-instantiated with the new LAN IP/subnet range and restarted. The active lease table is cleared, forcing existing clients to re-negotiate leases within the updated range (e.g. `10.0.0.2` to `10.0.0.254`).
 
+---
+
+## 7. Static DHCP Lease Reservations (MAC-to-IP Mappings)
+
+Static DHCP lease reservations allow network administrators to pin specific IPv4 addresses to client MAC addresses via `trimrouter.toml`:
+
+### 7.1 Configuration Format
+Static reservations are configured in the `[dhcp]` section:
+
+```toml
+[[dhcp.reservations]]
+mac = "52:54:00:12:34:58"
+ip = "192.168.1.50"
+
+[[dhcp.reservations]]
+mac = "52:54:00:12:34:59"
+ip = "192.168.1.60"
+```
+
+### 7.2 Validation Rules
+1. **Unicast MAC**: The MAC address must be a valid, non-zero, non-multicast unicast MAC address.
+2. **Subnet Scope**: The reserved IP must be a valid IPv4 host address within the configured `lan_ip` subnet and must not match the router's own gateway IP, network address, or broadcast address.
+3. **No Duplicates**: Each reservation must specify a unique MAC address and a unique IP address.
+
+### 7.3 Allocation & Dynamic Pool Isolation
+1. **Reserved Client Allocation**: When a client whose MAC matches a reservation sends `DHCPDISCOVER`, the server immediately offers its assigned static IP address.
+2. **Dynamic Pool Isolation**: When dynamic clients without reservations request IP addresses, the allocation algorithm (`is_ip_available_for_dynamic`) skips all statically reserved IP addresses.
+3. **Request Enforcement**: If a non-reserved client attempts to request a statically reserved IP, or if a reserved client attempts to request an IP other than its assigned reservation, the server rejects the request with `DHCPNAK`.
+
+### 7.4 Startup Synchronization (Race-Free Initialization)
+Upon worker process launch, the DHCP server supervisor immediately transmits the configured static reservations over IPC (`SetStaticLeases`). The sandboxed worker process explicitly awaits and applies this initial synchronization message before binding or polling the raw packet socket for incoming client requests. This guarantees that static reservations and dynamic pool isolation are active before any `DHCPDISCOVER` packet is processed.
+
+

@@ -67,8 +67,9 @@ pub async fn run_dhcp_server_worker(
         DHCP_SERVER_UID,
         DHCP_SERVER_GID,
         ipc_fd,
-        |ipc| async move {
+        |mut ipc| async move {
             let leases = spawn_lease_actor();
+            sync_initial_static_leases(&mut ipc.reader, &leases).await?;
 
             let config = Arc::new(ServerConfig {
                 server_ip,
@@ -84,6 +85,46 @@ pub async fn run_dhcp_server_worker(
         },
     )
     .await
+}
+
+async fn sync_initial_static_leases(
+    ipc_reader: &mut OwnedReadHalf,
+    leases: &LeaseHandle,
+) -> Result<(), std::io::Error> {
+    match recv_msg::<DhcpServerParentToWorkerMsg, _>(ipc_reader).await {
+        Ok(Some(DhcpServerParentToWorkerMsg::SetStaticLeases {
+            leases: static_leases,
+        })) => {
+            leases
+                .set_static_leases(static_leases.into_iter().collect())
+                .await;
+            Ok(())
+        }
+        Ok(Some(other)) => {
+            warn!(
+                "[dhcp-server-worker] Unexpected initial message: {:?}",
+                other
+            );
+            Ok(())
+        }
+        Ok(None) => {
+            error!("[dhcp-server-worker] Parent closed IPC before sending initial static leases");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Parent closed IPC before init",
+            ))
+        }
+        Err(e) => {
+            error!(
+                "[dhcp-server-worker] Failed to receive initial static leases from parent: {}",
+                e
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "IPC initialization failed",
+            ))
+        }
+    }
 }
 
 async fn run_server_loop(
@@ -122,8 +163,14 @@ async fn run_server_loop(
                         ip_address,
                         mac_address,
                     })) => {
-                        let mac = MacAddr::from(mac_address);
-                        leases.add_neighbor(mac, ip_address).await;
+                        leases.add_neighbor(mac_address, ip_address).await;
+                    }
+                    Ok(Some(DhcpServerParentToWorkerMsg::SetStaticLeases {
+                        leases: static_leases,
+                    })) => {
+                        leases
+                            .set_static_leases(static_leases.into_iter().collect())
+                            .await;
                     }
                     Ok(None) | Err(_) => {
                         info!("[dhcp-server-worker] Parent closed IPC or error. Shutting down.");
@@ -1311,5 +1358,43 @@ mod tests {
             extract_client_mac(&msg),
             Some(MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55))
         );
+    }
+
+    #[tokio::test]
+    async fn test_sync_initial_static_leases_success() {
+        let (sock1, sock2) = tokio::net::UnixStream::pair().unwrap();
+        let (mut reader, _writer) = sock1.into_split();
+        let (_parent_reader, mut parent_writer) = sock2.into_split();
+
+        let leases = spawn_lease_actor();
+
+        let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
+            leases: vec![(
+                MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),
+                Ipv4Addr::new(192, 168, 1, 50),
+            )],
+        };
+        send_msg(&mut parent_writer, &msg).await.unwrap();
+
+        let result = sync_initial_static_leases(&mut reader, &leases).await;
+        assert!(result.is_ok());
+
+        let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let net = "192.168.1.0/24".parse::<ipnet::Ipv4Net>().unwrap();
+        let candidate = leases
+            .allocate_candidate(mac, net, Ipv4Addr::new(192, 168, 1, 1))
+            .await;
+        assert_eq!(candidate, Some(Ipv4Addr::new(192, 168, 1, 50)));
+    }
+
+    #[tokio::test]
+    async fn test_sync_initial_static_leases_eof_fails() {
+        let (sock1, sock2) = tokio::net::UnixStream::pair().unwrap();
+        let (mut reader, _writer) = sock1.into_split();
+        drop(sock2);
+
+        let leases = spawn_lease_actor();
+        let result = sync_initial_static_leases(&mut reader, &leases).await;
+        assert!(result.is_err());
     }
 }

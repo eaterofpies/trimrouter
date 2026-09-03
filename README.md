@@ -69,6 +69,12 @@ max_log_size_mb = 100
 # Optional log level filter: "error", "warn", "info", "debug", "trace" (default: "info")
 level = "info"
 
+[dhcp]
+# Optional static DHCP lease reservations by MAC address
+# reservations = [
+#     { mac = "52:54:00:12:34:58", ip = "192.168.1.50" },
+# ]
+
 [system]
 # Optional reboot delay in seconds on panic (defaults to infinite hang if omitted)
 # reboot_delay = 10

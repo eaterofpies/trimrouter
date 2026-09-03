@@ -34,11 +34,12 @@ mod tests {
         let dhcp_client = DhcpClient::with_heartbeat("wan".to_string(), lease_tx, hb_tx.clone());
         assert_eq!(dhcp_client.get_worker_pid(), 0);
 
-        let dhcp_server = DhcpServer::with_local_hosts(
+        let dhcp_server = DhcpServer::new(
             "lan".to_string(),
             "192.168.1.1/24".to_string(),
             Some(hb_tx.clone()),
             Some(lh_tx.clone()),
+            std::collections::HashMap::new(),
         );
         assert_eq!(dhcp_server.get_worker_pid(), 0);
 
@@ -50,13 +51,14 @@ mod tests {
         );
         assert_eq!(dns_forwarder.get_worker_pid(), 0);
 
-        let _lan_manager = LanManager::with_local_hosts(
+        let _lan_manager = LanManager::new(
             "lan".to_string(),
             "192.168.1.1/24".to_string(),
             "10.0.0.1/24".to_string(),
             lease_rx.clone(),
             Some(hb_tx),
             Some(lh_tx),
+            std::collections::HashMap::new(),
         );
 
         let _sntp_client = SntpClient::new(lease_rx);

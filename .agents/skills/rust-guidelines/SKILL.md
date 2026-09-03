@@ -40,8 +40,9 @@ This skill provides code style and design standards for writing and modifying Ru
 * **Aggressively deduplicate code**. Avoid copy-pasting helper functions, boilerplate code, or duplicate logic patterns across different modules.
 * Consolidate common behaviors (e.g., asynchronous task wait/shutdown logic, packet processing utility patterns, or socket configuration routines) into shared modules (such as `utils`) or common traits instead of repeating them.
 
-## 8. Strong Typing at Boundaries (Early Symbolic Conversion)
+## 8. Strong Typing at Boundaries (Early Symbolic Conversion & IPC Types)
 * Parse and convert raw, weakly typed inputs (such as byte slices `&[u8]`, raw binary buffers, or strings) into strongly typed, domain-specific Rust structures (e.g., `pnet::util::MacAddr`, `std::net::Ipv4Addr`, or custom domain enums/structs) as early as possible (e.g., at network, parsing, or file boundaries).
+* **Strongly Typed IPC Messages**: Use domain types (e.g., `MacAddr`, `Ipv4Addr`) directly in IPC message definitions rather than primitive byte arrays (e.g., `[u8; 6]`) or raw slices. Enable crate feature flags (e.g., `features = ["serde"]`) in `Cargo.toml` where necessary to support direct serialization across IPC boundaries.
 * Avoid passing raw collections (like `&[u8]`, `Vec<u8>`, or generic `String`) down into core processing logic. Strongly typed symbolic boundaries prevent type-safety bypasses, eliminate redundant parser/formatter loops, and make calling interfaces self-documenting.
 
 ## 9. Top-of-File Imports Only & No Inline Path Qualification
@@ -87,4 +88,12 @@ This skill provides code style and design standards for writing and modifying Ru
 * **Eliminate Repeated String Literals**: Do not scatter raw repeated string literals across functions, modules, or services (e.g., service identifiers like `"dns-forwarder"`, `"lan-manager"`, `"dhcp-client"`, `"dhcp-server"`, `"interface-monitor"`, sysfs paths, or configuration tags).
 * **Declare Module or Crate-Level `const`**: Declare reusable strings as `pub const` at the module level or in a centralized definitions module (e.g., `crate::services` or `crate::network`), or use strongly typed symbolic representations (enums).
 * **Consistency and Typo Prevention**: Using named constants ensures compile-time typo detection, simplifies audits, and guarantees single-point updates across supervisory, logging, IPC, and watchdog boundaries.
+
+## 17. Single Canonical Constructors
+* **Avoid Cascading `with_...` Constructor Permutations**: Do not proliferate intermediate constructors (e.g., `new`, `with_heartbeat`, `with_local_hosts`, `with_options`) across service structs.
+* **Use Single Full Constructor**: Prefer a single, canonical constructor (`new(...)`) taking the required and optional parameters directly, or bundle optional parameters into a dedicated configuration/options struct.
+
+## 18. Race-Free Service & Worker Startup Handshake
+* **Explicit Startup Synchronization**: When a supervisor spawns a worker process that requires initial configuration (such as static leases or upstream resolvers), the worker must explicitly await and apply the initial IPC synchronization message before entering its main event loop or polling raw network sockets.
+* **Prevent Early Traffic Processing**: Sockets must not service network requests before all initial configuration and exclusions have been loaded into active lookup tables.
 

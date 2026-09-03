@@ -29,11 +29,33 @@ pub struct LeaseTable {
     allocated_ips: HashSet<Ipv4Addr>,
     /// Active temporary conflict holds on IPs.
     conflicts: HashMap<Ipv4Addr, Instant>,
+    /// Statically configured reservations (MAC -> reserved IP).
+    static_leases: HashMap<MacAddr, Ipv4Addr>,
+    /// O(1) index of statically reserved IPs.
+    reserved_ips: HashSet<Ipv4Addr>,
 }
 
 impl LeaseTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a new `LeaseTable` pre-populated with static lease reservations.
+    pub fn with_static_leases(static_leases: HashMap<MacAddr, Ipv4Addr>) -> Self {
+        let reserved_ips = static_leases.values().copied().collect();
+        Self {
+            by_mac: HashMap::new(),
+            allocated_ips: HashSet::new(),
+            conflicts: HashMap::new(),
+            static_leases,
+            reserved_ips,
+        }
+    }
+
+    /// Updates the static lease reservations mapping.
+    pub fn set_static_leases(&mut self, static_leases: HashMap<MacAddr, Ipv4Addr>) {
+        self.reserved_ips = static_leases.values().copied().collect();
+        self.static_leases = static_leases;
     }
 
     /// Returns the active lease for this MAC address, if one exists.
@@ -69,6 +91,11 @@ impl LeaseTable {
     /// Returns `true` if `ip` is not currently held by any client or under a conflict hold.
     pub fn is_ip_available(&self, ip: Ipv4Addr) -> bool {
         !self.allocated_ips.contains(&ip) && !self.is_conflict_active(ip)
+    }
+
+    /// Returns `true` if `ip` is available for dynamic allocation (not held and not statically reserved).
+    pub fn is_ip_available_for_dynamic(&self, ip: Ipv4Addr) -> bool {
+        self.is_ip_available(ip) && !self.reserved_ips.contains(&ip)
     }
 
     /// Returns `true` if `ip` is currently under an active conflict hold.
@@ -110,7 +137,7 @@ impl LeaseTable {
     }
 
     /// Evicts expired leases, then finds the first available host IP in
-    /// `net` that is not `server_ip`.
+    /// `net` that is not `server_ip` and not reserved for static leases.
     pub fn next_available_ip(
         &mut self,
         net: ipnet::Ipv4Net,
@@ -118,7 +145,7 @@ impl LeaseTable {
     ) -> Option<Ipv4Addr> {
         self.evict_expired();
         net.hosts()
-            .find(|&ip| ip != server_ip && self.is_ip_available(ip))
+            .find(|&ip| ip != server_ip && self.is_ip_available_for_dynamic(ip))
     }
 
     /// Finds the MAC address that currently holds the lease for `ip`.
@@ -130,12 +157,31 @@ impl LeaseTable {
     }
 
     /// Allocates the next available candidate IP with a temporary hold.
+    /// If `client_mac` has a static reservation, allocates its reserved IP.
     pub fn allocate_candidate(
         &mut self,
         client_mac: MacAddr,
         net: ipnet::Ipv4Net,
         server_ip: Ipv4Addr,
     ) -> Option<Ipv4Addr> {
+        if let Some(&reserved_ip) = self.static_leases.get(&client_mac) {
+            if net.contains(&reserved_ip)
+                && reserved_ip != server_ip
+                && !self.is_ip_taken_by_other(reserved_ip, client_mac)
+            {
+                self.insert(
+                    client_mac,
+                    ClientLease {
+                        ip: reserved_ip,
+                        expiry: Instant::now() + CANDIDATE_HOLD_DURATION,
+                        hostname: None,
+                    },
+                );
+                return Some(reserved_ip);
+            }
+            return None;
+        }
+
         let ip = self.next_available_ip(net, server_ip)?;
         self.insert(
             client_mac,
@@ -166,6 +212,15 @@ impl LeaseTable {
             || !net.contains(&target_ip)
             || self.is_ip_taken_by_other(target_ip, client_mac)
         {
+            return None;
+        }
+
+        // Static reservation validation
+        if let Some(&reserved_ip) = self.static_leases.get(&client_mac) {
+            if target_ip != reserved_ip {
+                return None;
+            }
+        } else if self.reserved_ips.contains(&target_ip) {
             return None;
         }
 
@@ -277,6 +332,10 @@ pub enum LeaseCommand {
     AddNeighbor {
         mac: MacAddr,
         ip: Ipv4Addr,
+    },
+    SetStaticLeases {
+        static_leases: HashMap<MacAddr, Ipv4Addr>,
+        reply_tx: oneshot::Sender<()>,
     },
 }
 
@@ -415,6 +474,21 @@ impl LeaseHandle {
             .send(LeaseCommand::AddNeighbor { mac, ip })
             .await;
     }
+
+    pub async fn set_static_leases(&self, static_leases: HashMap<MacAddr, Ipv4Addr>) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(LeaseCommand::SetStaticLeases {
+                static_leases,
+                reply_tx,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = reply_rx.await;
+        }
+    }
 }
 
 pub fn spawn_lease_actor() -> LeaseHandle {
@@ -441,6 +515,13 @@ async fn run_lease_actor_loop(mut rx: mpsc::Receiver<LeaseCommand>) {
 
 fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
     match cmd {
+        LeaseCommand::SetStaticLeases {
+            static_leases,
+            reply_tx,
+        } => {
+            leases.set_static_leases(static_leases);
+            let _ = reply_tx.send(());
+        }
         LeaseCommand::GetExistingIp {
             client_mac,
             reply_tx,
@@ -659,5 +740,66 @@ mod tests {
                 .expect("Must allocate candidate IP for re-requested lease");
             assert!(ip >= Ipv4Addr::new(192, 168, 1, 2) && ip <= Ipv4Addr::new(192, 168, 1, 254));
         }
+    }
+
+    #[test]
+    fn test_lease_table_static_reservations() {
+        let net: ipnet::Ipv4Net = "192.168.1.0/24".parse().unwrap();
+        let server_ip = Ipv4Addr::new(192, 168, 1, 1);
+
+        let reserved_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let reserved_ip = Ipv4Addr::new(192, 168, 1, 2);
+
+        let mut static_leases = HashMap::new();
+        static_leases.insert(reserved_mac, reserved_ip);
+
+        let mut table = LeaseTable::with_static_leases(static_leases);
+
+        // 1. Dynamic client allocating should skip the reserved IP (192.168.1.2)
+        let dynamic_mac = MacAddr::new(0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee);
+        let dyn_ip = table
+            .allocate_candidate(dynamic_mac, net, server_ip)
+            .expect("dynamic IP");
+        assert_eq!(dyn_ip, Ipv4Addr::new(192, 168, 1, 3));
+
+        // 2. Reserved client allocating should receive its reserved IP
+        let res_ip = table
+            .allocate_candidate(reserved_mac, net, server_ip)
+            .expect("reserved IP");
+        assert_eq!(res_ip, reserved_ip);
+
+        // 3. Dynamic client requesting the reserved IP should be rejected
+        let invalid_confirm = table.validate_and_confirm(
+            dynamic_mac,
+            Some(reserved_ip),
+            server_ip,
+            net,
+            Duration::from_secs(3600),
+            None,
+        );
+        assert_eq!(invalid_confirm, None);
+
+        // 4. Reserved client requesting wrong IP should be rejected
+        let wrong_ip_confirm = table.validate_and_confirm(
+            reserved_mac,
+            Some(Ipv4Addr::new(192, 168, 1, 50)),
+            server_ip,
+            net,
+            Duration::from_secs(3600),
+            None,
+        );
+        assert_eq!(wrong_ip_confirm, None);
+
+        // 5. Reserved client confirming its reserved IP succeeds
+        let valid_confirm = table.validate_and_confirm(
+            reserved_mac,
+            Some(reserved_ip),
+            server_ip,
+            net,
+            Duration::from_secs(3600),
+            None,
+        );
+        assert!(valid_confirm.is_some());
+        assert_eq!(valid_confirm.unwrap().ip, reserved_ip);
     }
 }

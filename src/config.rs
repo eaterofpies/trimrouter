@@ -3,6 +3,7 @@ use crate::init::system::ConfigReaderOps;
 use crate::services::utils::CleanOption;
 use pnet::util::MacAddr;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
@@ -31,6 +32,7 @@ pub struct RouterConfig {
     pub logging: LoggingConfig,
     pub watchdog: bool,
     pub dns_servers: Vec<Ipv4Addr>,
+    pub static_leases: HashMap<MacAddr, Ipv4Addr>,
 }
 
 impl std::fmt::Debug for RouterConfig {
@@ -44,6 +46,7 @@ impl std::fmt::Debug for RouterConfig {
             .field("logging", &self.logging)
             .field("watchdog", &self.watchdog)
             .field("dns_servers", &self.dns_servers)
+            .field("static_leases", &self.static_leases)
             .finish()
     }
 }
@@ -51,6 +54,7 @@ impl std::fmt::Debug for RouterConfig {
 #[derive(Deserialize)]
 struct ConfigToml {
     network: NetworkSection,
+    dhcp: Option<DhcpSection>,
     system: Option<SystemSection>,
     logging: Option<LoggingSection>,
     dns: Option<DnsSection>,
@@ -63,6 +67,17 @@ struct NetworkSection {
     wan_mac: String,
     lan_mac: String,
     dns_servers: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct DhcpSection {
+    reservations: Option<Vec<DhcpReservationToml>>,
+}
+
+#[derive(Deserialize)]
+struct DhcpReservationToml {
+    mac: String,
+    ip: String,
 }
 
 #[derive(Deserialize)]
@@ -198,6 +213,70 @@ fn parse_dns_servers(
     Ok(parsed_ips)
 }
 
+fn parse_dhcp_reservations(
+    dhcp: Option<&DhcpSection>,
+    lan_net: &ipnet::Ipv4Net,
+) -> Result<HashMap<MacAddr, Ipv4Addr>, RouterError> {
+    let mut static_leases = HashMap::new();
+    let mut seen_ips = HashSet::new();
+
+    let Some(dhcp_sec) = dhcp else {
+        return Ok(static_leases);
+    };
+    let Some(ref reservations) = dhcp_sec.reservations else {
+        return Ok(static_leases);
+    };
+
+    for res in reservations {
+        let mac = MacAddr::from_str(&res.mac).map_err(|_| {
+            RouterError::Generic(format!(
+                "DHCP reservation MAC '{}' must be a valid MAC address",
+                res.mac
+            ))
+        })?;
+        if !is_valid_unicast_mac(&mac) {
+            return Err(RouterError::Generic(format!(
+                "DHCP reservation MAC '{}' must be a valid non-zero, non-multicast unicast MAC address",
+                mac
+            )));
+        }
+
+        let ip: Ipv4Addr = res.ip.parse().map_err(|_| {
+            RouterError::Generic(format!(
+                "DHCP reservation IP '{}' must be a valid IPv4 address",
+                res.ip
+            ))
+        })?;
+
+        if !lan_net.contains(&ip)
+            || ip == lan_net.network()
+            || ip == lan_net.broadcast()
+            || ip == lan_net.addr()
+        {
+            return Err(RouterError::Generic(format!(
+                "DHCP reservation IP '{}' must be a valid host IP within LAN subnet '{}' and not the router's gateway IP",
+                ip, lan_net
+            )));
+        }
+
+        if static_leases.insert(mac, ip).is_some() {
+            return Err(RouterError::Generic(format!(
+                "Duplicate MAC address '{}' in DHCP reservations",
+                mac
+            )));
+        }
+
+        if !seen_ips.insert(ip) {
+            return Err(RouterError::Generic(format!(
+                "Duplicate IP address '{}' in DHCP reservations",
+                ip
+            )));
+        }
+    }
+
+    Ok(static_leases)
+}
+
 impl RouterConfig {
     pub fn parse<S: ConfigReaderOps>(sys: &S) -> Result<Self, RouterError> {
         let content = sys.read_config_file().map_err(|e| {
@@ -235,6 +314,7 @@ impl RouterConfig {
             )));
         }
 
+        let static_leases = parse_dhcp_reservations(parsed.dhcp.as_ref(), &lan_net)?;
         let reboot_delay = parsed.system.as_ref().and_then(|s| s.reboot_delay);
         let logging = parse_logging_config(parsed.logging.as_ref())?;
         let watchdog = parsed
@@ -252,6 +332,7 @@ impl RouterConfig {
             logging,
             watchdog,
             dns_servers,
+            static_leases,
         })
     }
 }
@@ -710,5 +791,113 @@ mod tests {
                 addr
             );
         }
+    }
+
+    #[test]
+    fn test_config_parsing_dhcp_reservations_valid() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.50"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:59"
+            ip = "192.168.1.60"
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg.static_leases.len(), 2);
+        assert_eq!(
+            cfg.static_leases
+                .get(&MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x58)),
+            Some(&Ipv4Addr::new(192, 168, 1, 50))
+        );
+        assert_eq!(
+            cfg.static_leases
+                .get(&MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x59)),
+            Some(&Ipv4Addr::new(192, 168, 1, 60))
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_dhcp_reservations_rejects_gateway_ip() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.1"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_dhcp_reservations_rejects_out_of_subnet() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "10.0.0.50"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_dhcp_reservations_rejects_duplicate_mac() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.50"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.51"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_dhcp_reservations_rejects_duplicate_ip() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.50"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:59"
+            ip = "192.168.1.50"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
     }
 }

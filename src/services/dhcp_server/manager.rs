@@ -8,10 +8,12 @@ use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{setup_worker_sockets, terminate_worker};
 use futures_util::StreamExt;
 use log::{error, info};
+use pnet::util::MacAddr;
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -24,38 +26,16 @@ pub struct DhcpServer {
     state: ExternalWorker,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
+    static_leases: HashMap<MacAddr, Ipv4Addr>,
 }
 
 impl DhcpServer {
-    pub fn new(lan_interface: String, lan_ip: String) -> Self {
-        Self {
-            lan_interface,
-            lan_ip,
-            state: ExternalWorker::new(DHCP_SERVER_SERVICE_NAME),
-            heartbeat_tx: None,
-            local_hosts_tx: None,
-        }
-    }
-
-    pub fn with_heartbeat(
-        lan_interface: String,
-        lan_ip: String,
-        heartbeat_tx: HeartbeatSender,
-    ) -> Self {
-        Self {
-            lan_interface,
-            lan_ip,
-            state: ExternalWorker::new(DHCP_SERVER_SERVICE_NAME),
-            heartbeat_tx: Some(heartbeat_tx),
-            local_hosts_tx: None,
-        }
-    }
-
-    pub fn with_local_hosts(
+    pub fn new(
         lan_interface: String,
         lan_ip: String,
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_tx: Option<LocalHostSender>,
+        static_leases: HashMap<MacAddr, Ipv4Addr>,
     ) -> Self {
         Self {
             lan_interface,
@@ -63,7 +43,12 @@ impl DhcpServer {
             state: ExternalWorker::new(DHCP_SERVER_SERVICE_NAME),
             heartbeat_tx,
             local_hosts_tx,
+            static_leases,
         }
+    }
+
+    pub fn reconfigure_lan_ip(&mut self, new_ip: String) {
+        self.lan_ip = new_ip;
     }
 
     pub fn get_worker_pid(&self) -> u32 {
@@ -77,6 +62,7 @@ fn start_parent_arp_listener(
     shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
+    static_leases: HashMap<MacAddr, Ipv4Addr>,
 ) -> Result<JoinHandle<()>, ServiceError> {
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
@@ -88,6 +74,7 @@ fn start_parent_arp_listener(
         shutdown_rx,
         heartbeat_tx,
         local_hosts_tx,
+        static_leases,
     ));
 
     Ok(handle)
@@ -100,7 +87,18 @@ async fn run_parent_dhcp_server_monitor(
     mut shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
+    static_leases: HashMap<MacAddr, Ipv4Addr>,
 ) {
+    let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
+        leases: static_leases.into_iter().collect(),
+    };
+    if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+        error!(
+            "[dhcp-server-parent] Failed to send static leases to worker: {}",
+            e
+        );
+    }
+
     let (connection, _handle, mut messages) =
         match rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]) {
             Ok(res) => res,
@@ -166,7 +164,7 @@ async fn run_parent_dhcp_server_monitor(
 
 fn parse_neighbor_update(
     payload: &NetlinkPayload<RouteNetlinkMessage>,
-) -> Option<(Ipv4Addr, [u8; 6])> {
+) -> Option<(Ipv4Addr, MacAddr)> {
     let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg)) = payload else {
         return None;
     };
@@ -179,7 +177,8 @@ fn parse_neighbor_update(
             }
             NeighbourAttribute::LinkLayerAddress(mac_bytes) => {
                 if let Ok(bytes) = mac_bytes.as_slice().try_into() {
-                    mac_opt = Some(bytes);
+                    let [b0, b1, b2, b3, b4, b5] = bytes;
+                    mac_opt = Some(MacAddr::new(b0, b1, b2, b3, b4, b5));
                 }
             }
             _ => {}
@@ -211,6 +210,7 @@ impl Service for DhcpServer {
         let lan_ip = self.lan_ip.clone();
         let heartbeat_tx = self.heartbeat_tx.clone();
         let local_hosts_tx = self.local_hosts_tx.clone();
+        let static_leases = self.static_leases.clone();
 
         self.state.start_supervised(
             move || setup_dhcp_server_attempt(&lan_interface, &lan_ip),
@@ -221,6 +221,7 @@ impl Service for DhcpServer {
                     shutdown_rx,
                     heartbeat_tx.clone(),
                     local_hosts_tx.clone(),
+                    static_leases.clone(),
                 )
             },
         )
@@ -238,25 +239,16 @@ mod tests {
 
     #[test]
     fn test_dhcp_server_constructors_and_pid() {
-        let srv = DhcpServer::new("lan".to_string(), "192.168.1.1/24".to_string());
-        assert_eq!(srv.get_worker_pid(), 0);
-
         let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(1);
-        let srv_hb = DhcpServer::with_heartbeat(
-            "lan".to_string(),
-            "192.168.1.1/24".to_string(),
-            hb_tx.clone(),
-        );
-        assert_eq!(srv_hb.get_worker_pid(), 0);
-
         let (lh_tx, _lh_rx) = tokio::sync::mpsc::channel(1);
-        let srv_lh = DhcpServer::with_local_hosts(
+        let srv = DhcpServer::new(
             "lan".to_string(),
             "192.168.1.1/24".to_string(),
             Some(hb_tx),
             Some(lh_tx),
+            HashMap::new(),
         );
-        assert_eq!(srv_lh.get_worker_pid(), 0);
+        assert_eq!(srv.get_worker_pid(), 0);
     }
 
     #[test]
@@ -282,7 +274,7 @@ mod tests {
             parsed,
             Some((
                 Ipv4Addr::new(192, 168, 1, 50),
-                [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+                MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
             ))
         );
 

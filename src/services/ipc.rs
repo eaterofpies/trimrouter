@@ -1,3 +1,4 @@
+use pnet::util::MacAddr;
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
@@ -55,7 +56,10 @@ pub enum DnsWorkerToParentMsg {
 pub enum DhcpServerParentToWorkerMsg {
     AddNeighbor {
         ip_address: Ipv4Addr,
-        mac_address: [u8; 6],
+        mac_address: MacAddr,
+    },
+    SetStaticLeases {
+        leases: Vec<(MacAddr, Ipv4Addr)>,
     },
 }
 
@@ -171,11 +175,22 @@ mod tests {
         // 3. DhcpServerParentToWorkerMsg::AddNeighbor
         let server_msg = DhcpServerParentToWorkerMsg::AddNeighbor {
             ip_address: Ipv4Addr::new(192, 168, 1, 10),
-            mac_address: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+            mac_address: MacAddr::new(0x52, 0x54, 0x00, 0x12, 0x34, 0x56),
         };
         send_msg(&mut w2, &server_msg).await.unwrap();
         let received: DhcpServerParentToWorkerMsg = recv_msg(&mut r1).await.unwrap().unwrap();
         assert_eq!(received, server_msg);
+
+        // 3b. DhcpServerParentToWorkerMsg::SetStaticLeases
+        let static_leases_msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
+            leases: vec![(
+                MacAddr::new(0x52, 0x54, 0x00, 0x12, 0x34, 0x56),
+                Ipv4Addr::new(192, 168, 1, 50),
+            )],
+        };
+        send_msg(&mut w2, &static_leases_msg).await.unwrap();
+        let received: DhcpServerParentToWorkerMsg = recv_msg(&mut r1).await.unwrap().unwrap();
+        assert_eq!(received, static_leases_msg);
 
         // 4. DnsParentToWorkerMsg::SetUpstreamResolvers
         let dns_msg = DnsParentToWorkerMsg::SetUpstreamResolvers {
