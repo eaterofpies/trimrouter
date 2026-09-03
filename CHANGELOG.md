@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.0](https://github.com/eaterofpies/trimrouter/compare/v0.1.0...v0.2.0) (2026-09-03)
+
+
+### Features
+
+* **dns:** implement RFC 2308 negative DNS caching with security guards ([5ba1f0d](https://github.com/eaterofpies/trimrouter/commit/5ba1f0d0dc0fd8708a5969f33a59c74f2bf604e1))
+* implement local lan dns and dhcp option 12 hostname resolution ([e31e200](https://github.com/eaterofpies/trimrouter/commit/e31e200a154e71134878a554beeab18c2b6d766b))
+* implement static DHCP lease reservations with startup synchronization ([861f7a0](https://github.com/eaterofpies/trimrouter/commit/861f7a0b8616137dca2b3d69a028d8ad81fc8c64))
+* **init:** configure bounded tmpfs quotas and security flags for /run and /tmp ([39aad07](https://github.com/eaterofpies/trimrouter/commit/39aad07b3b5405d04bcb65939123554a61c2c86c))
+* **init:** graceful filesystem sync on poweroff and panic teardown ([d81d2ed](https://github.com/eaterofpies/trimrouter/commit/d81d2ed64e5d32d8cd6ad8c2de2a88f4b712758e))
+* **interface:** add periodic carrier polling and synchronize interface spec ([7cece2d](https://github.com/eaterofpies/trimrouter/commit/7cece2dbdf905d7c4100c4b5c3945751f5155e84))
+* support custom upstream dns resolvers via trimrouter.toml ([e1fb713](https://github.com/eaterofpies/trimrouter/commit/e1fb713c948d8758c5edeebf12d18c4ab128ce5c))
+* **watchdog:** implement hardware watchdog supervision and service heartbeats ([c8ebe19](https://github.com/eaterofpies/trimrouter/commit/c8ebe19e1c3dcbdfa7813c483d784d9fc0aa3dd3))
+
 ## 0.1.0 (2026-08-29)
 
 
