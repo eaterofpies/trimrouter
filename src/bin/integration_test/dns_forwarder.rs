@@ -6,8 +6,15 @@ use trimrouter::services::{DnsForwarder, Service};
 pub async fn test_dns_forwarding(lease_rx: WanLeaseReceiver) -> Result<DnsForwarder, String> {
     std::println!("[test] Starting DNS Forwarder test...");
 
-    // 1. Start DNS Forwarder
-    let mut dns_forwarder = DnsForwarder::new(lease_rx);
+    // 1. Start DNS Forwarder with router.lan local host mapping
+    let (local_hosts_tx, local_hosts_rx) =
+        tokio::sync::mpsc::channel::<trimrouter::services::LocalHostEvent>(64);
+    let _ = local_hosts_tx.try_send(trimrouter::services::LocalHostEvent::Register {
+        name: trimrouter::services::utils::ROUTER_HOSTNAME.to_string(),
+        ip: std::net::Ipv4Addr::new(192, 168, 1, 1),
+    });
+    let mut dns_forwarder =
+        DnsForwarder::with_custom_dns(lease_rx, Vec::new(), None, Some(local_hosts_rx));
     if let Err(e) = dns_forwarder.start().await {
         return Err(format!("Failed to start DNS Forwarder: {}", e));
     }

@@ -523,6 +523,49 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ipnet::Ipv4Net;
+    use std::collections::HashSet;
+
+    fn seed_lease_table(
+        table: &mut LeaseTable,
+        count: u8,
+    ) -> (Ipv4Net, Ipv4Addr, HashSet<Ipv4Addr>) {
+        let net: Ipv4Net = "192.168.1.0/24".parse().unwrap();
+        let server_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let mut allocated_ips = HashSet::new();
+
+        for i in 1..=count {
+            let mac = MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, i);
+            let hostname = Some(format!("client-{}", i));
+            let ip = table
+                .allocate_candidate(mac, net, server_ip)
+                .expect("Must allocate candidate IP");
+
+            assert!(
+                ip >= Ipv4Addr::new(192, 168, 1, 2) && ip <= Ipv4Addr::new(192, 168, 1, 254),
+                "Allocated IP {} must be in valid LAN pool range",
+                ip
+            );
+            assert_ne!(ip, server_ip, "Allocated IP must not be server gateway IP");
+            assert!(
+                allocated_ips.insert(ip),
+                "Duplicate IP {} allocated to client {}",
+                ip,
+                i
+            );
+
+            table.insert(
+                mac,
+                ClientLease {
+                    ip,
+                    expiry: Instant::now() + Duration::from_secs(3600),
+                    hostname,
+                },
+            );
+        }
+
+        (net, server_ip, allocated_ips)
+    }
 
     #[test]
     fn test_lease_table_is_empty_and_get_mac_by_ip() {
@@ -577,5 +620,44 @@ mod tests {
             },
         );
         assert!(!table.is_hostname_taken_by_other("laptop", mac2));
+    }
+
+    #[test]
+    fn test_lease_table_multi_client_allocation() {
+        let mut table = LeaseTable::new();
+        let (_net, _server_ip, _allocated_ips) = seed_lease_table(&mut table, 10);
+
+        assert_eq!(table.len(), 10);
+        assert!(!table.is_empty());
+
+        for i in 1..=10u8 {
+            let mac = MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, i);
+            let lease = table.get(&mac).expect("MAC must have an active lease");
+            assert_eq!(table.get_mac_by_ip(lease.ip), Some(mac));
+            let expected_hostname = format!("client-{}", i);
+            assert_eq!(lease.hostname.as_deref(), Some(expected_hostname.as_str()));
+        }
+    }
+
+    #[test]
+    fn test_lease_table_release_and_reallocation() {
+        let mut table = LeaseTable::new();
+        let (net, server_ip, _allocated_ips) = seed_lease_table(&mut table, 10);
+
+        // Release leases for odd clients
+        for i in (1..=10u8).step_by(2) {
+            let mac = MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, i);
+            assert!(table.remove(&mac).is_some());
+        }
+        assert_eq!(table.len(), 5);
+
+        // Re-allocating for released clients succeeds
+        for i in (1..=10u8).step_by(2) {
+            let mac = MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, i);
+            let ip = table
+                .allocate_candidate(mac, net, server_ip)
+                .expect("Must allocate candidate IP for re-requested lease");
+            assert!(ip >= Ipv4Addr::new(192, 168, 1, 2) && ip <= Ipv4Addr::new(192, 168, 1, 254));
+        }
     }
 }

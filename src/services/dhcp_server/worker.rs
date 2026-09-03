@@ -1277,4 +1277,39 @@ mod tests {
             Some(&DhcpOption::MessageType(MessageType::Ack))
         );
     }
+
+    #[test]
+    fn test_sanitize_hostname_matrix() {
+        assert_eq!(sanitize_hostname("laptop"), Some("laptop".to_string()));
+        assert_eq!(
+            sanitize_hostname("My-Laptop.local"),
+            Some("my-laptop".to_string())
+        );
+        assert_eq!(
+            sanitize_hostname("SERVER-01.lan."),
+            Some("server-01".to_string())
+        );
+
+        // Invalid hostnames
+        assert_eq!(sanitize_hostname("-leading-dash"), None);
+        assert_eq!(sanitize_hostname("trailing-dash-"), None);
+        assert_eq!(sanitize_hostname("has spaces"), None);
+        assert_eq!(sanitize_hostname("invalid_char!"), None);
+        assert_eq!(sanitize_hostname(""), None);
+        assert_eq!(sanitize_hostname(&"a".repeat(64)), None); // Too long (>63)
+    }
+
+    #[test]
+    fn test_extract_client_mac_edge_cases() {
+        let mut msg = Message::default();
+        // Zero/empty chaddr returns None
+        assert_eq!(extract_client_mac(&msg), None);
+
+        // Valid 6-byte MAC
+        msg.set_chaddr(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(
+            extract_client_mac(&msg),
+            Some(MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55))
+        );
+    }
 }

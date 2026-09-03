@@ -64,6 +64,19 @@ const DNS_QUERY: &[u8] = &[
     0x00, 0x01, // Class: IN
 ];
 
+// Sample DNS query payload for router.lan local hostname lookup
+const DNS_ROUTER_LAN_QUERY: &[u8] = &[
+    0x2b, 0x2b, // Transaction ID
+    0x01, 0x00, // Flags: Standard query
+    0x00, 0x01, // Questions: 1
+    0x00, 0x00, // Answer RRs: 0
+    0x00, 0x00, // Authority RRs: 0
+    0x00, 0x00, // Additional RRs: 0
+    0x06, b'r', b'o', b'u', b't', b'e', b'r', 0x03, b'l', b'a', b'n', 0x00, // router.lan
+    0x00, 0x01, // Type: A
+    0x00, 0x01, // Class: IN
+];
+
 // Sample DNS response payload (google.com A record response: 8.8.8.8)
 const DNS_RESPONSE: &[u8] = &[
     0x1a, 0x1a, // Transaction ID
@@ -1680,20 +1693,45 @@ async fn process_lan_udp_dns(
             );
         } else if *dns_test_phase == 2 {
             println!("[lan-client] DNS Query 2 resolved successfully! DNS Caching verified.");
-            *dns_test_phase = 0;
-            let _ = verification_tx.send("END_DNS_OUTAGE".to_string()).await;
-            let confirm_pkt = packet::build_raw_packet(
+            println!("[lan-client] Starting DNS Query 3 for local hostname 'router.lan'...");
+            *dns_test_phase = 3;
+            let req_pkt = packet::build_raw_packet(
                 pkt.client_mac,
                 MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
                 Ipv4Addr::new(192, 168, 1, 2),
                 Ipv4Addr::new(192, 168, 1, 1),
-                23456,
-                23457,
-                b"DNS_CACHE_OK",
+                12345, // client port
+                53,    // DNS port
+                DNS_ROUTER_LAN_QUERY,
             )
-            .expect("valid confirm pkt");
-            let _ = mock.send_frame(&confirm_pkt).await;
+            .expect("valid router.lan dns req pkt");
+            let _ = mock.send_frame(&req_pkt).await;
         }
+    } else if pkt.src_ip == Ipv4Addr::new(192, 168, 1, 1)
+        && pkt.src_port == 53
+        && pkt.dest_port == 12345
+        && *dns_test_phase == 3
+        && pkt.payload.len() >= 4
+        && pkt.payload[0] == 0x2b
+        && pkt.payload[1] == 0x2b
+        && pkt.payload.ends_with(&[192, 168, 1, 1])
+    {
+        println!(
+            "[lan-client] DNS Query 3 for 'router.lan' resolved successfully to 192.168.1.1! Local DNS verified."
+        );
+        *dns_test_phase = 0;
+        let _ = verification_tx.send("END_DNS_OUTAGE".to_string()).await;
+        let confirm_pkt = packet::build_raw_packet(
+            pkt.client_mac,
+            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+            Ipv4Addr::new(192, 168, 1, 2),
+            Ipv4Addr::new(192, 168, 1, 1),
+            23456,
+            23457,
+            b"DNS_CACHE_OK",
+        )
+        .expect("valid confirm pkt");
+        let _ = mock.send_frame(&confirm_pkt).await;
     }
 }
 

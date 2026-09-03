@@ -1284,4 +1284,67 @@ mod tests {
         msg_soa.add_authority(record);
         assert_eq!(calculate_cache_ttl(&msg_soa), Some(Duration::from_secs(30)));
     }
+
+    #[test]
+    fn test_try_resolve_local_query_case_insensitivity_matrix() {
+        let mut local_hosts = HashMap::new();
+        let mut local_ips = HashMap::new();
+
+        let my_ip = Ipv4Addr::new(192, 168, 1, 100);
+        local_hosts.insert("my-laptop".to_string(), my_ip);
+        local_ips.insert(my_ip, "my-laptop".to_string());
+
+        // Both .lan and single label resolve to A record with case insensitivity
+        for domain in ["MY-LAPTOP.LAN.", "My-Laptop.lan.", "mY-lApToP."] {
+            let mut query =
+                Message::new(1234, hickory_proto::op::MessageType::Query, OpCode::Query);
+            let qname = Name::from_ascii(domain).unwrap();
+            let item = hickory_proto::op::Query::query(qname, RecordType::A);
+            query.add_query(item);
+
+            let mut bytes = Vec::new();
+            let mut enc = BinEncoder::new(&mut bytes);
+            query.emit(&mut enc).unwrap();
+
+            let resp_bytes = try_resolve_local_query(&bytes, &local_hosts, &local_ips)
+                .unwrap_or_else(|| panic!("Domain {} should resolve", domain));
+            let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+            assert_eq!(
+                resp_msg.response_code,
+                hickory_proto::op::ResponseCode::NoError
+            );
+            assert_eq!(resp_msg.answers.len(), 1);
+        }
+
+        // Case-insensitive .local mDNS query returns authoritative NXDomain
+        for domain in ["MY-LAPTOP.LOCAL.", "My-Laptop.Local."] {
+            let mut query =
+                Message::new(5678, hickory_proto::op::MessageType::Query, OpCode::Query);
+            let qname = Name::from_ascii(domain).unwrap();
+            let item = hickory_proto::op::Query::query(qname, RecordType::A);
+            query.add_query(item);
+
+            let mut bytes = Vec::new();
+            let mut enc = BinEncoder::new(&mut bytes);
+            query.emit(&mut enc).unwrap();
+
+            let resp_bytes = try_resolve_local_query(&bytes, &local_hosts, &local_ips)
+                .unwrap_or_else(|| panic!("Domain {} should return mDNS NXDomain", domain));
+            let resp_msg = Message::from_bytes(&resp_bytes).unwrap();
+            assert_eq!(
+                resp_msg.response_code,
+                hickory_proto::op::ResponseCode::NXDomain
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_cache_key_pointer_loop_rejected() {
+        // Construct DNS query with a compression pointer loop (0xC0 0x0C pointing to itself)
+        let mut query = vec![0u8; DNS_HEADER_SIZE];
+        query[5] = 1; // QDCount = 1
+        query.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+
+        assert_eq!(get_cache_key(&query), None);
+    }
 }

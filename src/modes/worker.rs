@@ -64,18 +64,48 @@ mod tests {
     use crate::cli::CliFd;
 
     #[test]
-    fn test_worker_service_properties() {
+    fn test_worker_service_properties_all_variants() {
         let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
-        let udp_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (s3, _s4) = std::os::unix::net::UnixStream::pair().unwrap();
+        let udp_sock1 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_sock2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
 
-        let service = WorkerService::SntpClient {
+        // 1. SntpClient
+        let sntp = WorkerService::SntpClient {
             ipc_fd: CliFd(s1.into()),
-            ntp_socket_fd: CliFd(udp_sock.into()),
+            ntp_socket_fd: CliFd(udp_sock1.into()),
         };
+        assert_eq!(sntp.child_fds().len(), 2);
+        assert_eq!(sntp.to_args().len(), 2);
 
-        let fds = service.child_fds();
-        assert_eq!(fds.len(), 2);
-        let args = service.to_args();
-        assert_eq!(args.len(), 2);
+        // 2. DnsForwarder
+        let dns = WorkerService::DnsForwarder {
+            ipc_fd: CliFd(s3.into()),
+            dns_socket_fd: CliFd(udp_sock2.into()),
+            upstream_socket_fd: CliFd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into()),
+        };
+        assert_eq!(dns.child_fds().len(), 3);
+        assert_eq!(dns.to_args().len(), 3);
+
+        // 3. DhcpClient
+        let (s5, _s6) = std::os::unix::net::UnixStream::pair().unwrap();
+        let dhcp_cli = WorkerService::DhcpClient {
+            ipc_fd: CliFd(s5.into()),
+            raw_socket_fd: CliFd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into()),
+            wan_interface: "wan".to_string(),
+        };
+        assert_eq!(dhcp_cli.child_fds().len(), 2);
+        assert_eq!(dhcp_cli.to_args().len(), 3);
+
+        // 4. DhcpServer
+        let (s7, _s8) = std::os::unix::net::UnixStream::pair().unwrap();
+        let dhcp_srv = WorkerService::DhcpServer {
+            ipc_fd: CliFd(s7.into()),
+            raw_socket_fd: CliFd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into()),
+            wan_interface: "lan".to_string(),
+            lan_ip: "192.168.1.1/24".to_string(),
+        };
+        assert_eq!(dhcp_srv.child_fds().len(), 2);
+        assert_eq!(dhcp_srv.to_args().len(), 4);
     }
 }

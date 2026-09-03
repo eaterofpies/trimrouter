@@ -1197,4 +1197,29 @@ mod tests {
         assert_eq!(msg_ren.opts().get(OptionCode::ServerIdentifier), None);
         assert!(!msg_ren.flags().broadcast());
     }
+
+    #[test]
+    fn test_parse_offer_and_ack_edge_cases() {
+        let mut msg = dhcproto::v4::Message::default();
+        msg.set_xid(0x5555);
+        msg.set_yiaddr(Ipv4Addr::new(10, 0, 2, 15));
+
+        // Wrong xid returns None
+        assert!(parse_offer(&msg, 0x9999).is_none());
+
+        // Message without OptionCode::MessageType returns None
+        assert!(parse_offer(&msg, 0x5555).is_none());
+
+        // DHCPOFFER without server identifier
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Offer));
+        let offer = parse_offer(&msg, 0x5555).expect("Valid offer");
+        assert_eq!(offer.offered_ip, Ipv4Addr::new(10, 0, 2, 15));
+        assert_eq!(offer.server_ip, None);
+
+        // DHCPNAK
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Nak));
+        assert!(matches!(parse_ack_nak(&msg, 0x5555), ParseAckResult::Nak));
+    }
 }

@@ -477,4 +477,28 @@ pub mod tests {
             timeout
         ));
     }
+
+    #[test]
+    fn test_evaluate_health_partial_failure_one_stale_service() {
+        let mut liveness: ServiceLivenessMap = [None; MONITORED_SERVICE_COUNT];
+        let now = Instant::now();
+        let timeout = Duration::from_secs(30);
+
+        // DNS forwarder, Interface monitor, and LAN manager are active
+        liveness[MonitoredService::DnsForwarder.index()] = Some(now);
+        liveness[MonitoredService::InterfaceMonitor.index()] = Some(now);
+        liveness[MonitoredService::LanManager.index()] = Some(now);
+
+        // DHCP client has timed out (45s elapsed > 30s timeout)
+        liveness[MonitoredService::DhcpClient.index()] = Some(now - Duration::from_secs(45));
+
+        let expected = vec![
+            MonitoredService::DnsForwarder,
+            MonitoredService::InterfaceMonitor,
+            MonitoredService::DhcpClient,
+            MonitoredService::LanManager,
+        ];
+
+        assert!(!evaluate_health(&expected, &liveness, timeout));
+    }
 }

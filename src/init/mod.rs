@@ -315,3 +315,40 @@ fn build_managed_interfaces(
 
     vec![wan_iface, lan_iface]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pnet::util::MacAddr;
+
+    #[test]
+    fn test_build_managed_interfaces_structure() {
+        let (lease_tx, lease_rx) = tokio::sync::watch::channel(services::WanLease::default());
+        let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(1);
+        let (lh_tx, _lh_rx) = tokio::sync::mpsc::channel(1);
+
+        let config = RouterConfig {
+            lan_ip: "192.168.1.1/24".to_string(),
+            backup_lan_ip: "10.0.0.1/24".to_string(),
+            wan_mac: MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),
+            lan_mac: MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x66),
+            reboot_delay: None,
+            logging: Default::default(),
+            watchdog: true,
+            dns_servers: Vec::new(),
+        };
+
+        let ifaces = build_managed_interfaces(&config, lease_tx, lease_rx, hb_tx, lh_tx);
+        assert_eq!(ifaces.len(), 2);
+
+        // WAN interface assertions
+        assert_eq!(ifaces[0].name, "wan");
+        assert_eq!(ifaces[0].mac, config.wan_mac);
+        assert_eq!(ifaces[0].active_services.len(), 2);
+
+        // LAN interface assertions
+        assert_eq!(ifaces[1].name, "lan");
+        assert_eq!(ifaces[1].mac, config.lan_mac);
+        assert_eq!(ifaces[1].active_services.len(), 1);
+    }
+}
