@@ -1,4 +1,5 @@
 use futures_util::TryStreamExt;
+use pnet::util::MacAddr;
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::address::AddressAttribute;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -158,7 +159,73 @@ pub async fn test_lan_dhcp_handshake(lease_rx: WanLeaseReceiver) -> Result<LanMa
     // 2. Tell the host coordinator to trigger the mock LAN client DHCP handshake
     std::println!("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE");
 
-    // 3. Open raw ICMP socket to ping the LAN client once it gets its IP (192.168.1.2)
+    // 3. Ping the dynamically leased client IP (192.168.1.2)
+    let target_ip = Ipv4Addr::new(192, 168, 1, 2);
+    if let Err(e) = ping_ip(target_ip, Duration::from_secs(10)).await {
+        if let Err(stop_err) = lan_manager.stop().await {
+            std::eprintln!(
+                "[test] Warning: Failed to stop LanManager during cleanup: {}",
+                stop_err
+            );
+        }
+        return Err(format!(
+            "LAN DHCP handshake test failed: did not receive ICMP reply from {}: {}",
+            target_ip, e
+        ));
+    }
+
+    std::println!("[test] LAN DHCP Server Handshake verified successfully.");
+    Ok(lan_manager)
+}
+
+pub async fn test_lan_static_lease(lease_rx: WanLeaseReceiver) -> Result<(), String> {
+    std::println!("[test] Starting LAN Static Lease Reservation test...");
+
+    let client_mac = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
+    let static_ip = Ipv4Addr::new(192, 168, 1, 50);
+    let mut static_leases = HashMap::new();
+    static_leases.insert(client_mac, static_ip);
+
+    let mut lan_manager = LanManager::new(
+        "lan".to_string(),
+        "192.168.1.1/24".to_string(),
+        "10.0.0.1/24".to_string(),
+        lease_rx,
+        None,
+        None,
+        static_leases,
+    );
+
+    if let Err(e) = lan_manager.start().await {
+        return Err(format!(
+            "Failed to start LanManager with static lease: {}",
+            e
+        ));
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Trigger mock client DHCP handshake with static reservation active
+    std::println!("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE");
+
+    // Verify ping to static reserved IP 192.168.1.50
+    if let Err(e) = ping_ip(static_ip, Duration::from_secs(10)).await {
+        let _ = lan_manager.stop().await;
+        return Err(format!(
+            "Static lease ping failed for reserved IP {}: {}",
+            static_ip, e
+        ));
+    }
+
+    if let Err(e) = lan_manager.stop().await {
+        return Err(format!("Failed to stop LanManager during cleanup: {}", e));
+    }
+
+    std::println!("[test] LAN Static Lease Reservation verified successfully.");
+    Ok(())
+}
+
+async fn ping_ip(target_ip: Ipv4Addr, timeout: Duration) -> Result<(), String> {
     let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
         .map_err(|e| format!("Failed to create ICMP socket: {}", e))?;
     let local_addr: SocketAddr = "192.168.1.1:0".parse().unwrap();
@@ -166,29 +233,20 @@ pub async fn test_lan_dhcp_handshake(lease_rx: WanLeaseReceiver) -> Result<LanMa
         .bind(&local_addr.into())
         .map_err(|e| format!("Failed to bind ICMP socket: {}", e))?;
     socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(|e| e.to_string())?;
 
-    let target_ip = Ipv4Addr::new(192, 168, 1, 2);
-    let id = 0x5432u16;
+    let id = rand::random::<u16>();
     let ping_data = build_icmp_echo_request(id, 1);
     let dest_addr: SocketAddr = format!("{}:0", target_ip).parse().unwrap();
 
-    let mut success = false;
     let start_time = std::time::Instant::now();
-
-    // Loop for up to 10 seconds trying to ping
-    while start_time.elapsed() < Duration::from_secs(10) {
-        // Send ping
+    while start_time.elapsed() < timeout {
         let _ = socket.send_to(&ping_data, &dest_addr.into());
-
-        // Wait for pong
         let mut buf = [std::mem::MaybeUninit::new(0u8); 512];
         if let Ok((n, _)) = socket.recv_from(&mut buf) {
-            // Safe because the first n bytes are guaranteed to be initialized by recv_from
             let slice =
                 unsafe { std::mem::transmute::<&[std::mem::MaybeUninit<u8>], &[u8]>(&buf[..n]) };
-            // Check both: with IP header (index 20) or without IP header (index 0)
             let (icmp_type, icmp_code, recv_id) = if n >= 28 && slice[20] == 0 && slice[21] == 0 {
                 (
                     slice[20],
@@ -206,28 +264,16 @@ pub async fn test_lan_dhcp_handshake(lease_rx: WanLeaseReceiver) -> Result<LanMa
             };
 
             if icmp_type == 0 && icmp_code == 0 && recv_id == id {
-                success = true;
-                break;
+                return Ok(());
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    if !success {
-        if let Err(e) = lan_manager.stop().await {
-            std::eprintln!(
-                "[test] Warning: Failed to stop LanManager during cleanup: {}",
-                e
-            );
-        }
-        return Err(
-            "LAN DHCP handshake test failed: did not receive ICMP reply from leased client"
-                .to_string(),
-        );
-    }
-
-    std::println!("[test] LAN DHCP Server Handshake verified successfully.");
-    Ok(lan_manager)
+    Err(format!(
+        "Timed out waiting for ICMP echo reply from {}",
+        target_ip
+    ))
 }
 
 fn build_icmp_echo_request(id: u16, seq: u16) -> Vec<u8> {

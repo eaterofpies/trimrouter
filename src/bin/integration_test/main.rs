@@ -400,6 +400,18 @@ async fn main() {
         failed += 1;
     }
 
+    // Test 8b: LAN Static Lease Reservation
+    match lan_manager::test_lan_static_lease(lease_rx.clone()).await {
+        Ok(_) => {
+            std::println!("[test-control] TEST_PASSED lan_static_lease");
+            passed += 1;
+        }
+        Err(e) => {
+            std::println!("[test-control] TEST_FAILED lan_static_lease {}", e);
+            failed += 1;
+        }
+    }
+
     // Clean WAN IP configuration
     if let Some(index) = network::get_interface_index("wan").await
         && let Err(e) = flush_ipv4_addresses("wan", index).await
