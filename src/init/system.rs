@@ -2,13 +2,13 @@ use crate::error::RouterError;
 use log::{error, info, warn};
 use nix::mount::MsFlags;
 use nix::sys::reboot::RebootMode;
+use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::fs;
 use std::panic;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -29,6 +29,8 @@ pub trait PowerOps: Send + Sync + 'static {
 }
 
 pub trait ProcessOps: Send + Sync + 'static {
+    fn kill(&self, pid: Pid, signal: Signal) -> Result<(), nix::Error>;
+
     fn waitpid(
         &self,
         pid: Option<Pid>,
@@ -81,6 +83,10 @@ impl PowerOps for RealSystem {
 }
 
 impl ProcessOps for RealSystem {
+    fn kill(&self, pid: Pid, signal: Signal) -> Result<(), nix::Error> {
+        nix::sys::signal::kill(pid, signal)
+    }
+
     fn waitpid(
         &self,
         pid: Option<Pid>,
@@ -181,8 +187,9 @@ pub fn setup_resolv_conf<S: ProcessOps>(sys: &S) -> Result<(), std::io::Error> {
     setup_resolv_conf_at_path(Path::new(RESOLV_CONF_PATH))
 }
 
-// -1 = infinite (default), >=0 = delay in seconds
-pub static REBOOT_DELAY: AtomicI32 = AtomicI32::new(-1);
+pub const PANIC_REBOOT_DELAY: Duration = Duration::from_secs(10);
+pub const PANIC_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const PANIC_REAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 fn log_panic_info(info: &std::panic::PanicHookInfo<'_>) {
     error!("====================================================");
@@ -201,31 +208,79 @@ fn log_panic_info(info: &std::panic::PanicHookInfo<'_>) {
     crate::logging::flush();
 }
 
+enum ReapOutcome {
+    NoChildrenRemaining,
+    ChildrenStillRunning,
+}
+
+fn reap_and_check_all_exited<S: ProcessOps>(sys: &S) -> ReapOutcome {
+    loop {
+        match sys.waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(pid, code)) => {
+                info!(
+                    "[init] Reaped child process PID {} (exit status {})",
+                    pid, code
+                );
+            }
+            Ok(WaitStatus::Signaled(pid, sig, _)) => {
+                info!(
+                    "[init] Reaped child process PID {} (terminated with signal {})",
+                    pid, sig
+                );
+            }
+            Ok(WaitStatus::StillAlive) => return ReapOutcome::ChildrenStillRunning,
+            Err(nix::Error::ECHILD) => return ReapOutcome::NoChildrenRemaining,
+            _ => return ReapOutcome::ChildrenStillRunning,
+        }
+    }
+}
+
+fn terminate_children_with_grace<S: ProcessOps>(sys: &S) {
+    info!("[init] Sending SIGTERM to all child processes...");
+    let _ = sys.kill(Pid::from_raw(-1), Signal::SIGTERM);
+
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < PANIC_GRACE_PERIOD {
+        if let ReapOutcome::NoChildrenRemaining = reap_and_check_all_exited(sys) {
+            info!("[init] All child processes exited cleanly.");
+            return;
+        }
+        thread::sleep(PANIC_REAP_POLL_INTERVAL);
+    }
+
+    warn!(
+        "[init] Grace period expired ({}s). Sending SIGKILL to remaining child processes...",
+        PANIC_GRACE_PERIOD.as_secs()
+    );
+    let _ = sys.kill(Pid::from_raw(-1), Signal::SIGKILL);
+    thread::sleep(PANIC_REAP_POLL_INTERVAL);
+    let _ = reap_and_check_all_exited(sys);
+}
+
 fn halt_on_panic<S: PowerOps + ProcessOps>(sys: &S) {
     if sys.getpid() != Pid::from_raw(1) {
         return;
     }
+    let panic_start = std::time::Instant::now();
+    error!(
+        "[init] Panic recovery initiated. Rebooting in {} seconds...",
+        PANIC_REBOOT_DELAY.as_secs()
+    );
+
+    terminate_children_with_grace(sys);
+
     crate::logging::flush();
     sys.sync();
 
-    let delay = REBOOT_DELAY.load(Ordering::Relaxed);
-    if delay >= 0 {
-        error!("[init] Rebooting in {} seconds...", delay);
-        crate::logging::flush();
-        sys.sync();
-        thread::sleep(Duration::from_secs(delay as u64));
-        error!("[init] Rebooting system now...");
-        crate::logging::flush();
-        sys.sync();
-        let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
-    } else {
-        error!("[init] System halted. Hanging indefinitely on panic...");
-        crate::logging::flush();
-        sys.sync();
-        loop {
-            thread::sleep(Duration::from_secs(3600));
-        }
+    let elapsed = panic_start.elapsed();
+    if elapsed < PANIC_REBOOT_DELAY {
+        thread::sleep(PANIC_REBOOT_DELAY - elapsed);
     }
+
+    error!("[init] Rebooting system now...");
+    crate::logging::flush();
+    sys.sync();
+    let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
 }
 
 pub fn register_panic_handler<S: PowerOps + ProcessOps>(sys: Arc<S>) {
@@ -256,6 +311,7 @@ pub mod mock {
         pub reboot_call: Mutex<Option<RebootMode>>,
         pub sync_calls: Mutex<usize>,
         pub waitpid_results: Mutex<Vec<Result<WaitStatus, nix::Error>>>,
+        pub kill_calls: Mutex<Vec<(Pid, Signal)>>,
     }
 
     impl Default for MockSystem {
@@ -273,6 +329,7 @@ pub mod mock {
                 reboot_call: Mutex::new(None),
                 sync_calls: Mutex::new(0),
                 waitpid_results: Mutex::new(Vec::new()),
+                kill_calls: Mutex::new(Vec::new()),
             }
         }
     }
@@ -309,6 +366,11 @@ pub mod mock {
     }
 
     impl ProcessOps for MockSystem {
+        fn kill(&self, pid: Pid, signal: Signal) -> Result<(), nix::Error> {
+            self.kill_calls.lock().unwrap().push((pid, signal));
+            Ok(())
+        }
+
         fn waitpid(
             &self,
             _pid: Option<Pid>,
@@ -374,7 +436,7 @@ mod tests {
     #[test]
     fn test_hang_on_panic() {
         let mut sys = MockSystem::new();
-        // Set PID to non-1 so it returns from panic hook without infinite sleeping
+        // Set PID to non-1 so it returns from panic hook without sleeping
         sys.pid = Pid::from_raw(99);
         let sys = Arc::new(sys);
 
@@ -384,7 +446,8 @@ mod tests {
             panic!("Test panic exception");
         });
 
-        let _ = handle.join(); // This will return immediately now
+        let _ = handle.join();
+        let _ = std::panic::take_hook();
 
         let reboot_called = sys.reboot_call.lock().unwrap();
         assert_eq!(*reboot_called, None);
@@ -427,5 +490,52 @@ mod tests {
     fn test_mock_system_read_config_empty_returns_err() {
         let sys = MockSystem::new();
         assert!(sys.read_config_file().is_err());
+    }
+
+    #[test]
+    fn test_reap_and_check_all_exited() {
+        let sys = MockSystem::new();
+        {
+            let mut list = sys.waitpid_results.lock().unwrap();
+            list.push(Ok(WaitStatus::Exited(Pid::from_raw(100), 0)));
+            list.push(Ok(WaitStatus::Signaled(
+                Pid::from_raw(101),
+                Signal::SIGTERM,
+                false,
+            )));
+            list.push(Err(nix::Error::ECHILD));
+        }
+        match reap_and_check_all_exited(&sys) {
+            ReapOutcome::NoChildrenRemaining => {}
+            ReapOutcome::ChildrenStillRunning => panic!("Expected NoChildrenRemaining on ECHILD"),
+        }
+    }
+
+    #[test]
+    fn test_terminate_children_with_grace_echild_returns_immediately() {
+        let sys = MockSystem::new();
+        {
+            let mut list = sys.waitpid_results.lock().unwrap();
+            list.push(Err(nix::Error::ECHILD));
+        }
+        let start = std::time::Instant::now();
+        terminate_children_with_grace(&sys);
+        assert!(start.elapsed() < PANIC_GRACE_PERIOD);
+        let kills = sys.kill_calls.lock().unwrap();
+        assert_eq!(kills.len(), 1);
+        assert_eq!(kills[0].0, Pid::from_raw(-1));
+        assert_eq!(kills[0].1, Signal::SIGTERM);
+    }
+
+    #[test]
+    fn test_terminate_children_with_grace_fallback_sigkill() {
+        let sys = MockSystem::new();
+        let start = std::time::Instant::now();
+        terminate_children_with_grace(&sys);
+        assert!(start.elapsed() >= PANIC_GRACE_PERIOD);
+        let kills = sys.kill_calls.lock().unwrap();
+        assert_eq!(kills.len(), 2);
+        assert_eq!(kills[0].1, Signal::SIGTERM);
+        assert_eq!(kills[1].1, Signal::SIGKILL);
     }
 }

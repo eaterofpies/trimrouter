@@ -1,6 +1,5 @@
 use crate::error::RouterError;
 use crate::init::system::ConfigReaderOps;
-use crate::services::utils::CleanOption;
 use pnet::util::MacAddr;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -28,7 +27,6 @@ pub struct RouterConfig {
     pub backup_lan_ip: String,
     pub wan_mac: MacAddr,
     pub lan_mac: MacAddr,
-    pub reboot_delay: Option<u32>, // Some(N) = N seconds, None = infinite
     pub logging: LoggingConfig,
     pub watchdog: bool,
     pub dns_servers: Vec<Ipv4Addr>,
@@ -42,7 +40,6 @@ impl std::fmt::Debug for RouterConfig {
             .field("backup_lan_ip", &self.backup_lan_ip)
             .field("wan_mac", &self.wan_mac)
             .field("lan_mac", &self.lan_mac)
-            .field("reboot_delay", &CleanOption(&self.reboot_delay))
             .field("logging", &self.logging)
             .field("watchdog", &self.watchdog)
             .field("dns_servers", &self.dns_servers)
@@ -87,7 +84,6 @@ struct DnsSection {
 
 #[derive(Deserialize)]
 struct SystemSection {
-    reboot_delay: Option<u32>,
     watchdog: Option<bool>,
 }
 
@@ -315,7 +311,6 @@ impl RouterConfig {
         }
 
         let static_leases = parse_dhcp_reservations(parsed.dhcp.as_ref(), &lan_net)?;
-        let reboot_delay = parsed.system.as_ref().and_then(|s| s.reboot_delay);
         let logging = parse_logging_config(parsed.logging.as_ref())?;
         let watchdog = parsed
             .system
@@ -328,7 +323,6 @@ impl RouterConfig {
             backup_lan_ip,
             wan_mac,
             lan_mac,
-            reboot_delay,
             logging,
             watchdog,
             dns_servers,
@@ -415,7 +409,6 @@ mod tests {
             config.lan_mac,
             MacAddr::from_str("52:54:00:12:34:57").unwrap()
         );
-        assert_eq!(config.reboot_delay, None);
     }
 
     #[test]
@@ -582,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_parsing_reboot_delay() {
+    fn test_config_parsing_system_watchdog_toggle() {
         let mut sys = MockSystem::new();
         sys.config_content = r#"
             [network]
@@ -590,11 +583,11 @@ mod tests {
             lan_mac = "52:54:00:12:34:57"
             backup_lan_ip = "10.0.0.1/24"
             [system]
-            reboot_delay = 5
+            watchdog = false
         "#
         .to_string();
         let cfg = RouterConfig::parse(&sys).unwrap();
-        assert_eq!(cfg.reboot_delay, Some(5));
+        assert!(!cfg.watchdog);
     }
 
     #[test]

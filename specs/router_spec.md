@@ -41,7 +41,7 @@ Crucially, **no other files** will be present on the target filesystem other tha
 3. **Orphan Reaping**: Runs a non-blocking reaping loop using `waitpid` to prevent zombie processes.
 4. **Configuration Extraction**: Reads and parses `/boot/config/trimrouter.toml`. `wan_mac` and `lan_mac` are strictly required — if either is missing or the file cannot be read, PID 1 panics (halts). See §3 for the full configuration schema.
 5. **Kernel Module Autoloading**: Probes required modules at startup via a built-in `modprobe` emulator. Listens for `NETLINK_KOBJECT_UEVENT` broadcasts and loads modules matching received `modalias` strings by resolving `modules.dep` with cycle detection and recursion depth caps (`MAX_DEP_RECURSION_DEPTH = 64`), non-recursive polynomial wildcard matching (eliminating ReDoS / stack exhaustion), and path traversal sanitization. The binary also acts as a drop-in `modprobe` replacement when invoked as `argv[0] == "modprobe"`.
-6. **Panic Handling**: Registers a custom panic hook via `std::panic::set_hook`. On panic, logs the traceback to stdout and hangs indefinitely (to avoid an unclean kernel panic) rather than exiting.
+6. **Panic Handling & Auto-Recovery**: Registers a custom panic hook via `std::panic::set_hook`. On panic in PID 1, the hook logs the panic cause, source location, and traceback to `/var/log/system.log`, immediately terminates all child worker processes with `SIGKILL` (`kill(-1, SIGKILL)`), flushes log buffers, runs `sync()`, waits 10 seconds (`PANIC_REBOOT_DELAY`) to allow storage queues to settle and prevent reboot loops, and automatically reboots the system via `nix::sys::reboot::reboot(RebootMode::RB_AUTOBOOT)` for autonomous recovery.
 7. **ACPI Power Button**: Monitors `/dev/input/event0`–`event31` via the `evdev` crate with a dynamic background discovery loop for `KEY_POWER`, `KEY_POWER2`, or `KEY_SLEEP` key-down events to trigger a clean shutdown (flushing log buffers and synchronizing filesystems via `sync()` before poweroff), since no `acpid` or `systemd-logind` is present.
 8. **Local DNS Resolver Configuration**: Writes `/etc/resolv.conf` configured with `nameserver 127.0.0.1` so that standard library DNS lookups from PID 1 and local utilities resolve transparently through the embedded DNS forwarder. Failure to write `/etc/resolv.conf` is treated as a fatal initialization error (panic).
 9. **Hardware Watchdog Integration**: Discovers and opens `/dev/watchdog` if present to protect against deadlocks and hangs. An asynchronous keepalive monitor pets the watchdog periodically upon successful health checks. On clean system shutdown or reboot, it sends the magic close character (`'V'`) to disarm the hardware watchdog. See [`watchdog_spec.md`](watchdog_spec.md).
@@ -62,6 +62,27 @@ At early startup, PID 1 mounts the required pseudo-filesystems before initializi
 1. **RAM Quota Bounding (`size=8M` & `size=16M`)**: Unconfigured Linux `tmpfs` mounts default to **50% of total physical RAM**. On low-memory embedded routers (128–512 MiB), unbounded mounts expose the router to Out-Of-Memory (OOM) panics if a rogue or sandboxed process fills `/tmp`. Explicit bounds restrict memory consumption to safe, deterministic ceilings.
 2. **Restricted Deletion (`mode=1777`)**: The sticky bit on `/tmp` ensures only root or the file's creator can delete or rename temporary files, preserving isolation between sandboxed workers.
 3. **Privilege Boundary (`MS_NOSUID | MS_NODEV`)**: Setuid/setgid execution and character/block device node interpretation are disallowed on all runtime tmpfs instances, eliminating local privilege escalation via binaries or device nodes planted in temporary filesystems.
+
+### 2.1.2 Shutdown, Poweroff, and Panic Recovery Lifecycle
+
+`trimrouter` defines distinct deterministic workflows for orderly termination versus emergency panic recovery:
+
+#### Orderly Shutdown / Poweroff (Signals & ACPI Power Button)
+1. **Signal/Event Interception**: Receives `SIGINT`, `SIGTERM`, `SIGPWR`, or a key-down event (`KEY_POWER`, `KEY_POWER2`, `KEY_SLEEP`) from `/dev/input/event*`.
+2. **Shutdown Coordination**: Sets atomic `shutdown_flag = true`, signaling asynchronous loops and service monitors to cease operations.
+3. **Watchdog Disarm**: Writes the magic close character (`'V'`) to `/dev/watchdog` before closing its descriptor, preventing unwanted hardware resets during powerdown.
+4. **Service Teardown**: Stops network services (DNS forwarder, LAN manager, DHCP client).
+5. **Storage Flush & Poweroff**: Flushes in-memory log buffers to `/var/log/system.log`, executes `sync()` across all mounted filesystems, and invokes `nix::sys::reboot::reboot(RebootMode::RB_POWER_OFF)`.
+
+#### Emergency Panic Teardown & Recovery (Panic in PID 1)
+1. **Diagnostic Persistence**: Captures panic payload (reason), file, line, column, and backtrace, writing the diagnostic report directly to `/var/log/system.log`.
+2. **Two-Phase Process Teardown**:
+   - Sends `SIGTERM` to all child processes (`kill(-1, SIGTERM)`), giving active workers a 2-second grace period (`PANIC_GRACE_PERIOD = 2s`) to finalize in-flight log records and shut down cleanly.
+   - Actively reaps exiting child processes via non-blocking `waitpid(-1, WNOHANG)`.
+   - If any child processes remain alive after the 2-second grace period, forcefully terminates them with `SIGKILL` (`kill(-1, SIGKILL)`).
+3. **Storage Flush & Sync**: Flushes all pending log records and invokes `sync()` to ensure post-mortem traces are fully committed to Partition 2.
+4. **Stabilization Delay**: Waits the remaining time of a fixed 10-second period (`PANIC_REBOOT_DELAY = 10s`) to allow flash storage controllers to finalize write cycles and prevent rapid reboot thrashing.
+5. **Automated Recovery Reboot**: Calls `nix::sys::reboot::reboot(RebootMode::RB_AUTOBOOT)` to power-cycle/reboot the appliance, restoring normal routing operations autonomously.
 
 ### 2.2 Routing, Address & NAT Configuration
 
@@ -129,7 +150,6 @@ backup_lan_ip = "10.0.0.1/24"   # Optional — defaults to "10.0.0.1/24"
 dns_servers = ["1.1.1.1", "1.0.0.1"] # Optional — custom upstream DNS resolvers (overrides WAN DHCP DNS)
 
 [system]
-reboot_delay = 10               # Optional — seconds before reboot on panic (omit for infinite hang)
 watchdog = true                 # Optional — enable /dev/watchdog hardware supervisor (default: true)
 ```
 

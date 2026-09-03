@@ -76,8 +76,6 @@ level = "info"
 # ]
 
 [system]
-# Optional reboot delay in seconds on panic (defaults to infinite hang if omitted)
-# reboot_delay = 10
 # Optional hardware watchdog supervision (/dev/watchdog) (default: true)
 # watchdog = true
 ```

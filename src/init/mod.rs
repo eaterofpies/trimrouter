@@ -16,7 +16,7 @@ use std::fs::{self, OpenOptions, metadata, set_permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use storage::{
     ensure_log_partition_in_mbr, mount_boot_partition, setup_log_partition, wait_for_boot_partition,
 };
@@ -170,11 +170,6 @@ fn load_and_apply_config(sys: &RealSystem) -> RouterConfig {
         env!("VERGEN_GIT_SHA"),
         env!("VERGEN_BUILD_TIMESTAMP")
     );
-    let delay_val = match config.reboot_delay {
-        None => -1,
-        Some(d) => d as i32,
-    };
-    system::REBOOT_DELAY.store(delay_val, Ordering::Relaxed);
     info!("[init] Configuration loaded: {:?}", config);
 
     config
@@ -334,7 +329,6 @@ mod tests {
             backup_lan_ip: "10.0.0.1/24".to_string(),
             wan_mac: MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),
             lan_mac: MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x66),
-            reboot_delay: None,
             logging: Default::default(),
             watchdog: true,
             dns_servers: Vec::new(),

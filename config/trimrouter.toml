@@ -11,8 +11,6 @@ lan_mac = "52:54:00:12:34:57"
 # backup_lan_ip = "10.0.0.1/24"
 
 [system]
-# Delay in seconds before auto-rebooting on panic (unset/commented out for infinite hang)
-# reboot_delay = 10
 # Hardware watchdog supervision (/dev/watchdog) (default: true)
 # watchdog = true
 
