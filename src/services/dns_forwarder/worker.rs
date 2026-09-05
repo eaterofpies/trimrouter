@@ -1,4 +1,5 @@
 use crate::services::DNS_FORWARDER_SERVICE_NAME;
+use crate::services::dns_forwarder::rate_limiter::DnsRateLimiter;
 use crate::services::ipc::{DnsParentToWorkerMsg, DnsWorkerToParentMsg, recv_msg, send_msg};
 use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_udp_socket, run_sandboxed_worker,
@@ -82,6 +83,7 @@ async fn run_forwarder_loop(
     let mut client_buf = [0u8; RECV_BUF_SIZE];
     let mut upstream_buf = [0u8; RECV_BUF_SIZE];
     let mut cleanup_timer = tokio::time::interval(CLEANUP_INTERVAL);
+    let mut rate_limiter = DnsRateLimiter::default();
 
     loop {
         tokio::select! {
@@ -90,6 +92,7 @@ async fn run_forwarder_loop(
                     debug!("[dns-forwarder-worker] Failed to send heartbeat to parent: {}", e);
                 }
                 evict_expired_cache(&mut cache);
+                rate_limiter.retain_recent();
                 check_pending_timeouts(&mut pending_queries, &upstream_socket).await;
             }
             ipc_msg = recv_msg::<DnsParentToWorkerMsg, _>(&mut ipc_reader) => {
@@ -116,22 +119,24 @@ async fn run_forwarder_loop(
             }
             client_recv = dns_socket.recv_from(&mut client_buf) => {
                 if let Ok((len, src)) = client_recv {
-                    let local_table = LocalDnsTable {
-                        hosts: &local_hosts,
-                        ips: &local_ips,
-                    };
-                    let sockets = ForwarderSockets {
-                        dns: &dns_socket,
-                        upstream: &upstream_socket,
+                    let ctx = ForwarderContext {
+                        sockets: ForwarderSockets {
+                            dns: &dns_socket,
+                            upstream: &upstream_socket,
+                        },
+                        local_table: LocalDnsTable {
+                            hosts: &local_hosts,
+                            ips: &local_ips,
+                        },
+                        configured_servers: &upstream_servers,
                     };
                     handle_client_query(
                         &client_buf[..len],
                         src,
-                        &sockets,
+                        &ctx,
                         &mut cache,
                         &mut pending_queries,
-                        &upstream_servers,
-                        &local_table,
+                        &mut rate_limiter,
                     ).await;
                 }
             }
@@ -160,21 +165,28 @@ struct LocalDnsTable<'a> {
     ips: &'a HashMap<Ipv4Addr, String>,
 }
 
+struct ForwarderContext<'a> {
+    sockets: ForwarderSockets<'a>,
+    local_table: LocalDnsTable<'a>,
+    configured_servers: &'a [Ipv4Addr],
+}
+
 async fn handle_client_query(
     query: &[u8],
     src: SocketAddr,
-    sockets: &ForwarderSockets<'_>,
+    ctx: &ForwarderContext<'_>,
     cache: &mut HashMap<Vec<u8>, CacheEntry>,
     pending: &mut HashMap<u16, PendingQuery>,
-    configured_servers: &[Ipv4Addr],
-    local_table: &LocalDnsTable<'_>,
+    rate_limiter: &mut DnsRateLimiter,
 ) {
     if query.len() < DNS_HEADER_SIZE {
         return;
     }
 
-    if let Some(local_resp) = try_resolve_local_query(query, local_table.hosts, local_table.ips) {
-        let _ = sockets.dns.send_to(&local_resp, src).await;
+    if let Some(local_resp) =
+        try_resolve_local_query(query, ctx.local_table.hosts, ctx.local_table.ips)
+    {
+        let _ = ctx.sockets.dns.send_to(&local_resp, src).await;
         return;
     }
 
@@ -185,7 +197,19 @@ async fn handle_client_query(
     if let Some(mut response) = lookup_cache(&cache_key, cache) {
         response[0] = query[0];
         response[1] = query[1];
-        let _ = sockets.dns.send_to(&response, src).await;
+        let _ = ctx.sockets.dns.send_to(&response, src).await;
+        return;
+    }
+
+    let client_ip = match src.ip() {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(_) => return,
+    };
+    if !rate_limiter.check(&client_ip) {
+        debug!(
+            "[dns-forwarder-worker] Upstream rate limit exceeded for client {}. Dropping query.",
+            client_ip
+        );
         return;
     }
 
@@ -193,9 +217,9 @@ async fn handle_client_query(
         query,
         src,
         cache_key,
-        sockets.upstream,
+        ctx.sockets.upstream,
         pending,
-        configured_servers,
+        ctx.configured_servers,
     )
     .await;
 }

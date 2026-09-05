@@ -23,7 +23,7 @@ It manages virtual filesystems, signal forwarding, orphan reaping, and launches 
 - **Embedded Network Services**:
   - **DHCP Client (WAN)**: Handles dynamic leases and unicast renewals on the WAN interface over raw sockets.
   - **DHCP Server (LAN)**: Manages LAN lease allocations, address conflicts, and lease release/decline requests.
-  - **DNS Forwarder/Proxy (LAN)**: Listens for DNS queries on the LAN interface and forwards them to the dynamic DNS servers obtained from the WAN lease.
+  - **DNS Forwarder/Proxy (LAN)**: Resolves local split-horizon hostnames (`.lan`), serves cached records at wire speed, enforces per-client token-bucket rate limiting on upstream queries, and forwards uncached requests to WAN DNS resolvers with transaction ID randomization and spoofing defense.
   - **NTP Client (SNTP)**: Periodically synchronizes the router system time from time.google.com.
 
 ---

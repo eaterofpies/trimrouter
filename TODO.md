@@ -1,6 +1,5 @@
 # TODO List
 
-- DNS query rate limiting and flood defense (per-client token-bucket rate limiting)
 - Inbound TCP listener on port 53 for LAN DNS queries (RFC 7766)
 - EDNS0 buffer sizing and truncation (TC=1 flag) handling in DNS forwarder
 - Upstream DNS query deduplication and in-flight request joining

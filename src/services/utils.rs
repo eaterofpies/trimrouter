@@ -420,6 +420,8 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     #[cfg(target_arch = "x86_64")]
     libc::SYS_arch_prctl,
     libc::SYS_clock_gettime,
+    libc::SYS_clock_getres,
+    libc::SYS_sched_getaffinity,
     libc::SYS_nanosleep,
     libc::SYS_gettimeofday,
     libc::SYS_clock_nanosleep,

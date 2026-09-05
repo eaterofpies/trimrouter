@@ -60,6 +60,13 @@ For every query forwarded upstream:
 *   Attempts resolution sequentially across the configured valid upstream resolvers. If an upstream resolver times out or fails to respond, it automatically attempts the next resolver in the list.
 *   If the WAN lease has no valid DNS servers or is inactive, falls back to `8.8.8.8` (Google DNS).
 
+### 2.4 Upstream Query Rate Limiting & Flood Defense
+To prevent DNS query flooding, amplification abuse, and Denial-of-Service attacks from rogue or infected LAN devices:
+*   **Upstream Rate Limiting**: Employs an in-memory token-bucket rate limiter per client `Ipv4Addr` applied strictly to upstream cache misses (allowing local `.lan` hostnames and cached records to be served unthrottled at wire speed).
+*   **Default Thresholds**: Allows up to 100 queries/second (`DEFAULT_DNS_RATE_LIMIT_PER_SEC`) with a burst allowance of up to 150 queries (`DEFAULT_DNS_BURST_QUOTA`).
+*   **Flooding Defense**: Queries exceeding the burst quota are immediately dropped without forwarding, preventing outbound bandwidth exhaustion and protecting upstream resolvers.
+*   **Periodic Key Retention**: Idle client tracking records are automatically reclaimed during the 1-second cleanup timer via `retain_recent()`.
+
 ---
 
 ## 3. Cache Design
