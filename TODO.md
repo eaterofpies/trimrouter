@@ -1,7 +1,6 @@
 # TODO List
 
 - Inbound TCP listener on port 53 for LAN DNS queries (RFC 7766)
-- EDNS0 buffer sizing and truncation (TC=1 flag) handling in DNS forwarder
 - Upstream DNS query deduplication and in-flight request joining
 - Upstream TCP fallback and secondary resolver failover in DNS forwarder
 - DNS-over-TLS (DoT) upstream resolution (port 853 with embedded CA trust roots)

@@ -20,6 +20,8 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 // DNS Constants & Config
 // =========================================================================
 const DNS_HEADER_SIZE: usize = 12;
+const RFC1035_MAX_UDP_PAYLOAD: usize = 512;
+const MAX_EDNS_PAYLOAD_SIZE: usize = 4096;
 const DEFAULT_TTL_SECS: u32 = 30;
 const MAX_TTL_SECS: u32 = 3600; // 1 hour max cache duration
 const DEFAULT_NEGATIVE_TTL_SECS: u32 = 60; // 1 minute default for NXDOMAIN/NODATA
@@ -41,6 +43,7 @@ struct CacheEntry {
 struct PendingQuery {
     client_addr: SocketAddr,
     client_xid: u16,
+    client_max_payload: usize,
     cache_key: Vec<u8>,
     query_payload: Vec<u8>,
     upstream_servers: Vec<Ipv4Addr>,
@@ -197,7 +200,9 @@ async fn handle_client_query(
     if let Some(mut response) = lookup_cache(&cache_key, cache) {
         response[0] = query[0];
         response[1] = query[1];
-        let _ = ctx.sockets.dns.send_to(&response, src).await;
+        let max_payload = extract_client_max_payload(query);
+        let final_response = prepare_client_response(response, max_payload);
+        let _ = ctx.sockets.dns.send_to(&final_response, src).await;
         return;
     }
 
@@ -240,6 +245,7 @@ async fn forward_new_client_query(
     };
 
     let client_xid = u16::from_be_bytes([query[0], query[1]]);
+    let client_max_payload = extract_client_max_payload(query);
     let upstream_servers = get_upstream_resolvers(configured_servers);
     let target_server = upstream_servers[0];
 
@@ -255,6 +261,7 @@ async fn forward_new_client_query(
             PendingQuery {
                 client_addr: src,
                 client_xid,
+                client_max_payload,
                 cache_key,
                 query_payload: query.to_vec(),
                 upstream_servers,
@@ -297,8 +304,9 @@ async fn handle_upstream_reply(
     client_response[0] = client_xid_bytes[0];
     client_response[1] = client_xid_bytes[1];
 
+    let final_response = prepare_client_response(client_response, query_meta.client_max_payload);
     let _ = dns_socket
-        .send_to(&client_response, query_meta.client_addr)
+        .send_to(&final_response, query_meta.client_addr)
         .await;
 }
 
@@ -335,6 +343,35 @@ async fn check_pending_timeouts(
             let _ = upstream_socket.send_to(&forwarded, dest).await;
         }
     }
+}
+
+fn extract_client_max_payload(query_bytes: &[u8]) -> usize {
+    if let Ok(msg) = Message::from_bytes(query_bytes) {
+        if let Some(edns) = &msg.edns {
+            return (edns.max_payload() as usize)
+                .clamp(RFC1035_MAX_UDP_PAYLOAD, MAX_EDNS_PAYLOAD_SIZE);
+        }
+    }
+    RFC1035_MAX_UDP_PAYLOAD
+}
+
+fn prepare_client_response(mut response: Vec<u8>, max_payload: usize) -> Vec<u8> {
+    if response.len() <= max_payload {
+        return response;
+    }
+    if let Ok(msg) = Message::from_bytes(&response) {
+        let truncated_msg = msg.truncate();
+        let mut buf = Vec::new();
+        let mut encoder = BinEncoder::new(&mut buf);
+        if truncated_msg.emit(&mut encoder).is_ok() && buf.len() <= max_payload {
+            return buf;
+        }
+    }
+    if response.len() >= DNS_HEADER_SIZE {
+        response[2] |= 0x02; // Set TC flag (byte 2, bit 1)
+        response.truncate(DNS_HEADER_SIZE);
+    }
+    response
 }
 
 fn evict_expired_cache(cache: &mut HashMap<Vec<u8>, CacheEntry>) {
@@ -1370,5 +1407,77 @@ mod tests {
         query.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
 
         assert_eq!(get_cache_key(&query), None);
+    }
+
+    #[test]
+    fn test_extract_client_max_payload_standard_and_edns() {
+        // Standard query without EDNS
+        let mut query = Message::new(1234, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("example.com.").unwrap();
+        query.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        let mut query_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut enc).unwrap();
+
+        assert_eq!(extract_client_max_payload(&query_bytes), 512);
+
+        // Query with EDNS0 OPT specifying 2048 buffer size
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(2048);
+        query.set_edns(edns);
+
+        let mut edns_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut edns_bytes);
+        query.emit(&mut enc).unwrap();
+
+        assert_eq!(extract_client_max_payload(&edns_bytes), 2048);
+    }
+
+    #[test]
+    fn test_prepare_client_response_truncation() {
+        // Build a large response with many A records (>512 bytes)
+        let mut response = Message::new(
+            1234,
+            hickory_proto::op::MessageType::Response,
+            OpCode::Query,
+        );
+        let qname = Name::from_ascii("example.com.").unwrap();
+        response.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        for i in 0..50 {
+            let record = Record::from_rdata(
+                qname.clone(),
+                300,
+                RData::A(A(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8))),
+            );
+            response.add_answer(record);
+        }
+        let mut large_resp = Vec::new();
+        let mut enc = BinEncoder::new(&mut large_resp);
+        response.emit(&mut enc).unwrap();
+        assert!(large_resp.len() > 512);
+
+        // For a client with 512-byte max payload, prepare_client_response must set TC=1 and truncate
+        let truncated = prepare_client_response(large_resp.clone(), 512);
+        assert!(truncated.len() <= 512);
+        let decoded = Message::from_bytes(&truncated).unwrap();
+        assert!(
+            decoded.truncation,
+            "TC flag must be set on truncated response"
+        );
+
+        // For a client with 4096-byte max payload, large_resp should fit untouched
+        let untouched = prepare_client_response(large_resp.clone(), 4096);
+        assert_eq!(untouched.len(), large_resp.len());
+        let decoded = Message::from_bytes(&untouched).unwrap();
+        assert!(
+            !decoded.truncation,
+            "TC flag must not be set when response fits"
+        );
     }
 }

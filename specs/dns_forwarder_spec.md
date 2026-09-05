@@ -67,6 +67,12 @@ To prevent DNS query flooding, amplification abuse, and Denial-of-Service attack
 *   **Flooding Defense**: Queries exceeding the burst quota are immediately dropped without forwarding, preventing outbound bandwidth exhaustion and protecting upstream resolvers.
 *   **Periodic Key Retention**: Idle client tracking records are automatically reclaimed during the 1-second cleanup timer via `retain_recent()`.
 
+### 2.5 EDNS0 Buffer Sizing & Response Truncation (`TC=1`)
+To support large DNS responses (such as DNSSEC signatures and multi-record answers) over UDP while adhering to client buffer constraints per RFC 6891 and RFC 1035:
+*   **Client Buffer Inspection**: The forwarder inspects client queries for an EDNS0 `OPT` pseudo-record to determine the advertised maximum UDP payload size. If absent, the payload is constrained to the RFC 1035 default of 512 bytes (`RFC1035_MAX_UDP_PAYLOAD`). If present, the buffer size is respected up to 4096 bytes (`MAX_EDNS_PAYLOAD_SIZE`).
+*   **Truncation (`TC=1`) Flag**: If a response (from local lookup, RAM cache, or upstream) exceeds the client's advertised buffer limit, the forwarder sets the `TC=1` (Truncated) flag in the DNS header and truncates the response, signaling the client to retry over TCP.
+*   **DNSSEC OK (`DO`) Passthrough**: The client's EDNS0 `OPT` record (including the `DO` bit) is passed upstream to receive `RRSIG` records for DNSSEC validation.
+
 ---
 
 ## 3. Cache Design
@@ -117,5 +123,5 @@ Before forwarding a query upstream or checking the cache, the forwarder inspects
 
 ## 5. Limitations
 
-*   **UDP Only**: The DNS forwarder supports only UDP DNS queries. TCP DNS queries (such as large zones or DNSSEC fallbacks) are not supported.
+*   **UDP Inbound Listener**: The DNS forwarder currently listens for incoming queries over UDP port 53. If responses exceed client buffer capacity, it truncates the reply and sets `TC=1` to prompt client TCP fallback.
 *   **Upstream Timeout**: Upstream queries time out after 3 seconds (`UPSTREAM_TIMEOUT`), at which point the pending query entry is evicted to prevent memory growth.
