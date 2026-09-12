@@ -346,11 +346,10 @@ async fn check_pending_timeouts(
 }
 
 fn extract_client_max_payload(query_bytes: &[u8]) -> usize {
-    if let Ok(msg) = Message::from_bytes(query_bytes) {
-        if let Some(edns) = &msg.edns {
-            return (edns.max_payload() as usize)
-                .clamp(RFC1035_MAX_UDP_PAYLOAD, MAX_EDNS_PAYLOAD_SIZE);
-        }
+    if let Ok(msg) = Message::from_bytes(query_bytes)
+        && let Some(edns) = &msg.edns
+    {
+        return (edns.max_payload() as usize).clamp(RFC1035_MAX_UDP_PAYLOAD, MAX_EDNS_PAYLOAD_SIZE);
     }
     RFC1035_MAX_UDP_PAYLOAD
 }
