@@ -88,10 +88,18 @@ impl ServiceController {
         Ok(())
     }
 
+    pub fn signal_shutdown(&self) {
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(true);
+        }
+    }
+
     pub async fn stop(&mut self) -> Result<(), ServiceError> {
         let handle = self.task_handle.take().ok_or(ServiceError::NotRunning)?;
-        let tx = self.shutdown_tx.take().ok_or(ServiceError::NotRunning)?;
-        let _ = tx.send(true);
+        let tx = self.shutdown_tx.take();
+        if let Some(tx) = tx {
+            let _ = tx.send(true);
+        }
         let _ = handle.await;
         Ok(())
     }
@@ -130,6 +138,10 @@ impl ExternalWorker {
         S: FnMut() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError>,
         M: FnMut(OwnedFd, u32, Receiver<bool>) -> Result<JoinHandle<()>, ServiceError>,
     {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
         let (worker_service, parent_ipc_fd) = match setup_attempt() {
             Ok(res) => res,
             Err(e) => {
@@ -137,6 +149,10 @@ impl ExternalWorker {
                 return;
             }
         };
+
+        if *shutdown_rx.borrow() {
+            return;
+        }
 
         let args = worker_service.to_args();
         let arg_strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -217,6 +233,8 @@ impl ExternalWorker {
     }
 
     pub(crate) async fn stop(&mut self) -> Result<(), ServiceError> {
+        self.controller.signal_shutdown();
+
         let child_pid = self.child_pid.swap(0, Ordering::SeqCst);
         if child_pid != 0 {
             info!(
