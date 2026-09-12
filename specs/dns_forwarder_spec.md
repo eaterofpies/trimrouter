@@ -9,7 +9,12 @@ The DNS Forwarder is a local DNS proxy service in `trimrouter` that resolves DNS
 
 ## 1. Network & Socket Architecture
 
-*   **Service Binding**: Binds to port `53` (UDP) on the LAN interface to accept client queries.
+*   **Service Binding**: Binds to port `53` (both UDP and TCP per RFC 7766) on the LAN interface to accept client queries.
+*   **TCP DNS Framing & Connection Lifecycle (RFC 7766)**:
+    *   Accepts inbound TCP connections on port 53.
+    *   Frames queries and replies using a 2-byte big-endian unsigned length prefix.
+    *   Supports pipelining and connection reuse on persistent streams up to a 10-second idle timeout (`TCP_DNS_IDLE_TIMEOUT`).
+    *   Enforces a maximum message size limit of 65,535 bytes (`MAX_TCP_DNS_MESSAGE_SIZE`).
 *   **Upstream Client Socket**: Binds a single, long-lived client UDP socket (`0.0.0.0:0`) for all outgoing upstream DNS queries.
     > [!TIP]
     > Reusing a single socket avoids binding and closing temporary sockets for each query, preventing ephemeral port exhaustion in high-concurrency environments.
@@ -123,5 +128,4 @@ Before forwarding a query upstream or checking the cache, the forwarder inspects
 
 ## 5. Limitations
 
-*   **UDP Inbound Listener**: The DNS forwarder currently listens for incoming queries over UDP port 53. If responses exceed client buffer capacity, it truncates the reply and sets `TC=1` to prompt client TCP fallback.
 *   **Upstream Timeout**: Upstream queries time out after 3 seconds (`UPSTREAM_TIMEOUT`), at which point the pending query entry is evicted to prevent memory growth.

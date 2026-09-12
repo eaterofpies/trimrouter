@@ -26,6 +26,12 @@ impl From<std::net::UdpSocket> for CliFd {
     }
 }
 
+impl From<std::net::TcpListener> for CliFd {
+    fn from(listener: std::net::TcpListener) -> Self {
+        Self(listener.into())
+    }
+}
+
 impl From<CliFd> for OwnedFd {
     fn from(cli_fd: CliFd) -> Self {
         cli_fd.0
@@ -163,6 +169,8 @@ pub enum WorkerService {
         dns_socket_fd: CliFd,
         #[arg(value_parser = parse_cli_fd)]
         upstream_socket_fd: CliFd,
+        #[arg(value_parser = parse_cli_fd)]
+        dns_tcp_listener_fd: CliFd,
     },
 }
 
@@ -206,11 +214,13 @@ impl WorkerService {
                 ipc_fd,
                 dns_socket_fd,
                 upstream_socket_fd,
+                dns_tcp_listener_fd,
             } => {
                 vec![
                     ipc_fd.as_raw_fd().to_string(),
                     dns_socket_fd.as_raw_fd().to_string(),
                     upstream_socket_fd.as_raw_fd().to_string(),
+                    dns_tcp_listener_fd.as_raw_fd().to_string(),
                 ]
             }
         }
@@ -236,10 +246,12 @@ impl WorkerService {
                 ipc_fd,
                 dns_socket_fd,
                 upstream_socket_fd,
+                dns_tcp_listener_fd,
             } => vec![
                 ipc_fd.as_fd(),
                 dns_socket_fd.as_fd(),
                 upstream_socket_fd.as_fd(),
+                dns_tcp_listener_fd.as_fd(),
             ],
         }
     }
@@ -311,10 +323,11 @@ mod tests {
         assert!(Cli::try_parse_from(&exe_worker_args).is_ok());
 
         let (s7, s8) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (s9, _s10) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (s9, s10) = std::os::unix::net::UnixStream::pair().unwrap();
         let fd7 = s7.into_raw_fd();
         let fd8 = s8.into_raw_fd();
         let fd9 = s9.into_raw_fd();
+        let fd10 = s10.into_raw_fd();
         let exe_short_args = vec![
             "exe".to_string(),
             "worker".to_string(),
@@ -322,6 +335,7 @@ mod tests {
             fd7.to_string(),
             fd8.to_string(),
             fd9.to_string(),
+            fd10.to_string(),
         ];
         assert!(Cli::try_parse_from(&exe_short_args).is_ok());
     }
@@ -331,14 +345,17 @@ mod tests {
         let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
         let (s3, _s4) = std::os::unix::net::UnixStream::pair().unwrap();
         let (s5, _s6) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (s7, _s8) = std::os::unix::net::UnixStream::pair().unwrap();
 
         let fd1 = CliFd(s1.into());
         let fd2 = CliFd(s3.into());
         let fd3 = CliFd(s5.into());
+        let fd4 = CliFd(s7.into());
 
         let raw1 = fd1.as_raw_fd().to_string();
         let raw2 = fd2.as_raw_fd().to_string();
         let raw3 = fd3.as_raw_fd().to_string();
+        let raw4 = fd4.as_raw_fd().to_string();
 
         // SntpClient
         let (sntp_sock, _sntp_sock_peer) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -390,10 +407,12 @@ mod tests {
             ipc_fd: CliFd(std::os::unix::net::UnixStream::pair().unwrap().0.into()),
             dns_socket_fd: fd2,
             upstream_socket_fd: fd3,
+            dns_tcp_listener_fd: fd4,
         };
-        assert_eq!(dns.child_fds().len(), 3);
+        assert_eq!(dns.child_fds().len(), 4);
         assert_eq!(dns.to_args()[1], raw2);
         assert_eq!(dns.to_args()[2], raw3);
+        assert_eq!(dns.to_args()[3], raw4);
     }
 
     #[test]

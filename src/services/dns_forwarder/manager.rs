@@ -9,7 +9,7 @@ use crate::services::utils::{DNS_PORT, WanLeaseReceiver, create_ipc_fds, termina
 use log::{error, info};
 use std::collections::HashMap;
 use std::io::Error as IoError;
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -214,6 +214,7 @@ fn start_parent_dns_monitor(
 fn setup_dns_forwarder_attempt() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> {
     let (parent_ipc, child_ipc) = create_ipc_fds()?;
     let dns_socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DNS_PORT))?;
+    let dns_tcp_listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, DNS_PORT))?;
     let upstream_socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
 
     Ok((
@@ -221,6 +222,7 @@ fn setup_dns_forwarder_attempt() -> Result<(crate::cli::WorkerService, OwnedFd),
             ipc_fd: child_ipc.into(),
             dns_socket_fd: dns_socket.into(),
             upstream_socket_fd: upstream_socket.into(),
+            dns_tcp_listener_fd: dns_tcp_listener.into(),
         },
         parent_ipc,
     ))

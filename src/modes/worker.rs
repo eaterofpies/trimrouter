@@ -40,10 +40,12 @@ async fn dispatch_worker(service: WorkerService) -> Result<(), (&'static str, st
             ipc_fd,
             dns_socket_fd,
             upstream_socket_fd,
+            dns_tcp_listener_fd,
         } => dns_forwarder::run_dns_forwarder_worker(
             ipc_fd.into(),
             dns_socket_fd.into(),
             upstream_socket_fd.into(),
+            dns_tcp_listener_fd.into(),
         )
         .await
         .map_err(|e| (DNS_FORWARDER_SERVICE_NAME, e)),
@@ -79,13 +81,15 @@ mod tests {
         assert_eq!(sntp.to_args().len(), 2);
 
         // 2. DnsForwarder
+        let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dns = WorkerService::DnsForwarder {
             ipc_fd: CliFd(s3.into()),
             dns_socket_fd: CliFd(udp_sock2.into()),
             upstream_socket_fd: CliFd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into()),
+            dns_tcp_listener_fd: CliFd(tcp_listener.into()),
         };
-        assert_eq!(dns.child_fds().len(), 3);
-        assert_eq!(dns.to_args().len(), 3);
+        assert_eq!(dns.child_fds().len(), 4);
+        assert_eq!(dns.to_args().len(), 4);
 
         // 3. DhcpClient
         let (s5, _s6) = std::os::unix::net::UnixStream::pair().unwrap();

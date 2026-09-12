@@ -2,7 +2,8 @@ use crate::services::DNS_FORWARDER_SERVICE_NAME;
 use crate::services::dns_forwarder::rate_limiter::DnsRateLimiter;
 use crate::services::ipc::{DnsParentToWorkerMsg, DnsWorkerToParentMsg, recv_msg, send_msg};
 use crate::services::utils::{
-    DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_udp_socket, run_sandboxed_worker,
+    DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_tcp_listener, async_udp_socket,
+    run_sandboxed_worker,
 };
 use hickory_proto::op::{Message, OpCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::A, rdata::PTR};
@@ -13,11 +14,14 @@ use std::io::Error as IoError;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::OwnedFd;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::mpsc::{Sender as MpscSender, channel as mpsc_channel};
+use tokio::sync::oneshot::{Sender as OneshotSender, channel as oneshot_channel};
 
 // =========================================================================
-// DNS Constants & Config
+// DNS Constants & Config for DNS Forwarder Service (benchmarked)
 // =========================================================================
 const DNS_HEADER_SIZE: usize = 12;
 const RFC1035_MAX_UDP_PAYLOAD: usize = 512;
@@ -33,6 +37,9 @@ const FALLBACK_DNS_SERVER: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_PENDING_QUERIES: usize = 4096;
 const MAX_CACHE_ENTRIES: usize = 4096;
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_MAX_MESSAGE_SIZE: usize = 65535;
+const TCP_QUERY_CHANNEL_CAPACITY: usize = 128;
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -40,8 +47,52 @@ struct CacheEntry {
     expiry: Instant,
 }
 
+#[derive(Debug)]
+enum ClientOrigin {
+    Udp(SocketAddr),
+    Tcp {
+        peer_addr: SocketAddr,
+        reply_tx: OneshotSender<Vec<u8>>,
+    },
+}
+
+impl ClientOrigin {
+    fn peer_addr(&self) -> SocketAddr {
+        match self {
+            Self::Udp(addr) => *addr,
+            Self::Tcp { peer_addr, .. } => *peer_addr,
+        }
+    }
+
+    async fn send_reply(
+        self,
+        response: Vec<u8>,
+        dns_socket: &UdpSocket,
+        max_payload: Option<usize>,
+    ) {
+        match self {
+            Self::Udp(src) => {
+                let final_response = match max_payload {
+                    Some(cap) => prepare_client_response(response, cap),
+                    None => response,
+                };
+                let _ = dns_socket.send_to(&final_response, src).await;
+            }
+            Self::Tcp { reply_tx, .. } => {
+                let _ = reply_tx.send(response);
+            }
+        }
+    }
+}
+
+struct TcpQueryRequest {
+    query: Vec<u8>,
+    peer_addr: SocketAddr,
+    reply_tx: OneshotSender<Vec<u8>>,
+}
+
 struct PendingQuery {
-    client_addr: SocketAddr,
+    client_origin: ClientOrigin,
     client_xid: u16,
     client_max_payload: usize,
     cache_key: Vec<u8>,
@@ -55,9 +106,11 @@ pub async fn run_dns_forwarder_worker(
     ipc_fd: OwnedFd,
     dns_socket_fd: OwnedFd,
     upstream_socket_fd: OwnedFd,
+    dns_tcp_listener_fd: OwnedFd,
 ) -> Result<(), IoError> {
     let dns_socket = async_udp_socket(dns_socket_fd)?;
     let upstream_socket = async_udp_socket(upstream_socket_fd)?;
+    let dns_tcp_listener = async_tcp_listener(dns_tcp_listener_fd)?;
 
     run_sandboxed_worker(
         DNS_FORWARDER_SERVICE_NAME,
@@ -65,7 +118,14 @@ pub async fn run_dns_forwarder_worker(
         DNS_FORWARDER_GID,
         ipc_fd,
         |ipc| async move {
-            run_forwarder_loop(dns_socket, upstream_socket, ipc.reader, ipc.writer).await;
+            run_forwarder_loop(
+                dns_socket,
+                upstream_socket,
+                dns_tcp_listener,
+                ipc.reader,
+                ipc.writer,
+            )
+            .await;
             Ok(())
         },
     )
@@ -75,6 +135,7 @@ pub async fn run_dns_forwarder_worker(
 async fn run_forwarder_loop(
     dns_socket: UdpSocket,
     upstream_socket: UdpSocket,
+    dns_tcp_listener: TcpListener,
     mut ipc_reader: OwnedReadHalf,
     mut ipc_writer: OwnedWriteHalf,
 ) {
@@ -87,6 +148,8 @@ async fn run_forwarder_loop(
     let mut upstream_buf = [0u8; RECV_BUF_SIZE];
     let mut cleanup_timer = tokio::time::interval(CLEANUP_INTERVAL);
     let mut rate_limiter = DnsRateLimiter::default();
+    let (tcp_query_tx, mut tcp_query_rx) =
+        mpsc_channel::<TcpQueryRequest>(TCP_QUERY_CHANNEL_CAPACITY);
 
     loop {
         tokio::select! {
@@ -133,15 +196,45 @@ async fn run_forwarder_loop(
                         },
                         configured_servers: &upstream_servers,
                     };
-                    handle_client_query(
+                    handle_incoming_query(
                         &client_buf[..len],
-                        src,
+                        ClientOrigin::Udp(src),
                         &ctx,
                         &mut cache,
                         &mut pending_queries,
                         &mut rate_limiter,
                     ).await;
                 }
+            }
+            tcp_accept = dns_tcp_listener.accept() => {
+                if let Ok((stream, peer_addr)) = tcp_accept {
+                    let tx = tcp_query_tx.clone();
+                    tokio::spawn(handle_tcp_client_connection(stream, peer_addr, tx));
+                }
+            }
+            Some(tcp_req) = tcp_query_rx.recv() => {
+                let ctx = ForwarderContext {
+                    sockets: ForwarderSockets {
+                        dns: &dns_socket,
+                        upstream: &upstream_socket,
+                    },
+                    local_table: LocalDnsTable {
+                        hosts: &local_hosts,
+                        ips: &local_ips,
+                    },
+                    configured_servers: &upstream_servers,
+                };
+                handle_incoming_query(
+                    &tcp_req.query,
+                    ClientOrigin::Tcp {
+                        peer_addr: tcp_req.peer_addr,
+                        reply_tx: tcp_req.reply_tx,
+                    },
+                    &ctx,
+                    &mut cache,
+                    &mut pending_queries,
+                    &mut rate_limiter,
+                ).await;
             }
             upstream_recv = upstream_socket.recv_from(&mut upstream_buf) => {
                 if let Ok((len, from_addr)) = upstream_recv {
@@ -174,9 +267,78 @@ struct ForwarderContext<'a> {
     configured_servers: &'a [Ipv4Addr],
 }
 
-async fn handle_client_query(
+async fn handle_tcp_client_connection(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    tcp_query_tx: MpscSender<TcpQueryRequest>,
+) {
+    let (mut reader, mut writer) = stream.into_split();
+    loop {
+        let Some(query) = read_tcp_dns_query(&mut reader).await else {
+            break;
+        };
+
+        let (reply_tx, reply_rx) = oneshot_channel();
+        let req = TcpQueryRequest {
+            query,
+            peer_addr,
+            reply_tx,
+        };
+
+        if tcp_query_tx.send(req).await.is_err() {
+            break;
+        }
+
+        let Ok(reply) = reply_rx.await else {
+            break;
+        };
+        if write_tcp_dns_reply(&mut writer, &reply).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn read_tcp_dns_query<R: AsyncReadExt + Unpin>(reader: &mut R) -> Option<Vec<u8>> {
+    let mut len_buf = [0u8; 2];
+    let read_len = tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)).await;
+    let Ok(Ok(_)) = read_len else {
+        return None;
+    };
+
+    let query_len = u16::from_be_bytes(len_buf) as usize;
+    if !(DNS_HEADER_SIZE..=TCP_MAX_MESSAGE_SIZE).contains(&query_len) {
+        return None;
+    }
+
+    let mut query_buf = vec![0u8; query_len];
+    let read_payload =
+        tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut query_buf)).await;
+    if let Ok(Ok(_)) = read_payload {
+        Some(query_buf)
+    } else {
+        None
+    }
+}
+
+async fn write_tcp_dns_reply<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    reply: &[u8],
+) -> Result<(), std::io::Error> {
+    if reply.len() > TCP_MAX_MESSAGE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "DNS reply exceeds TCP max message size",
+        ));
+    }
+    let reply_len_bytes = (reply.len() as u16).to_be_bytes();
+    writer.write_all(&reply_len_bytes).await?;
+    writer.write_all(reply).await?;
+    Ok(())
+}
+
+async fn handle_incoming_query(
     query: &[u8],
-    src: SocketAddr,
+    origin: ClientOrigin,
     ctx: &ForwarderContext<'_>,
     cache: &mut HashMap<Vec<u8>, CacheEntry>,
     pending: &mut HashMap<u16, PendingQuery>,
@@ -189,7 +351,7 @@ async fn handle_client_query(
     if let Some(local_resp) =
         try_resolve_local_query(query, ctx.local_table.hosts, ctx.local_table.ips)
     {
-        let _ = ctx.sockets.dns.send_to(&local_resp, src).await;
+        origin.send_reply(local_resp, ctx.sockets.dns, None).await;
         return;
     }
 
@@ -201,12 +363,13 @@ async fn handle_client_query(
         response[0] = query[0];
         response[1] = query[1];
         let max_payload = extract_client_max_payload(query);
-        let final_response = prepare_client_response(response, max_payload);
-        let _ = ctx.sockets.dns.send_to(&final_response, src).await;
+        origin
+            .send_reply(response, ctx.sockets.dns, Some(max_payload))
+            .await;
         return;
     }
 
-    let client_ip = match src.ip() {
+    let client_ip = match origin.peer_addr().ip() {
         IpAddr::V4(ip) => ip,
         IpAddr::V6(_) => return,
     };
@@ -220,7 +383,7 @@ async fn handle_client_query(
 
     forward_new_client_query(
         query,
-        src,
+        origin,
         cache_key,
         ctx.sockets.upstream,
         pending,
@@ -231,7 +394,7 @@ async fn handle_client_query(
 
 async fn forward_new_client_query(
     query: &[u8],
-    src: SocketAddr,
+    client_origin: ClientOrigin,
     cache_key: Vec<u8>,
     upstream_socket: &UdpSocket,
     pending: &mut HashMap<u16, PendingQuery>,
@@ -259,7 +422,7 @@ async fn forward_new_client_query(
         pending.insert(
             upstream_xid,
             PendingQuery {
-                client_addr: src,
+                client_origin,
                 client_xid,
                 client_max_payload,
                 cache_key,
@@ -304,9 +467,13 @@ async fn handle_upstream_reply(
     client_response[0] = client_xid_bytes[0];
     client_response[1] = client_xid_bytes[1];
 
-    let final_response = prepare_client_response(client_response, query_meta.client_max_payload);
-    let _ = dns_socket
-        .send_to(&final_response, query_meta.client_addr)
+    query_meta
+        .client_origin
+        .send_reply(
+            client_response,
+            dns_socket,
+            Some(query_meta.client_max_payload),
+        )
         .await;
 }
 
@@ -1478,5 +1645,345 @@ mod tests {
             !decoded.truncation,
             "TC flag must not be set when response fits"
         );
+    }
+
+    #[tokio::test]
+    async fn test_tcp_dns_framing_read_and_write() {
+        let (client_sock, server_sock) = tokio::net::UnixStream::pair().unwrap();
+        let (mut client_r, mut client_w) = client_sock.into_split();
+        let (mut server_r, mut server_w) = server_sock.into_split();
+
+        // Write a 16-byte dummy DNS query with 2-byte big-endian length prefix
+        let payload = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x61,
+            0x00, 0x01,
+        ];
+        let len_bytes = (payload.len() as u16).to_be_bytes();
+        client_w.write_all(&len_bytes).await.unwrap();
+        client_w.write_all(&payload).await.unwrap();
+
+        let read_query = read_tcp_dns_query(&mut server_r)
+            .await
+            .expect("query read successfully");
+        assert_eq!(read_query, payload);
+
+        // Write response back to client
+        let response_payload = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        write_tcp_dns_reply(&mut server_w, &response_payload)
+            .await
+            .unwrap();
+
+        let mut resp_len_buf = [0u8; 2];
+        client_r.read_exact(&mut resp_len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+        assert_eq!(resp_len, response_payload.len());
+
+        let mut resp_buf = vec![0u8; resp_len];
+        client_r.read_exact(&mut resp_buf).await.unwrap();
+        assert_eq!(resp_buf, response_payload);
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_query_local_resolution() {
+        let mut local_hosts = HashMap::new();
+        let mut local_ips = HashMap::new();
+        let router_ip = Ipv4Addr::new(192, 168, 1, 1);
+        local_hosts.insert("router".to_string(), router_ip);
+        local_ips.insert(router_ip, "router".to_string());
+
+        let mut query = Message::new(0x4321, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("router.lan.").unwrap();
+        query.add_query(hickory_proto::op::Query::query(qname, RecordType::A));
+        let mut query_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut enc).unwrap();
+
+        let (reply_tx, reply_rx) = oneshot_channel();
+        let req = TcpQueryRequest {
+            query: query_bytes,
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 54321),
+            reply_tx,
+        };
+
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dummy_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_servers = vec![Ipv4Addr::new(8, 8, 8, 8)];
+        let ctx = ForwarderContext {
+            sockets: ForwarderSockets {
+                dns: &dummy_dns,
+                upstream: &dummy_upstream,
+            },
+            local_table: LocalDnsTable {
+                hosts: &local_hosts,
+                ips: &local_ips,
+            },
+            configured_servers: &upstream_servers,
+        };
+        let mut cache = HashMap::new();
+        let mut pending = HashMap::new();
+        let mut rate_limiter = DnsRateLimiter::default();
+
+        handle_incoming_query(
+            &req.query,
+            ClientOrigin::Tcp {
+                peer_addr: req.peer_addr,
+                reply_tx: req.reply_tx,
+            },
+            &ctx,
+            &mut cache,
+            &mut pending,
+            &mut rate_limiter,
+        )
+        .await;
+
+        let reply = reply_rx.await.expect("received reply on oneshot channel");
+        let decoded = Message::from_bytes(&reply).expect("valid DNS message");
+        assert_eq!(decoded.id, 0x4321);
+        assert_eq!(
+            decoded.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(decoded.answers.len(), 1);
+        if let RData::A(A(ip)) = &decoded.answers[0].data {
+            assert_eq!(*ip, router_ip);
+        } else {
+            panic!("expected A record");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_query_cache_hit() {
+        let local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dummy_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_servers = vec![Ipv4Addr::new(8, 8, 8, 8)];
+        let ctx = ForwarderContext {
+            sockets: ForwarderSockets {
+                dns: &dummy_dns,
+                upstream: &dummy_upstream,
+            },
+            local_table: LocalDnsTable {
+                hosts: &local_hosts,
+                ips: &local_ips,
+            },
+            configured_servers: &upstream_servers,
+        };
+
+        // Populate cache for example.com
+        let mut cached_msg = Message::new(
+            0x1111,
+            hickory_proto::op::MessageType::Response,
+            OpCode::Query,
+        );
+        let qname = Name::from_ascii("example.com.").unwrap();
+        cached_msg.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        cached_msg.add_answer(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(93, 184, 216, 34))),
+        ));
+        let mut cached_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut cached_bytes);
+        cached_msg.emit(&mut enc).unwrap();
+
+        let mut cache = HashMap::new();
+        let cache_key = get_cache_key(&cached_bytes).unwrap();
+        insert_cache(cache_key, cached_bytes, &mut cache);
+
+        // Client query with a different XID (0x9999)
+        let mut client_query =
+            Message::new(0x9999, hickory_proto::op::MessageType::Query, OpCode::Query);
+        client_query.add_query(hickory_proto::op::Query::query(qname, RecordType::A));
+        let mut query_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut query_bytes);
+        client_query.emit(&mut enc).unwrap();
+
+        let (reply_tx, reply_rx) = oneshot_channel();
+        let req = TcpQueryRequest {
+            query: query_bytes,
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 54321),
+            reply_tx,
+        };
+        let mut pending = HashMap::new();
+        let mut rate_limiter = DnsRateLimiter::default();
+
+        handle_incoming_query(
+            &req.query,
+            ClientOrigin::Tcp {
+                peer_addr: req.peer_addr,
+                reply_tx: req.reply_tx,
+            },
+            &ctx,
+            &mut cache,
+            &mut pending,
+            &mut rate_limiter,
+        )
+        .await;
+
+        let reply = reply_rx.await.expect("received reply on oneshot channel");
+        let decoded = Message::from_bytes(&reply).expect("valid DNS message");
+        assert_eq!(decoded.id, 0x9999, "Response ID must match query ID");
+        assert_eq!(decoded.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_query_upstream_reply_routing() {
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_server = Ipv4Addr::new(8, 8, 8, 8);
+        let from_addr = SocketAddr::new(IpAddr::V4(upstream_server), DNS_PORT);
+
+        let (reply_tx, reply_rx) = oneshot_channel();
+        let mut pending = HashMap::new();
+        let upstream_xid = 0xbeef;
+        let client_xid = 0x1234;
+
+        let qname = Name::from_ascii("example.com.").unwrap();
+        let cache_key = b"example.com.:A:IN".to_vec();
+
+        pending.insert(
+            upstream_xid,
+            PendingQuery {
+                client_origin: ClientOrigin::Tcp {
+                    peer_addr: from_addr,
+                    reply_tx,
+                },
+                client_xid,
+                client_max_payload: MAX_EDNS_PAYLOAD_SIZE,
+                cache_key: cache_key.clone(),
+                query_payload: vec![],
+                upstream_servers: vec![upstream_server],
+                current_server_idx: 0,
+                deadline: Instant::now() + UPSTREAM_TIMEOUT,
+            },
+        );
+
+        let mut upstream_resp = Message::new(
+            upstream_xid,
+            hickory_proto::op::MessageType::Response,
+            OpCode::Query,
+        );
+        upstream_resp.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        upstream_resp.add_answer(Record::from_rdata(
+            qname,
+            300,
+            RData::A(A(Ipv4Addr::new(93, 184, 216, 34))),
+        ));
+        let mut resp_bytes = Vec::new();
+        let mut resp_enc = BinEncoder::new(&mut resp_bytes);
+        upstream_resp.emit(&mut resp_enc).unwrap();
+
+        let mut cache = HashMap::new();
+        handle_upstream_reply(&resp_bytes, from_addr, &dummy_dns, &mut cache, &mut pending).await;
+
+        let reply = reply_rx
+            .await
+            .expect("received reply on TCP oneshot channel");
+        let decoded = Message::from_bytes(&reply).expect("valid DNS message");
+        assert_eq!(decoded.id, client_xid, "Response ID must match client XID");
+        assert_eq!(decoded.answers.len(), 1);
+        assert!(cache.contains_key(&cache_key[..]));
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_concurrent_tcp_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let (tcp_query_tx, mut tcp_query_rx) = mpsc_channel::<TcpQueryRequest>(64);
+        let mut local_hosts = HashMap::new();
+        let mut local_ips = HashMap::new();
+        let router_ip = Ipv4Addr::new(192, 168, 1, 1);
+        local_hosts.insert("router".to_string(), router_ip);
+        local_ips.insert(router_ip, "router".to_string());
+
+        let tx_accept = tcp_query_tx.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, peer_addr)) = listener.accept().await {
+                let tx = tx_accept.clone();
+                tokio::spawn(handle_tcp_client_connection(stream, peer_addr, tx));
+            }
+        });
+
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dummy_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_servers = vec![Ipv4Addr::new(8, 8, 8, 8)];
+        tokio::spawn(async move {
+            let ctx = ForwarderContext {
+                sockets: ForwarderSockets {
+                    dns: &dummy_dns,
+                    upstream: &dummy_upstream,
+                },
+                local_table: LocalDnsTable {
+                    hosts: &local_hosts,
+                    ips: &local_ips,
+                },
+                configured_servers: &upstream_servers,
+            };
+            let mut cache = HashMap::new();
+            let mut pending = HashMap::new();
+            let mut rate_limiter = DnsRateLimiter::default();
+            while let Some(req) = tcp_query_rx.recv().await {
+                handle_incoming_query(
+                    &req.query,
+                    ClientOrigin::Tcp {
+                        peer_addr: req.peer_addr,
+                        reply_tx: req.reply_tx,
+                    },
+                    &ctx,
+                    &mut cache,
+                    &mut pending,
+                    &mut rate_limiter,
+                )
+                .await;
+            }
+        });
+
+        let mut handles = Vec::new();
+        for client_idx in 0..8u16 {
+            handles.push(tokio::spawn(perform_client_tcp_query(
+                server_addr,
+                client_idx,
+            )));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    async fn perform_client_tcp_query(server_addr: SocketAddr, client_idx: u16) {
+        let mut stream = TcpStream::connect(server_addr).await.unwrap();
+        let xid = 0x1000 + client_idx;
+        let mut query = Message::new(xid, hickory_proto::op::MessageType::Query, OpCode::Query);
+        let qname = Name::from_ascii("router.lan.").unwrap();
+        query.add_query(hickory_proto::op::Query::query(qname, RecordType::A));
+        let mut query_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut query_bytes);
+        query.emit(&mut enc).unwrap();
+
+        let len_prefix = (query_bytes.len() as u16).to_be_bytes();
+        stream.write_all(&len_prefix).await.unwrap();
+        stream.write_all(&query_bytes).await.unwrap();
+
+        let mut resp_len_buf = [0u8; 2];
+        stream.read_exact(&mut resp_len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+
+        let mut resp_buf = vec![0u8; resp_len];
+        stream.read_exact(&mut resp_buf).await.unwrap();
+
+        let resp_msg = Message::from_bytes(&resp_buf).unwrap();
+        assert_eq!(resp_msg.id, xid);
+        assert_eq!(resp_msg.answers.len(), 1);
     }
 }

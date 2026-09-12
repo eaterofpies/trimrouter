@@ -39,7 +39,9 @@ pub async fn test_dns_supervisor_recovery(
         pid2
     );
 
-    // 5. Verify the restarted DNS forwarder is still operational by triggering DNS Client Test again
+    // 5. Verify the restarted DNS forwarder is still operational over TCP and UDP
+    crate::dns_forwarder::verify_tcp_dns_resolution().await?;
+
     // We bind to UDP port 23457 to receive the confirmation
     let socket = std::net::UdpSocket::bind("192.168.1.1:23457").map_err(|e| e.to_string())?;
     socket

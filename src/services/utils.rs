@@ -393,6 +393,11 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_getsockopt,
     libc::SYS_setsockopt,
     #[cfg(not(target_arch = "aarch64"))]
+    libc::SYS_accept,
+    libc::SYS_accept4,
+    libc::SYS_getpeername,
+    libc::SYS_getsockname,
+    #[cfg(not(target_arch = "aarch64"))]
     libc::SYS_epoll_create,
     libc::SYS_epoll_ctl,
     #[cfg(not(target_arch = "aarch64"))]
@@ -550,6 +555,12 @@ pub fn async_udp_socket(fd: OwnedFd) -> Result<tokio::net::UdpSocket, std::io::E
     let std_sock = std::net::UdpSocket::from(fd);
     std_sock.set_nonblocking(true)?;
     tokio::net::UdpSocket::from_std(std_sock)
+}
+
+pub fn async_tcp_listener(fd: OwnedFd) -> Result<tokio::net::TcpListener, std::io::Error> {
+    let std_listener = std::net::TcpListener::from(fd);
+    std_listener.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(std_listener)
 }
 
 pub const MAX_SUPERVISOR_RESTART_DELAY_SECS: u64 = 60;
