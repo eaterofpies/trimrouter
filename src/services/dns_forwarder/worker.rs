@@ -40,12 +40,26 @@ const MAX_CACHE_ENTRIES: usize = 4096;
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_MAX_MESSAGE_SIZE: usize = 65535;
 const TCP_QUERY_CHANNEL_CAPACITY: usize = 128;
+const TCP_EVENT_CHANNEL_CAPACITY: usize = 128;
+const UPSTREAM_TCP_TIMEOUT: Duration = Duration::from_millis(2500);
 const MAX_JOINED_CLIENTS_PER_QUERY: usize = 64;
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
     response: Vec<u8>,
     expiry: Instant,
+}
+
+enum UpstreamTcpEvent {
+    Resolved {
+        cache_key: Vec<u8>,
+        reply: Vec<u8>,
+        clients: Vec<PendingClient>,
+    },
+    Failed {
+        fallback_reply: Vec<u8>,
+        clients: Vec<PendingClient>,
+    },
 }
 
 #[derive(Debug)]
@@ -156,6 +170,8 @@ async fn run_forwarder_loop(
     let mut rate_limiter = DnsRateLimiter::default();
     let (tcp_query_tx, mut tcp_query_rx) =
         mpsc_channel::<TcpQueryRequest>(TCP_QUERY_CHANNEL_CAPACITY);
+    let (tcp_event_tx, mut tcp_event_rx) =
+        mpsc_channel::<UpstreamTcpEvent>(TCP_EVENT_CHANNEL_CAPACITY);
 
     loop {
         tokio::select! {
@@ -248,10 +264,15 @@ async fn run_forwarder_loop(
                         &upstream_buf[..len],
                         from_addr,
                         &dns_socket,
+                        &upstream_socket,
                         &mut cache,
                         &mut pending_queries,
+                        &tcp_event_tx,
                     ).await;
                 }
+            }
+            Some(tcp_event) = tcp_event_rx.recv() => {
+                handle_upstream_tcp_event(tcp_event, &dns_socket, &mut cache).await;
             }
         }
     }
@@ -478,8 +499,10 @@ async fn handle_upstream_reply(
     reply: &[u8],
     from_addr: SocketAddr,
     dns_socket: &UdpSocket,
+    upstream_socket: &UdpSocket,
     cache: &mut HashMap<Vec<u8>, CacheEntry>,
     pending: &mut HashMap<u16, PendingQuery>,
+    tcp_event_tx: &MpscSender<UpstreamTcpEvent>,
 ) {
     if reply.len() < DNS_HEADER_SIZE {
         return;
@@ -499,13 +522,70 @@ async fn handle_upstream_reply(
         return;
     }
 
+    let is_truncated = reply[2] & 0x02 != 0;
+    if is_truncated {
+        let query_meta = pending
+            .remove(&upstream_xid)
+            .expect("query exists in pending");
+        spawn_upstream_tcp_fallback(
+            query_meta,
+            upstream_xid,
+            reply.to_vec(),
+            tcp_event_tx.clone(),
+        );
+        return;
+    }
+
+    let Ok(msg) = Message::from_bytes(reply) else {
+        return;
+    };
+
+    if (msg.response_code == hickory_proto::op::ResponseCode::ServFail
+        || msg.response_code == hickory_proto::op::ResponseCode::Refused)
+        && let Some(query) = pending.get_mut(&upstream_xid)
+        && try_failover_upstream_query(query, upstream_xid, upstream_socket).await
+    {
+        debug!(
+            "[dns-forwarder] Upstream {} returned {:?}, failing over to next resolver",
+            expected_ip, msg.response_code
+        );
+        return;
+    }
+
     let query_meta = pending
         .remove(&upstream_xid)
         .expect("query exists in pending");
 
     insert_cache(query_meta.cache_key, reply.to_vec(), cache);
+    fanout_client_replies(query_meta.clients, reply, dns_socket).await;
+}
 
-    for client in query_meta.clients {
+async fn try_failover_upstream_query(
+    query: &mut PendingQuery,
+    upstream_xid: u16,
+    upstream_socket: &UdpSocket,
+) -> bool {
+    if query.current_server_idx + 1 >= query.upstream_servers.len() {
+        return false;
+    }
+    query.current_server_idx += 1;
+    query.deadline = Instant::now() + UPSTREAM_TIMEOUT;
+    let target_server = query.upstream_servers[query.current_server_idx];
+
+    let mut forwarded = query.query_payload.clone();
+    let xid_bytes = upstream_xid.to_be_bytes();
+    if forwarded.len() >= 2 {
+        forwarded[0] = xid_bytes[0];
+        forwarded[1] = xid_bytes[1];
+    }
+
+    let dest = SocketAddr::new(IpAddr::V4(target_server), DNS_PORT);
+    let _ = upstream_socket.send_to(&forwarded, dest).await;
+    true
+}
+
+async fn fanout_client_replies(clients: Vec<PendingClient>, reply: &[u8], dns_socket: &UdpSocket) {
+    for client in clients {
         let mut client_response = reply.to_vec();
         let client_xid_bytes = client.client_xid.to_be_bytes();
         client_response[0] = client_xid_bytes[0];
@@ -516,6 +596,94 @@ async fn handle_upstream_reply(
             .send_reply(client_response, dns_socket, Some(client.client_max_payload))
             .await;
     }
+}
+
+fn spawn_upstream_tcp_fallback(
+    query_meta: PendingQuery,
+    upstream_xid: u16,
+    fallback_reply: Vec<u8>,
+    tcp_event_tx: MpscSender<UpstreamTcpEvent>,
+) {
+    let target = query_meta.upstream_servers[query_meta.current_server_idx];
+    let query_payload = query_meta.query_payload.clone();
+    let cache_key = query_meta.cache_key.clone();
+    let clients = query_meta.clients;
+
+    tokio::spawn(async move {
+        match fetch_upstream_tcp(target, &query_payload, upstream_xid).await {
+            Ok(reply) => {
+                let _ = tcp_event_tx
+                    .send(UpstreamTcpEvent::Resolved {
+                        cache_key,
+                        reply,
+                        clients,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                debug!(
+                    "[dns-forwarder] Upstream TCP fallback to {} failed: {}. Returning truncated reply.",
+                    target, e
+                );
+                let _ = tcp_event_tx
+                    .send(UpstreamTcpEvent::Failed {
+                        fallback_reply,
+                        clients,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+async fn handle_upstream_tcp_event(
+    event: UpstreamTcpEvent,
+    dns_socket: &UdpSocket,
+    cache: &mut HashMap<Vec<u8>, CacheEntry>,
+) {
+    match event {
+        UpstreamTcpEvent::Resolved {
+            cache_key,
+            reply,
+            clients,
+        } => {
+            insert_cache(cache_key, reply.clone(), cache);
+            fanout_client_replies(clients, &reply, dns_socket).await;
+        }
+        UpstreamTcpEvent::Failed {
+            fallback_reply,
+            clients,
+        } => {
+            fanout_client_replies(clients, &fallback_reply, dns_socket).await;
+        }
+    }
+}
+
+async fn fetch_upstream_tcp(
+    target_server: Ipv4Addr,
+    query_payload: &[u8],
+    upstream_xid: u16,
+) -> Result<Vec<u8>, IoError> {
+    let dest = SocketAddr::new(IpAddr::V4(target_server), DNS_PORT);
+    let mut stream = tokio::time::timeout(UPSTREAM_TCP_TIMEOUT, TcpStream::connect(dest))
+        .await
+        .map_err(|_| IoError::new(std::io::ErrorKind::TimedOut, "TCP connect timeout"))??;
+
+    let mut forwarded = query_payload.to_vec();
+    let xid_bytes = upstream_xid.to_be_bytes();
+    if forwarded.len() >= 2 {
+        forwarded[0] = xid_bytes[0];
+        forwarded[1] = xid_bytes[1];
+    }
+
+    write_tcp_dns_reply(&mut stream, &forwarded).await?;
+    let (mut reader, _) = stream.into_split();
+    read_tcp_dns_query(&mut reader).await.ok_or_else(|| {
+        IoError::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Failed to read TCP DNS reply",
+        )
+    })
 }
 
 async fn check_pending_timeouts(
@@ -538,17 +706,7 @@ async fn check_pending_timeouts(
 
     for xid in retry_list {
         if let Some(query) = pending.get_mut(&xid) {
-            query.current_server_idx += 1;
-            query.deadline = now + UPSTREAM_TIMEOUT;
-            let target_server = query.upstream_servers[query.current_server_idx];
-
-            let mut forwarded = query.query_payload.clone();
-            let xid_bytes = xid.to_be_bytes();
-            forwarded[0] = xid_bytes[0];
-            forwarded[1] = xid_bytes[1];
-
-            let dest = SocketAddr::new(IpAddr::V4(target_server), DNS_PORT);
-            let _ = upstream_socket.send_to(&forwarded, dest).await;
+            try_failover_upstream_query(query, xid, upstream_socket).await;
         }
     }
 }
@@ -1925,7 +2083,18 @@ mod tests {
         upstream_resp.emit(&mut resp_enc).unwrap();
 
         let mut cache = HashMap::new();
-        handle_upstream_reply(&resp_bytes, from_addr, &dummy_dns, &mut cache, &mut pending).await;
+        let dummy_upstream = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let (tcp_event_tx, _tcp_event_rx) = mpsc_channel(32);
+        handle_upstream_reply(
+            &resp_bytes,
+            from_addr,
+            &dummy_dns,
+            &dummy_upstream,
+            &mut cache,
+            &mut pending,
+            &tcp_event_tx,
+        )
+        .await;
 
         let reply = reply_rx
             .await
@@ -2016,7 +2185,17 @@ mod tests {
         // Send upstream reply
         let resp_bytes = build_test_response(upstream_xid, qname, Ipv4Addr::new(4, 3, 2, 1));
         let from_addr = SocketAddr::new(IpAddr::V4(upstream_servers[0]), DNS_PORT);
-        handle_upstream_reply(&resp_bytes, from_addr, &dummy_dns, &mut cache, &mut pending).await;
+        let (tcp_event_tx, _tcp_event_rx) = mpsc_channel(32);
+        handle_upstream_reply(
+            &resp_bytes,
+            from_addr,
+            &dummy_dns,
+            &dummy_upstream,
+            &mut cache,
+            &mut pending,
+            &tcp_event_tx,
+        )
+        .await;
 
         assert!(
             pending.is_empty(),
@@ -2272,12 +2451,15 @@ mod tests {
         assert!(large_resp_bytes.len() > 512);
 
         let from_addr = SocketAddr::new(IpAddr::V4(upstream_servers[0]), DNS_PORT);
+        let (tcp_event_tx, _tcp_event_rx) = mpsc_channel(32);
         handle_upstream_reply(
             &large_resp_bytes,
             from_addr,
             &dummy_dns,
+            &dummy_upstream,
             &mut cache,
             &mut pending,
+            &tcp_event_tx,
         )
         .await;
 
@@ -2292,10 +2474,12 @@ mod tests {
     #[tokio::test]
     async fn test_handle_upstream_reply_spoofed_source_ip_and_port_rejected() {
         let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dummy_upstream = UdpSocket::bind("0.0.0.0:0").await.unwrap();
         let upstream_server = Ipv4Addr::new(8, 8, 8, 8);
         let legitimate_addr = SocketAddr::new(IpAddr::V4(upstream_server), DNS_PORT);
 
         let (reply_tx, mut reply_rx) = oneshot_channel();
+        let (tcp_event_tx, _tcp_event_rx) = mpsc_channel(32);
         let mut pending = HashMap::new();
         let upstream_xid = 0xbeef;
         let client_xid = 0x1234;
@@ -2334,8 +2518,10 @@ mod tests {
             &resp_bytes,
             spoofed_ip_addr,
             &dummy_dns,
+            &dummy_upstream,
             &mut cache,
             &mut pending,
+            &tcp_event_tx,
         )
         .await;
         assert!(cache.is_empty(), "Spoofed IP packet must not be cached");
@@ -2355,8 +2541,10 @@ mod tests {
             &resp_bytes,
             spoofed_port_addr,
             &dummy_dns,
+            &dummy_upstream,
             &mut cache,
             &mut pending,
+            &tcp_event_tx,
         )
         .await;
         assert!(cache.is_empty(), "Spoofed port packet must not be cached");
@@ -2371,8 +2559,10 @@ mod tests {
             &resp_bytes,
             legitimate_addr,
             &dummy_dns,
+            &dummy_upstream,
             &mut cache,
             &mut pending,
+            &tcp_event_tx,
         )
         .await;
         assert_eq!(cache.len(), 1, "Legitimate packet is cached");
@@ -2548,5 +2738,258 @@ mod tests {
             calculate_cache_ttl(&msg_high),
             Some(Duration::from_secs(300))
         );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_failover_on_servfail_advances_to_secondary() {
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dummy_upstream = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let server1 = Ipv4Addr::new(8, 8, 8, 8);
+        let server2 = Ipv4Addr::new(8, 8, 4, 4);
+        let upstream_servers = vec![server1, server2];
+
+        let (reply_tx, mut reply_rx) = oneshot_channel();
+        let (tcp_event_tx, _tcp_event_rx) = mpsc_channel(32);
+        let mut pending = HashMap::new();
+        let upstream_xid = 0x5555;
+        let client_xid = 0x1111;
+        let qname = Name::from_ascii("failover.test.").unwrap();
+        let cache_key = b"failover.test.:A:IN".to_vec();
+
+        pending.insert(
+            upstream_xid,
+            PendingQuery {
+                clients: vec![PendingClient {
+                    origin: ClientOrigin::Tcp {
+                        peer_addr: SocketAddr::new(
+                            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+                            50000,
+                        ),
+                        reply_tx,
+                    },
+                    client_xid,
+                    client_max_payload: 512,
+                }],
+                cache_key: cache_key.clone(),
+                query_payload: build_test_query(client_xid, qname.clone()),
+                upstream_servers: upstream_servers.clone(),
+                current_server_idx: 0,
+                deadline: Instant::now() + UPSTREAM_TIMEOUT,
+            },
+        );
+
+        let mut cache = HashMap::new();
+
+        // 1. Server 1 returns SERVFAIL
+        let mut servfail_msg = Message::new(
+            upstream_xid,
+            hickory_proto::op::MessageType::Response,
+            OpCode::Query,
+        );
+        servfail_msg.metadata.response_code = hickory_proto::op::ResponseCode::ServFail;
+        servfail_msg.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        let mut servfail_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut servfail_bytes);
+        servfail_msg.emit(&mut enc).unwrap();
+
+        let server1_addr = SocketAddr::new(IpAddr::V4(server1), DNS_PORT);
+        handle_upstream_reply(
+            &servfail_bytes,
+            server1_addr,
+            &dummy_dns,
+            &dummy_upstream,
+            &mut cache,
+            &mut pending,
+            &tcp_event_tx,
+        )
+        .await;
+
+        // Query must still be pending and advanced to server 2
+        assert_eq!(pending.len(), 1);
+        let query = pending.get(&upstream_xid).unwrap();
+        assert_eq!(query.current_server_idx, 1);
+        assert!(reply_rx.try_recv().is_err(), "No reply sent to client yet");
+
+        // 2. Server 2 returns valid NoError response
+        let success_bytes =
+            build_test_response(upstream_xid, qname.clone(), Ipv4Addr::new(9, 9, 9, 9));
+        let server2_addr = SocketAddr::new(IpAddr::V4(server2), DNS_PORT);
+        handle_upstream_reply(
+            &success_bytes,
+            server2_addr,
+            &dummy_dns,
+            &dummy_upstream,
+            &mut cache,
+            &mut pending,
+            &tcp_event_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty(), "Pending query cleared after success");
+        assert_eq!(cache.len(), 1, "Successful response is cached");
+        let delivered = reply_rx.try_recv().expect("Client receives reply");
+        let decoded = Message::from_bytes(&delivered).unwrap();
+        assert_eq!(
+            decoded.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_failover_all_servers_servfail_delivers_error() {
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dummy_upstream = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let server1 = Ipv4Addr::new(8, 8, 8, 8);
+        let server2 = Ipv4Addr::new(8, 8, 4, 4);
+        let upstream_servers = vec![server1, server2];
+
+        let (reply_tx, mut reply_rx) = oneshot_channel();
+        let (tcp_event_tx, _tcp_event_rx) = mpsc_channel(32);
+        let mut pending = HashMap::new();
+        let upstream_xid = 0x6666;
+        let client_xid = 0x2222;
+        let qname = Name::from_ascii("allfail.test.").unwrap();
+        let cache_key = b"allfail.test.:A:IN".to_vec();
+
+        pending.insert(
+            upstream_xid,
+            PendingQuery {
+                clients: vec![PendingClient {
+                    origin: ClientOrigin::Tcp {
+                        peer_addr: SocketAddr::new(
+                            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+                            50000,
+                        ),
+                        reply_tx,
+                    },
+                    client_xid,
+                    client_max_payload: 512,
+                }],
+                cache_key: cache_key.clone(),
+                query_payload: build_test_query(client_xid, qname.clone()),
+                upstream_servers: upstream_servers.clone(),
+                current_server_idx: 1, // Already on last server
+                deadline: Instant::now() + UPSTREAM_TIMEOUT,
+            },
+        );
+
+        let mut cache = HashMap::new();
+        let mut servfail_msg = Message::new(
+            upstream_xid,
+            hickory_proto::op::MessageType::Response,
+            OpCode::Query,
+        );
+        servfail_msg.metadata.response_code = hickory_proto::op::ResponseCode::ServFail;
+        servfail_msg.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        let mut servfail_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut servfail_bytes);
+        servfail_msg.emit(&mut enc).unwrap();
+
+        let server2_addr = SocketAddr::new(IpAddr::V4(server2), DNS_PORT);
+        handle_upstream_reply(
+            &servfail_bytes,
+            server2_addr,
+            &dummy_dns,
+            &dummy_upstream,
+            &mut cache,
+            &mut pending,
+            &tcp_event_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty(), "Pending query cleared");
+        assert!(cache.is_empty(), "ServFail must NOT be cached");
+        let delivered = reply_rx.try_recv().expect("Client receives error response");
+        let decoded = Message::from_bytes(&delivered).unwrap();
+        assert_eq!(
+            decoded.response_code,
+            hickory_proto::op::ResponseCode::ServFail
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_tcp_fallback_event_handling() {
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut cache = HashMap::new();
+        let (reply_tx, reply_rx) = oneshot_channel();
+        let client_xid = 0x7777;
+        let qname = Name::from_ascii("tcpfallback.test.").unwrap();
+        let cache_key = b"tcpfallback.test.:A:IN".to_vec();
+
+        let full_resp = build_test_response(0x9999, qname, Ipv4Addr::new(1, 2, 3, 4));
+        let clients = vec![PendingClient {
+            origin: ClientOrigin::Tcp {
+                peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 50000),
+                reply_tx,
+            },
+            client_xid,
+            client_max_payload: 4096,
+        }];
+
+        let event = UpstreamTcpEvent::Resolved {
+            cache_key: cache_key.clone(),
+            reply: full_resp.clone(),
+            clients,
+        };
+
+        handle_upstream_tcp_event(event, &dummy_dns, &mut cache).await;
+
+        assert!(cache.contains_key(&cache_key[..]));
+        let delivered = reply_rx
+            .await
+            .expect("Client receives reply via TCP fallback event");
+        let decoded = Message::from_bytes(&delivered).unwrap();
+        assert_eq!(decoded.id, client_xid);
+        assert_eq!(decoded.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_upstream_tcp_fallback_failed_event_delivers_truncated() {
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut cache = HashMap::new();
+        let (reply_tx, reply_rx) = oneshot_channel();
+        let client_xid = 0x8888;
+        let qname = Name::from_ascii("tcptrunc.test.").unwrap();
+
+        let mut trunc_msg = Message::new(
+            0x9999,
+            hickory_proto::op::MessageType::Response,
+            OpCode::Query,
+        );
+        trunc_msg.metadata.truncation = true;
+        trunc_msg.add_query(hickory_proto::op::Query::query(qname, RecordType::A));
+        let mut trunc_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut trunc_bytes);
+        trunc_msg.emit(&mut enc).unwrap();
+
+        let clients = vec![PendingClient {
+            origin: ClientOrigin::Tcp {
+                peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 50000),
+                reply_tx,
+            },
+            client_xid,
+            client_max_payload: 512,
+        }];
+
+        let event = UpstreamTcpEvent::Failed {
+            fallback_reply: trunc_bytes.clone(),
+            clients,
+        };
+
+        handle_upstream_tcp_event(event, &dummy_dns, &mut cache).await;
+
+        assert!(cache.is_empty(), "Failed TCP response not cached");
+        let delivered = reply_rx
+            .await
+            .expect("Client receives fallback truncated reply");
+        let decoded = Message::from_bytes(&delivered).unwrap();
+        assert!(decoded.truncation);
+        assert_eq!(decoded.id, client_xid);
     }
 }

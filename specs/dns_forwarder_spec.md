@@ -84,8 +84,14 @@ To prevent redundant upstream WAN queries and eliminate latency during cache-mis
 *   **Multi-Client Response Fanout**: When the upstream resolver responds, the forwarder iterates through all joined client requests, restoring each client's unique transaction ID (`client_xid`) and framing/truncation constraints (`TC=1` if needed per client max payload or TCP framing) and transmitting the response back across their respective UDP or TCP transports.
 *   **Join Capacity Bound**: In-flight joining is bounded to at most 64 clients per query (`MAX_JOINED_CLIENTS_PER_QUERY`). If the joined client limit is reached during a flood, new queries are forwarded independently with distinct randomized upstream XIDs.
 
+### 2.7 Upstream TCP Fallback & Secondary Resolver Failover
+To guarantee high availability and resolution of large records over the WAN:
+*   **Upstream TCP Fallback (`TC=1`)**: When an upstream resolver responds to a UDP query with the Truncation flag set (`TC=1`), the forwarder automatically establishes an outbound TCP connection to `upstream_resolver:53` with a 2.5-second timeout (`UPSTREAM_TCP_TIMEOUT`), retrieves the full untruncated answer, caches the result, and fans it out to waiting clients (applying truncation only to small-buffer UDP clients). If upstream TCP connection fails, the forwarder delivers the truncated response to clients so client-side fallback can take over.
+*   **Secondary Resolver Failover on Server Errors**: If an upstream resolver returns `SERVFAIL` (RCODE 2) or `REFUSED` (RCODE 5), the forwarder immediately fails over to the next configured resolver in `upstream_servers` before returning an error to clients.
+*   **Timeout-Based Failover**: If an upstream resolver fails to respond within 3 seconds (`UPSTREAM_TIMEOUT`), the forwarder advances to the next resolver in `upstream_servers` and resends the query.
 
 ---
+
 
 ## 3. Cache Design
 
