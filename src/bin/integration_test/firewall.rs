@@ -43,6 +43,35 @@ pub async fn test_firewall_wan_drop() -> Result<(), String> {
     Ok(())
 }
 
+pub async fn test_dnat_port_forwarding() -> Result<(), String> {
+    std::println!("[test] Starting DNAT Port Forwarding test...");
+
+    // 1. Bind to UDP port 23458 to receive verification from the LAN mock
+    let socket = UdpSocket::bind("192.168.1.1:23458").map_err(|e| e.to_string())?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|e| e.to_string())?;
+
+    // 2. Trigger the host test coordinator to send an inbound packet on WAN port 28080
+    std::println!("[test-control] TRIGGER_PORT_FORWARDING_TEST");
+
+    // 3. Await verification packet from the LAN client
+    let mut buf = [0u8; 512];
+    let (amt, _src) = socket
+        .recv_from(&mut buf)
+        .map_err(|e| format!("Timed out waiting for port forwarding verification: {}", e))?;
+
+    if &buf[..amt] == b"PORT_FORWARDING_OK" {
+        std::println!("[test] Inbound DNAT port forwarding verified successfully.");
+        Ok(())
+    } else {
+        Err(format!(
+            "Received invalid port forwarding verification payload: {:?}",
+            String::from_utf8_lossy(&buf[..amt])
+        ))
+    }
+}
+
 pub async fn test_conntrack_invalid_drop() -> Result<(), String> {
     std::println!("[test] Starting Firewall Conntrack Invalid Drop test...");
 

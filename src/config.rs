@@ -1,10 +1,53 @@
 use crate::error::RouterError;
 use crate::init::system::ConfigReaderOps;
 use pnet::util::MacAddr;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardProtocol {
+    Tcp,
+    Udp,
+    Both,
+}
+
+impl std::fmt::Display for ForwardProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp => write!(f, "tcp"),
+            Self::Udp => write!(f, "udp"),
+            Self::Both => write!(f, "both"),
+        }
+    }
+}
+
+impl FromStr for ForwardProtocol {
+    type Err = RouterError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "tcp" => Ok(ForwardProtocol::Tcp),
+            "udp" => Ok(ForwardProtocol::Udp),
+            "both" | "tcp+udp" | "tcp,udp" | "all" => Ok(ForwardProtocol::Both),
+            _ => Err(RouterError::Generic(format!(
+                "Invalid port forwarding protocol '{}': expected 'tcp', 'udp', or 'both'",
+                s
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortForwardRule {
+    pub protocol: ForwardProtocol,
+    pub external_port: u16,
+    pub internal_ip: Ipv4Addr,
+    pub internal_port: u16,
+    pub description: Option<String>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LoggingConfig {
@@ -31,6 +74,7 @@ pub struct RouterConfig {
     pub watchdog: bool,
     pub dns_servers: Vec<Ipv4Addr>,
     pub static_leases: HashMap<MacAddr, Ipv4Addr>,
+    pub port_forwards: Vec<PortForwardRule>,
 }
 
 impl std::fmt::Debug for RouterConfig {
@@ -44,6 +88,7 @@ impl std::fmt::Debug for RouterConfig {
             .field("watchdog", &self.watchdog)
             .field("dns_servers", &self.dns_servers)
             .field("static_leases", &self.static_leases)
+            .field("port_forwards", &self.port_forwards)
             .finish()
     }
 }
@@ -55,6 +100,30 @@ struct ConfigToml {
     system: Option<SystemSection>,
     logging: Option<LoggingSection>,
     dns: Option<DnsSection>,
+    port_forwarding: Option<Vec<PortForwardToml>>,
+    port_forwards: Option<Vec<PortForwardToml>>,
+    firewall: Option<FirewallSection>,
+}
+
+#[derive(Deserialize)]
+struct FirewallSection {
+    port_forwarding: Option<Vec<PortForwardToml>>,
+    port_forwards: Option<Vec<PortForwardToml>>,
+}
+
+#[derive(Deserialize)]
+struct PortForwardToml {
+    proto: Option<String>,
+    protocol: Option<String>,
+    external_port: Option<u16>,
+    ext_port: Option<u16>,
+    port: Option<u16>,
+    internal_ip: Option<String>,
+    int_ip: Option<String>,
+    ip: Option<String>,
+    internal_port: Option<u16>,
+    int_port: Option<u16>,
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -273,6 +342,149 @@ fn parse_dhcp_reservations(
     Ok(static_leases)
 }
 
+fn collect_raw_port_forward_rules(config: &ConfigToml) -> Vec<&PortForwardToml> {
+    let mut list = Vec::new();
+    if let Some(ref rules) = config.port_forwarding {
+        list.extend(rules.iter());
+    }
+    if let Some(ref rules) = config.port_forwards {
+        list.extend(rules.iter());
+    }
+    if let Some(ref fw) = config.firewall {
+        if let Some(ref rules) = fw.port_forwarding {
+            list.extend(rules.iter());
+        }
+        if let Some(ref rules) = fw.port_forwards {
+            list.extend(rules.iter());
+        }
+    }
+    list
+}
+
+fn validate_and_build_port_forward_rule(
+    raw: &PortForwardToml,
+    lan_net: &ipnet::Ipv4Net,
+) -> Result<PortForwardRule, RouterError> {
+    let proto_str = raw
+        .proto
+        .as_deref()
+        .or(raw.protocol.as_deref())
+        .unwrap_or("tcp");
+    let protocol = ForwardProtocol::from_str(proto_str)?;
+
+    let external_port = raw
+        .external_port
+        .or(raw.ext_port)
+        .or(raw.port)
+        .ok_or_else(|| {
+            RouterError::Generic(
+                "Port forwarding rule is missing 'external_port' (or 'ext_port' / 'port')"
+                    .to_string(),
+            )
+        })?;
+    if external_port == 0 {
+        return Err(RouterError::Generic(
+            "Port forwarding 'external_port' must be between 1 and 65535 (cannot be 0)".to_string(),
+        ));
+    }
+
+    let ip_str = raw
+        .internal_ip
+        .as_deref()
+        .or(raw.int_ip.as_deref())
+        .or(raw.ip.as_deref())
+        .ok_or_else(|| {
+            RouterError::Generic(
+                "Port forwarding rule is missing 'internal_ip' (or 'int_ip' / 'ip')".to_string(),
+            )
+        })?;
+    let internal_ip: Ipv4Addr = ip_str.parse().map_err(|_| {
+        RouterError::Generic(format!(
+            "Port forwarding target IP '{}' must be a valid IPv4 address",
+            ip_str
+        ))
+    })?;
+
+    if !lan_net.contains(&internal_ip)
+        || internal_ip == lan_net.network()
+        || internal_ip == lan_net.broadcast()
+        || internal_ip == lan_net.addr()
+    {
+        return Err(RouterError::Generic(format!(
+            "Port forwarding target IP '{}' must be a valid host IP within LAN subnet '{}' and not the router's gateway IP",
+            internal_ip, lan_net
+        )));
+    }
+
+    let internal_port = raw.internal_port.or(raw.int_port).unwrap_or(external_port);
+    if internal_port == 0 {
+        return Err(RouterError::Generic(
+            "Port forwarding 'internal_port' must be between 1 and 65535 (cannot be 0)".to_string(),
+        ));
+    }
+
+    Ok(PortForwardRule {
+        protocol,
+        external_port,
+        internal_ip,
+        internal_port,
+        description: raw.description.clone(),
+    })
+}
+
+fn check_port_forward_conflicts(
+    rule: &PortForwardRule,
+    bound_tcp_ports: &mut HashSet<u16>,
+    bound_udp_ports: &mut HashSet<u16>,
+) -> Result<(), RouterError> {
+    if (rule.protocol == ForwardProtocol::Udp || rule.protocol == ForwardProtocol::Both)
+        && rule.external_port == dhcproto::v4::CLIENT_PORT
+    {
+        return Err(RouterError::Generic(format!(
+            "Port forwarding external UDP port {} conflicts with WAN DHCP client",
+            dhcproto::v4::CLIENT_PORT
+        )));
+    }
+
+    if (rule.protocol == ForwardProtocol::Tcp || rule.protocol == ForwardProtocol::Both)
+        && !bound_tcp_ports.insert(rule.external_port)
+    {
+        return Err(RouterError::Generic(format!(
+            "Duplicate port forwarding binding for TCP port {}",
+            rule.external_port
+        )));
+    }
+
+    if (rule.protocol == ForwardProtocol::Udp || rule.protocol == ForwardProtocol::Both)
+        && !bound_udp_ports.insert(rule.external_port)
+    {
+        return Err(RouterError::Generic(format!(
+            "Duplicate port forwarding binding for UDP port {}",
+            rule.external_port
+        )));
+    }
+
+    Ok(())
+}
+
+fn parse_port_forward_rules(
+    config_toml: &ConfigToml,
+    lan_net: &ipnet::Ipv4Net,
+) -> Result<Vec<PortForwardRule>, RouterError> {
+    let mut rules = Vec::new();
+    let mut bound_tcp_ports = HashSet::new();
+    let mut bound_udp_ports = HashSet::new();
+
+    let raw_rules = collect_raw_port_forward_rules(config_toml);
+    for raw in raw_rules {
+        let rule = validate_and_build_port_forward_rule(raw, lan_net)?;
+        check_port_forward_conflicts(&rule, &mut bound_tcp_ports, &mut bound_udp_ports)?;
+        rules.push(rule);
+    }
+
+    Ok(rules)
+}
+
 impl RouterConfig {
     pub fn parse<S: ConfigReaderOps>(sys: &S) -> Result<Self, RouterError> {
         let content = sys.read_config_file().map_err(|e| {
@@ -294,11 +506,15 @@ impl RouterConfig {
         let lan_ip = parsed
             .network
             .lan_ip
-            .unwrap_or_else(|| "192.168.1.1/24".to_string());
+            .as_deref()
+            .unwrap_or("192.168.1.1/24")
+            .to_string();
         let backup_lan_ip = parsed
             .network
             .backup_lan_ip
-            .unwrap_or_else(|| "10.0.0.1/24".to_string());
+            .as_deref()
+            .unwrap_or("10.0.0.1/24")
+            .to_string();
 
         let lan_net = validate_lan_subnet("lan_ip", &lan_ip)?;
         let backup_net = validate_lan_subnet("backup_lan_ip", &backup_lan_ip)?;
@@ -311,6 +527,7 @@ impl RouterConfig {
         }
 
         let static_leases = parse_dhcp_reservations(parsed.dhcp.as_ref(), &lan_net)?;
+        let port_forwards = parse_port_forward_rules(&parsed, &lan_net)?;
         let logging = parse_logging_config(parsed.logging.as_ref())?;
         let watchdog = parsed
             .system
@@ -327,6 +544,7 @@ impl RouterConfig {
             watchdog,
             dns_servers,
             static_leases,
+            port_forwards,
         })
     }
 }
@@ -892,5 +1110,176 @@ mod tests {
         "#
         .to_string();
         assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_port_forwarding_valid() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[port_forwarding]]
+            proto = "tcp"
+            external_port = 8080
+            internal_ip = "192.168.1.50"
+            internal_port = 80
+            description = "Web Server"
+
+            [[port_forwarding]]
+            proto = "udp"
+            external_port = 9000
+            internal_ip = "192.168.1.50"
+            internal_port = 9000
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg.port_forwards.len(), 2);
+        assert_eq!(cfg.port_forwards[0].protocol, ForwardProtocol::Tcp);
+        assert_eq!(cfg.port_forwards[0].external_port, 8080);
+        assert_eq!(
+            cfg.port_forwards[0].internal_ip,
+            Ipv4Addr::new(192, 168, 1, 50)
+        );
+        assert_eq!(cfg.port_forwards[0].internal_port, 80);
+        assert_eq!(
+            cfg.port_forwards[0].description.as_deref(),
+            Some("Web Server")
+        );
+
+        assert_eq!(cfg.port_forwards[1].protocol, ForwardProtocol::Udp);
+        assert_eq!(cfg.port_forwards[1].external_port, 9000);
+        assert_eq!(
+            cfg.port_forwards[1].internal_ip,
+            Ipv4Addr::new(192, 168, 1, 50)
+        );
+        assert_eq!(cfg.port_forwards[1].internal_port, 9000);
+    }
+
+    #[test]
+    fn test_config_parsing_port_forwarding_both_and_omitted_internal_port() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[port_forwards]]
+            proto = "both"
+            ext_port = 2222
+            int_ip = "192.168.1.100"
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg.port_forwards.len(), 1);
+        assert_eq!(cfg.port_forwards[0].protocol, ForwardProtocol::Both);
+        assert_eq!(cfg.port_forwards[0].external_port, 2222);
+        assert_eq!(
+            cfg.port_forwards[0].internal_ip,
+            Ipv4Addr::new(192, 168, 1, 100)
+        );
+        assert_eq!(cfg.port_forwards[0].internal_port, 2222);
+    }
+
+    #[test]
+    fn test_config_parsing_port_forwarding_invalid_proto_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [[port_forwarding]]
+            proto = "icmp"
+            external_port = 80
+            internal_ip = "192.168.1.50"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_port_forwarding_zero_port_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [[port_forwarding]]
+            proto = "tcp"
+            external_port = 0
+            internal_ip = "192.168.1.50"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_port_forwarding_gateway_ip_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[port_forwarding]]
+            proto = "tcp"
+            external_port = 8080
+            internal_ip = "192.168.1.1"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_port_forwarding_duplicate_external_port_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[port_forwarding]]
+            proto = "tcp"
+            external_port = 8080
+            internal_ip = "192.168.1.50"
+
+            [[port_forwarding]]
+            proto = "tcp"
+            external_port = 8080
+            internal_ip = "192.168.1.60"
+        "#
+        .to_string();
+        assert!(RouterConfig::parse(&sys).is_err());
+    }
+
+    #[test]
+    fn test_config_parsing_port_forwarding_dhcp_port_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+            lan_ip = "192.168.1.1/24"
+
+            [[port_forwarding]]
+            proto = "udp"
+            external_port = 68
+            internal_ip = "192.168.1.50"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("conflicts with WAN DHCP client")
+        );
     }
 }

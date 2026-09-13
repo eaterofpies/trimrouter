@@ -197,6 +197,8 @@ async fn main() {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_FORWARDED_NAT_TEST") {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_FORWARDED_NAT_TEST".to_string()).await;
+                            } else if line.contains("[test-control] TRIGGER_PORT_FORWARDING_TEST") {
+                                let _ = env.wan_cmd_tx.send("TRIGGER_PORT_FORWARDING_TEST".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_DNS_CLIENT_TEST") {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_DNS_CLIENT_TEST".to_string()).await;
                             } else if line.contains("[test-control] SUITE_PASSED") {
@@ -824,6 +826,24 @@ async fn handle_invalid_conntrack_traffic(
     }
 }
 
+async fn handle_port_forwarding_wan_traffic(mock: &mut UnixStreamMock, client_mac: MacAddr) {
+    println!(
+        "[isp-test] Sending Inbound WAN packet to {}:28080 for port forwarding test...",
+        MOCK_CLIENT_IP
+    );
+    let pkt = packet::build_raw_packet(
+        MOCK_SERVER_MAC,
+        client_mac,
+        MOCK_SERVER_IP,
+        MOCK_CLIENT_IP,
+        54321,
+        28080,
+        b"DNAT_PING_TEST",
+    )
+    .expect("valid port forward test packet");
+    let _ = mock.send_frame(&pkt).await;
+}
+
 struct WanUdpPacket<'a> {
     client_mac: MacAddr,
     src_ip: Ipv4Addr,
@@ -1021,6 +1041,8 @@ async fn run_mock_wan_isp(
                         handle_unsolicited_wan_traffic(&mut mock, &verification_tx, client_mac).await;
                     } else if cmd_str == "SEND_INVALID_CONNTRACK_WAN" {
                         handle_invalid_conntrack_traffic(&mut mock, &verification_tx, client_mac).await;
+                    } else if cmd_str == "TRIGGER_PORT_FORWARDING_TEST" {
+                        handle_port_forwarding_wan_traffic(&mut mock, client_mac).await;
                     } else if cmd_str == "SIMULATE_DNS_OUTAGE" {
                         println!("[isp-test] Simulating upstream DNS outage.");
                         dns_outage_active = true;
@@ -1648,6 +1670,30 @@ async fn process_lan_udp_nat(
     }
 }
 
+async fn process_lan_udp_dnat(
+    mock: &mut UnixStreamMock,
+    client_mac: MacAddr,
+    dest_port: u16,
+    payload: &[u8],
+) {
+    if dest_port == 8080 && payload == b"DNAT_PING_TEST" {
+        println!(
+            "[lan-client] Received forwarded DNAT packet on port 8080! Replying verification..."
+        );
+        let confirm_pkt = packet::build_raw_packet(
+            client_mac,
+            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+            Ipv4Addr::new(192, 168, 1, 2),
+            Ipv4Addr::new(192, 168, 1, 1),
+            8080,
+            23458,
+            b"PORT_FORWARDING_OK",
+        )
+        .expect("valid confirm pkt");
+        let _ = mock.send_frame(&confirm_pkt).await;
+    }
+}
+
 struct LanUdpPacket<'a> {
     client_mac: MacAddr,
     src_ip: Ipv4Addr,
@@ -1805,6 +1851,7 @@ async fn run_mock_lan_client(
 
                 if let Some((src_ip, src_port, dest_port, payload)) = parse_udp_payload(&frame) {
                     process_lan_udp_nat(&mut mock, client_mac, src_ip, src_port, dest_port, &payload).await;
+                    process_lan_udp_dnat(&mut mock, client_mac, dest_port, &payload).await;
                     let lan_pkt = LanUdpPacket {
                         client_mac,
                         src_ip,

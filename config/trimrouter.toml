@@ -10,7 +10,16 @@ wan_mac = "52:54:00:12:34:56"
 lan_mac = "52:54:00:12:34:57"
 # backup_lan_ip = "10.0.0.1/24"
 
+# Optional inbound port forwarding rules (DNAT)
+# [[port_forwarding]]
+# protocol = "both"
+# external_port = 8080
+# internal_ip = "192.168.1.50"
+# internal_port = 80
+# description = "Web Server"
+
 [system]
 # Hardware watchdog supervision (/dev/watchdog) (default: true)
 # watchdog = true
+
 

@@ -102,7 +102,10 @@ Writes `"1"` to `/proc/sys/net/ipv4/ip_forward` at startup.
 
 #### 2.2.3 Netfilter / nftables NAT Configuration (`NETLINK_NETFILTER`)
 
-Creates an IPv4 table named `trimrouter` containing two chains:
+Creates an IPv4 table named `trimrouter` containing three chains:
+
+**`nat_prerouting`** — type `nat`, hook `prerouting`, priority `-100`, policy `accept`:
+- DNAT rules: matches inbound traffic on the WAN interface (`iif == wan`), protocol (`tcp`, `udp`), and destination port (`dport == external_port`), rewriting the destination IP to the target LAN host (`internal_ip`) and destination port (`internal_port`).
 
 **`nat_postrouting`** — type `nat`, hook `postrouting`, priority `100`, policy `accept`:
 - Masquerade rule: matches outbound traffic on the WAN interface (`oif`) and applies `masquerade`.
@@ -151,9 +154,22 @@ dns_servers = ["1.1.1.1", "1.0.0.1"] # Optional — custom upstream DNS resolver
 
 [system]
 watchdog = true                 # Optional — enable /dev/watchdog hardware supervisor (default: true)
+
+[dhcp]
+# Optional static DHCP lease reservations by MAC address
+# reservations = [
+#     { mac = "52:54:00:12:34:58", ip = "192.168.1.50" },
+# ]
+
+[[port_forwarding]]
+proto = "tcp"                   # Optional — "tcp", "udp", or "both" (default: "tcp")
+external_port = 8080            # Required — external WAN port (1-65535)
+internal_ip = "192.168.1.50"    # Required — destination LAN host IP within LAN subnet
+internal_port = 80              # Optional — destination port (defaults to external_port)
+description = "Web Server"      # Optional — human-readable description
 ```
 
-If `wan_mac` or `lan_mac` is missing, invalid (e.g. zero, broadcast, multicast, or identical MACs), if `lan_ip`/`backup_lan_ip` are invalid CIDRs (or overlap with each other), if `dns_servers` contains invalid IP addresses, or if the configuration file cannot be read, PID 1 prints a descriptive configuration error and halts.
+If `wan_mac` or `lan_mac` is missing, invalid (e.g. zero, broadcast, multicast, or identical MACs), if `lan_ip`/`backup_lan_ip` are invalid CIDRs (or overlap with each other), if `dns_servers` contains invalid IP addresses, if port forwarding targets are invalid or conflict, or if the configuration file cannot be read, PID 1 prints a descriptive configuration error and halts.
 
 ---
 

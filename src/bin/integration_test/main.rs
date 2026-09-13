@@ -182,9 +182,22 @@ async fn main() {
             std::eprintln!("[test] FATAL: Failed to init loopback: {}", e);
             std::process::exit(1);
         }
-        if let Err(e) =
-            netfilter::configure_firewall(network::WAN_INTERFACE, network::LAN_INTERFACE)
-        {
+        let test_port_forwards = if config.port_forwards.is_empty() {
+            vec![trimrouter::config::PortForwardRule {
+                protocol: trimrouter::config::ForwardProtocol::Both,
+                external_port: 28080,
+                internal_ip: std::net::Ipv4Addr::new(192, 168, 1, 2),
+                internal_port: 8080,
+                description: Some("Integration test port forwarding rule".to_string()),
+            }]
+        } else {
+            config.port_forwards.clone()
+        };
+        if let Err(e) = netfilter::configure_firewall(
+            network::WAN_INTERFACE,
+            network::LAN_INTERFACE,
+            &test_port_forwards,
+        ) {
             std::eprintln!("[test] FATAL: Failed to configure firewall: {}", e);
             std::process::exit(1);
         }
@@ -313,8 +326,19 @@ async fn main() {
                 failed += 1;
             }
         }
+        // Test 4b: DNAT Inbound Port Forwarding
+        match firewall::test_dnat_port_forwarding().await {
+            Ok(_) => {
+                std::println!("[test-control] TEST_PASSED dnat_port_forwarding");
+                passed += 1;
+            }
+            Err(e) => {
+                std::println!("[test-control] TEST_FAILED dnat_port_forwarding {}", e);
+                failed += 1;
+            }
+        }
     } else {
-        std::println!("[test] Skipping NAT Routing test (DHCP Client binding failed).");
+        std::println!("[test] Skipping NAT Routing tests (DHCP Client binding failed).");
     }
 
     // Test 5: Firewall Drop (Only run if client bound successfully)

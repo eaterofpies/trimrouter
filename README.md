@@ -18,8 +18,8 @@ It manages virtual filesystems, signal forwarding, orphan reaping, and launches 
 - **Init Process (PID 1)**: Mounts virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`), reaps orphaned processes, handles termination signals, integrates with hardware watchdog timers (`/dev/watchdog`) with asynchronous health checks, and monitors ACPI power button events to gracefully power down the virtual machine.
 - **Kernel Module Autoloading**: Bundles a built-in `modprobe` emulator; listens for `NETLINK_KOBJECT_UEVENT` broadcasts and automatically loads required kernel modules at startup and on device hotplug, with no external `modprobe` binary required.
 - **Dynamic Interface Lifecycle**: Monitors Linux kernel Netlink multicast link events to hotplug interfaces, rename them dynamically by MAC, configure IP addresses, and orchestrate service lifecycles.
-- **Kernel-Space NAT & Routing**: Interacts directly with the Linux kernel using Netlink sockets (`NETLINK_ROUTE` and `NETLINK_NETFILTER`) to manage interface states, IP assignments, default routes, and Source NAT (Masquerading).
-- **Stateful Firewall**: Implements an `nftables` input filter chain that drops all unsolicited incoming traffic on the WAN interface by default.
+- **Kernel-Space NAT & Routing**: Interacts directly with the Linux kernel using Netlink sockets (`NETLINK_ROUTE` and `NETLINK_NETFILTER`) to manage interface states, IP assignments, default routes, Source NAT (Masquerading), and Destination NAT (Inbound Port Forwarding).
+- **Stateful Firewall**: Implements an `nftables` input filter chain that drops all unsolicited incoming traffic on the WAN interface by default, while supporting declarative port forwarding rules to LAN destinations.
 - **Embedded Network Services**:
   - **DHCP Client (WAN)**: Handles dynamic leases and unicast renewals on the WAN interface over raw sockets.
   - **DHCP Server (LAN)**: Manages LAN lease allocations, address conflicts, and lease release/decline requests.
@@ -74,6 +74,13 @@ level = "info"
 # reservations = [
 #     { mac = "52:54:00:12:34:58", ip = "192.168.1.50" },
 # ]
+
+# Optional inbound port forwarding rules (DNAT)
+# [[port_forwarding]]
+# proto = "tcp"                   # "tcp", "udp", or "both" (default: "tcp")
+# external_port = 8080            # External WAN port (1-65535)
+# internal_ip = "192.168.1.50"    # Destination LAN host IP
+# internal_port = 80              # Optional destination port (defaults to external_port)
 
 [system]
 # Optional hardware watchdog supervision (/dev/watchdog) (default: true)

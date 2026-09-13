@@ -218,7 +218,7 @@ async fn configure_networking_and_services(
     heartbeat_tx: HeartbeatSender,
     _shutdown_flag: Arc<AtomicBool>,
 ) -> services::DnsForwarder {
-    setup_loopback_and_firewall(sys.as_ref()).await;
+    setup_loopback_and_firewall(sys.as_ref(), &config).await;
 
     let (lease_tx, lease_rx) = tokio::sync::watch::channel(services::WanLease::default());
     let (local_hosts_tx, local_hosts_rx) =
@@ -258,14 +258,17 @@ async fn configure_networking_and_services(
     dns_forwarder
 }
 
-async fn setup_loopback_and_firewall(sys: &RealSystem) {
+async fn setup_loopback_and_firewall(sys: &RealSystem, config: &RouterConfig) {
     if sys.getpid() == Pid::from_raw(1) {
         if let Err(e) = network::configure_network_init().await {
             panic!("FATAL: Failed to initialize network: {}", e);
         }
 
-        if let Err(e) = firewall::configure_firewall(network::WAN_INTERFACE, network::LAN_INTERFACE)
-        {
+        if let Err(e) = firewall::configure_firewall(
+            network::WAN_INTERFACE,
+            network::LAN_INTERFACE,
+            &config.port_forwards,
+        ) {
             panic!("FATAL: Failed to configure firewall: {}", e);
         }
     }
@@ -333,6 +336,7 @@ mod tests {
             watchdog: true,
             dns_servers: Vec::new(),
             static_leases: HashMap::new(),
+            port_forwards: Vec::new(),
         };
 
         let ifaces = build_managed_interfaces(&config, lease_tx, lease_rx, hb_tx, lh_tx);
