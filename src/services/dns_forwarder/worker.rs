@@ -40,6 +40,7 @@ const MAX_CACHE_ENTRIES: usize = 4096;
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_MAX_MESSAGE_SIZE: usize = 65535;
 const TCP_QUERY_CHANNEL_CAPACITY: usize = 128;
+const MAX_JOINED_CLIENTS_PER_QUERY: usize = 64;
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -91,10 +92,15 @@ struct TcpQueryRequest {
     reply_tx: OneshotSender<Vec<u8>>,
 }
 
-struct PendingQuery {
-    client_origin: ClientOrigin,
+#[derive(Debug)]
+struct PendingClient {
+    origin: ClientOrigin,
     client_xid: u16,
     client_max_payload: usize,
+}
+
+struct PendingQuery {
+    clients: Vec<PendingClient>,
     cache_key: Vec<u8>,
     query_payload: Vec<u8>,
     upstream_servers: Vec<Ipv4Addr>,
@@ -381,6 +387,12 @@ async fn handle_incoming_query(
         return;
     }
 
+    let mut origin_opt = Some(origin);
+    if try_join_in_flight_query(pending, &cache_key, query, &mut origin_opt) {
+        return;
+    }
+    let origin = origin_opt.expect("origin must be present if not joined");
+
     forward_new_client_query(
         query,
         origin,
@@ -390,6 +402,31 @@ async fn handle_incoming_query(
         ctx.configured_servers,
     )
     .await;
+}
+
+fn try_join_in_flight_query(
+    pending: &mut HashMap<u16, PendingQuery>,
+    cache_key: &[u8],
+    query: &[u8],
+    origin: &mut Option<ClientOrigin>,
+) -> bool {
+    let Some(existing) = pending.values_mut().find(|p| p.cache_key == cache_key) else {
+        return false;
+    };
+    if existing.clients.len() >= MAX_JOINED_CLIENTS_PER_QUERY {
+        return false;
+    }
+    let Some(orig) = origin.take() else {
+        return false;
+    };
+    let client_xid = u16::from_be_bytes([query[0], query[1]]);
+    let client_max_payload = extract_client_max_payload(query);
+    existing.clients.push(PendingClient {
+        origin: orig,
+        client_xid,
+        client_max_payload,
+    });
+    true
 }
 
 async fn forward_new_client_query(
@@ -422,9 +459,11 @@ async fn forward_new_client_query(
         pending.insert(
             upstream_xid,
             PendingQuery {
-                client_origin,
-                client_xid,
-                client_max_payload,
+                clients: vec![PendingClient {
+                    origin: client_origin,
+                    client_xid,
+                    client_max_payload,
+                }],
                 cache_key,
                 query_payload: query.to_vec(),
                 upstream_servers,
@@ -462,19 +501,17 @@ async fn handle_upstream_reply(
 
     insert_cache(query_meta.cache_key, reply.to_vec(), cache);
 
-    let mut client_response = reply.to_vec();
-    let client_xid_bytes = query_meta.client_xid.to_be_bytes();
-    client_response[0] = client_xid_bytes[0];
-    client_response[1] = client_xid_bytes[1];
+    for client in query_meta.clients {
+        let mut client_response = reply.to_vec();
+        let client_xid_bytes = client.client_xid.to_be_bytes();
+        client_response[0] = client_xid_bytes[0];
+        client_response[1] = client_xid_bytes[1];
 
-    query_meta
-        .client_origin
-        .send_reply(
-            client_response,
-            dns_socket,
-            Some(query_meta.client_max_payload),
-        )
-        .await;
+        client
+            .origin
+            .send_reply(client_response, dns_socket, Some(client.client_max_payload))
+            .await;
+    }
 }
 
 async fn check_pending_timeouts(
@@ -1849,12 +1886,14 @@ mod tests {
         pending.insert(
             upstream_xid,
             PendingQuery {
-                client_origin: ClientOrigin::Tcp {
-                    peer_addr: from_addr,
-                    reply_tx,
-                },
-                client_xid,
-                client_max_payload: MAX_EDNS_PAYLOAD_SIZE,
+                clients: vec![PendingClient {
+                    origin: ClientOrigin::Tcp {
+                        peer_addr: from_addr,
+                        reply_tx,
+                    },
+                    client_xid,
+                    client_max_payload: MAX_EDNS_PAYLOAD_SIZE,
+                }],
                 cache_key: cache_key.clone(),
                 query_payload: vec![],
                 upstream_servers: vec![upstream_server],
@@ -1892,6 +1931,162 @@ mod tests {
         assert_eq!(decoded.answers.len(), 1);
         assert!(cache.contains_key(&cache_key[..]));
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_query_deduplication_and_multi_client_fanout() {
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dummy_upstream = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let upstream_servers = vec![Ipv4Addr::new(8, 8, 8, 8)];
+        let local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+        let ctx = ForwarderContext {
+            sockets: ForwarderSockets {
+                dns: &dummy_dns,
+                upstream: &dummy_upstream,
+            },
+            local_table: LocalDnsTable {
+                hosts: &local_hosts,
+                ips: &local_ips,
+            },
+            configured_servers: &upstream_servers,
+        };
+
+        let mut cache = HashMap::new();
+        let mut pending = HashMap::new();
+        let mut rate_limiter = DnsRateLimiter::default();
+
+        let qname = Name::from_ascii("dedup.test.").unwrap();
+        let client_addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 11111);
+        let client_addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)), 22222);
+
+        let q1 = build_test_query(0x1111, qname.clone());
+        let q2 = build_test_query(0x2222, qname.clone());
+        let q3 = build_test_query(0x3333, qname.clone());
+
+        // Client 1 (UDP) initiates upstream query
+        handle_incoming_query(
+            &q1,
+            ClientOrigin::Udp(client_addr1),
+            &ctx,
+            &mut cache,
+            &mut pending,
+            &mut rate_limiter,
+        )
+        .await;
+        assert_eq!(pending.len(), 1);
+
+        // Client 2 (UDP) joins in-flight query
+        handle_incoming_query(
+            &q2,
+            ClientOrigin::Udp(client_addr2),
+            &ctx,
+            &mut cache,
+            &mut pending,
+            &mut rate_limiter,
+        )
+        .await;
+        assert_eq!(pending.len(), 1);
+
+        // Client 3 (TCP) joins in-flight query
+        let (reply_tx, reply_rx) = oneshot_channel();
+        let tcp_origin = ClientOrigin::Tcp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 30)), 33333),
+            reply_tx,
+        };
+        handle_incoming_query(
+            &q3,
+            tcp_origin,
+            &ctx,
+            &mut cache,
+            &mut pending,
+            &mut rate_limiter,
+        )
+        .await;
+        assert_eq!(pending.len(), 1);
+
+        let (upstream_xid, in_flight) = pending.iter().next().unwrap();
+        let upstream_xid = *upstream_xid;
+        assert_eq!(in_flight.clients.len(), 3, "All 3 clients must be joined");
+
+        // Send upstream reply
+        let resp_bytes = build_test_response(upstream_xid, qname, Ipv4Addr::new(4, 3, 2, 1));
+        let from_addr = SocketAddr::new(IpAddr::V4(upstream_servers[0]), DNS_PORT);
+        handle_upstream_reply(&resp_bytes, from_addr, &dummy_dns, &mut cache, &mut pending).await;
+
+        assert!(
+            pending.is_empty(),
+            "Pending map must be cleared after reply"
+        );
+        let tcp_reply = reply_rx.await.expect("TCP client must receive response");
+        let tcp_msg = Message::from_bytes(&tcp_reply).unwrap();
+        assert_eq!(tcp_msg.id, 0x3333, "TCP client must receive its own XID");
+    }
+
+    #[test]
+    fn test_try_join_in_flight_query_capacity_limit() {
+        let mut pending = HashMap::new();
+        let cache_key = b"limit.test.:A:IN".to_vec();
+        let mut clients = Vec::new();
+        for idx in 0..MAX_JOINED_CLIENTS_PER_QUERY {
+            clients.push(PendingClient {
+                origin: ClientOrigin::Udp(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                    1000 + idx as u16,
+                )),
+                client_xid: idx as u16,
+                client_max_payload: 512,
+            });
+        }
+        pending.insert(
+            0x4444,
+            PendingQuery {
+                clients,
+                cache_key: cache_key.clone(),
+                query_payload: vec![],
+                upstream_servers: vec![Ipv4Addr::new(8, 8, 8, 8)],
+                current_server_idx: 0,
+                deadline: Instant::now() + UPSTREAM_TIMEOUT,
+            },
+        );
+
+        let query = vec![0u8; DNS_HEADER_SIZE];
+        let origin = ClientOrigin::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            9999,
+        ));
+        let mut origin_opt = Some(origin);
+        let joined = try_join_in_flight_query(&mut pending, &cache_key, &query, &mut origin_opt);
+        assert!(
+            !joined,
+            "Joining must be rejected once MAX_JOINED_CLIENTS_PER_QUERY is reached"
+        );
+        assert!(
+            origin_opt.is_some(),
+            "Origin must not be consumed when joining fails"
+        );
+    }
+
+    fn build_test_query(id: u16, qname: Name) -> Vec<u8> {
+        let mut query = Message::new(id, hickory_proto::op::MessageType::Query, OpCode::Query);
+        query.add_query(hickory_proto::op::Query::query(qname, RecordType::A));
+        let mut bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut bytes);
+        query.emit(&mut enc).unwrap();
+        bytes
+    }
+
+    fn build_test_response(id: u16, qname: Name, ip: Ipv4Addr) -> Vec<u8> {
+        let mut resp = Message::new(id, hickory_proto::op::MessageType::Response, OpCode::Query);
+        resp.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        resp.add_answer(Record::from_rdata(qname, 300, RData::A(A(ip))));
+        let mut bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut bytes);
+        resp.emit(&mut enc).unwrap();
+        bytes
     }
 
     #[tokio::test]

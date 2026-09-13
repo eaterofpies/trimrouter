@@ -78,6 +78,13 @@ To support large DNS responses (such as DNSSEC signatures and multi-record answe
 *   **Truncation (`TC=1`) Flag**: If a response (from local lookup, RAM cache, or upstream) exceeds the client's advertised buffer limit, the forwarder sets the `TC=1` (Truncated) flag in the DNS header and truncates the response, signaling the client to retry over TCP.
 *   **DNSSEC OK (`DO`) Passthrough**: The client's EDNS0 `OPT` record (including the `DO` bit) is passed upstream to receive `RRSIG` records for DNSSEC validation.
 
+### 2.6 In-Flight Query Deduplication & Request Joining
+To prevent redundant upstream WAN queries and eliminate latency during cache-miss query stampedes (e.g., when multiple LAN clients simultaneously query the same un-cached domain):
+*   **In-Flight Request Joining**: When an incoming query matches a question (`domain:type:class`) that already has an unresolved query in-flight to an upstream resolver, the forwarder attaches the client request (`ClientOrigin`, `client_xid`, and client max payload constraint) to the existing `PendingQuery` record instead of dispatching a redundant upstream packet.
+*   **Multi-Client Response Fanout**: When the upstream resolver responds, the forwarder iterates through all joined client requests, restoring each client's unique transaction ID (`client_xid`) and framing/truncation constraints (`TC=1` if needed per client max payload or TCP framing) and transmitting the response back across their respective UDP or TCP transports.
+*   **Join Capacity Bound**: In-flight joining is bounded to at most 64 clients per query (`MAX_JOINED_CLIENTS_PER_QUERY`). If the joined client limit is reached during a flood, new queries are forwarded independently with distinct randomized upstream XIDs.
+
+
 ---
 
 ## 3. Cache Design
