@@ -485,7 +485,7 @@ async fn handle_upstream_reply(
         return;
     }
     let upstream_xid = u16::from_be_bytes([reply[0], reply[1]]);
-    let Some(query_meta) = pending.remove(&upstream_xid) else {
+    let Some(query_meta) = pending.get(&upstream_xid) else {
         return;
     };
 
@@ -498,6 +498,10 @@ async fn handle_upstream_reply(
         );
         return;
     }
+
+    let query_meta = pending
+        .remove(&upstream_xid)
+        .expect("query exists in pending");
 
     insert_cache(query_meta.cache_key, reply.to_vec(), cache);
 
@@ -2180,5 +2184,369 @@ mod tests {
         let resp_msg = Message::from_bytes(&resp_buf).unwrap();
         assert_eq!(resp_msg.id, xid);
         assert_eq!(resp_msg.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_fanout_heterogeneous_edns_truncation() {
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dummy_upstream = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let upstream_servers = vec![Ipv4Addr::new(8, 8, 8, 8)];
+        let local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+        let ctx = ForwarderContext {
+            sockets: ForwarderSockets {
+                dns: &dummy_dns,
+                upstream: &dummy_upstream,
+            },
+            local_table: LocalDnsTable {
+                hosts: &local_hosts,
+                ips: &local_ips,
+            },
+            configured_servers: &upstream_servers,
+        };
+
+        let mut cache = HashMap::new();
+        let mut pending = HashMap::new();
+        let mut rate_limiter = DnsRateLimiter::default();
+        let qname = Name::from_ascii("large.example.com.").unwrap();
+
+        let q1 = build_test_query(0x1001, qname.clone());
+        let (reply_tx_tcp, reply_rx_tcp) = oneshot_channel();
+
+        let mut q2_msg = Message::new(0x2002, hickory_proto::op::MessageType::Query, OpCode::Query);
+        q2_msg.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        let mut q2 = Vec::new();
+        let mut enc = BinEncoder::new(&mut q2);
+        q2_msg.emit(&mut enc).unwrap();
+
+        handle_incoming_query(
+            &q1,
+            ClientOrigin::Udp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                10001,
+            )),
+            &ctx,
+            &mut cache,
+            &mut pending,
+            &mut rate_limiter,
+        )
+        .await;
+
+        handle_incoming_query(
+            &q2,
+            ClientOrigin::Tcp {
+                peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)), 20002),
+                reply_tx: reply_tx_tcp,
+            },
+            &ctx,
+            &mut cache,
+            &mut pending,
+            &mut rate_limiter,
+        )
+        .await;
+
+        let (&upstream_xid, _) = pending.iter().next().unwrap();
+
+        let mut large_resp = Message::new(
+            upstream_xid,
+            hickory_proto::op::MessageType::Response,
+            OpCode::Query,
+        );
+        large_resp.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        for i in 0..40 {
+            large_resp.add_answer(Record::from_rdata(
+                qname.clone(),
+                300,
+                RData::A(A(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8))),
+            ));
+        }
+        let mut large_resp_bytes = Vec::new();
+        let mut enc = BinEncoder::new(&mut large_resp_bytes);
+        large_resp.emit(&mut enc).unwrap();
+        assert!(large_resp_bytes.len() > 512);
+
+        let from_addr = SocketAddr::new(IpAddr::V4(upstream_servers[0]), DNS_PORT);
+        handle_upstream_reply(
+            &large_resp_bytes,
+            from_addr,
+            &dummy_dns,
+            &mut cache,
+            &mut pending,
+        )
+        .await;
+
+        let tcp_reply = reply_rx_tcp.await.unwrap();
+        assert_eq!(
+            tcp_reply.len(),
+            large_resp_bytes.len(),
+            "TCP client receives full untruncated payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_upstream_reply_spoofed_source_ip_and_port_rejected() {
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_server = Ipv4Addr::new(8, 8, 8, 8);
+        let legitimate_addr = SocketAddr::new(IpAddr::V4(upstream_server), DNS_PORT);
+
+        let (reply_tx, mut reply_rx) = oneshot_channel();
+        let mut pending = HashMap::new();
+        let upstream_xid = 0xbeef;
+        let client_xid = 0x1234;
+        let qname = Name::from_ascii("secure.test.").unwrap();
+        let cache_key = b"secure.test.:A:IN".to_vec();
+
+        pending.insert(
+            upstream_xid,
+            PendingQuery {
+                clients: vec![PendingClient {
+                    origin: ClientOrigin::Tcp {
+                        peer_addr: SocketAddr::new(
+                            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+                            50000,
+                        ),
+                        reply_tx,
+                    },
+                    client_xid,
+                    client_max_payload: 512,
+                }],
+                cache_key: cache_key.clone(),
+                query_payload: vec![],
+                upstream_servers: vec![upstream_server],
+                current_server_idx: 0,
+                deadline: Instant::now() + UPSTREAM_TIMEOUT,
+            },
+        );
+
+        let resp_bytes =
+            build_test_response(upstream_xid, qname.clone(), Ipv4Addr::new(6, 6, 6, 6));
+        let mut cache = HashMap::new();
+
+        // 1. Spoofed IP (1.1.1.1:53) rejected
+        let spoofed_ip_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), DNS_PORT);
+        handle_upstream_reply(
+            &resp_bytes,
+            spoofed_ip_addr,
+            &dummy_dns,
+            &mut cache,
+            &mut pending,
+        )
+        .await;
+        assert!(cache.is_empty(), "Spoofed IP packet must not be cached");
+        assert_eq!(
+            pending.len(),
+            1,
+            "Query must remain pending after spoofed IP"
+        );
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "Client must not receive spoofed reply"
+        );
+
+        // 2. Spoofed port (8.8.8.8:5353) rejected
+        let spoofed_port_addr = SocketAddr::new(IpAddr::V4(upstream_server), 5353);
+        handle_upstream_reply(
+            &resp_bytes,
+            spoofed_port_addr,
+            &dummy_dns,
+            &mut cache,
+            &mut pending,
+        )
+        .await;
+        assert!(cache.is_empty(), "Spoofed port packet must not be cached");
+        assert_eq!(
+            pending.len(),
+            1,
+            "Query must remain pending after spoofed port"
+        );
+
+        // 3. Legitimate response accepted
+        handle_upstream_reply(
+            &resp_bytes,
+            legitimate_addr,
+            &dummy_dns,
+            &mut cache,
+            &mut pending,
+        )
+        .await;
+        assert_eq!(cache.len(), 1, "Legitimate packet is cached");
+        assert!(pending.is_empty(), "Pending query cleared");
+        let delivered = reply_rx
+            .try_recv()
+            .expect("Client receives legitimate reply");
+        assert_eq!(delivered.len(), resp_bytes.len());
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_dedup_cross_type_isolation() {
+        let dummy_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dummy_upstream = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let upstream_servers = vec![Ipv4Addr::new(8, 8, 8, 8)];
+        let local_hosts = HashMap::new();
+        let local_ips = HashMap::new();
+        let ctx = ForwarderContext {
+            sockets: ForwarderSockets {
+                dns: &dummy_dns,
+                upstream: &dummy_upstream,
+            },
+            local_table: LocalDnsTable {
+                hosts: &local_hosts,
+                ips: &local_ips,
+            },
+            configured_servers: &upstream_servers,
+        };
+
+        let mut cache = HashMap::new();
+        let mut pending = HashMap::new();
+        let mut rate_limiter = DnsRateLimiter::default();
+        let qname = Name::from_ascii("isolation.test.").unwrap();
+
+        let mut q_a_msg =
+            Message::new(0x1000, hickory_proto::op::MessageType::Query, OpCode::Query);
+        q_a_msg.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        let mut q_a = Vec::new();
+        let mut enc = BinEncoder::new(&mut q_a);
+        q_a_msg.emit(&mut enc).unwrap();
+
+        let mut q_aaaa_msg =
+            Message::new(0x2000, hickory_proto::op::MessageType::Query, OpCode::Query);
+        q_aaaa_msg.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::AAAA,
+        ));
+        let mut q_aaaa = Vec::new();
+        let mut enc = BinEncoder::new(&mut q_aaaa);
+        q_aaaa_msg.emit(&mut enc).unwrap();
+
+        handle_incoming_query(
+            &q_a,
+            ClientOrigin::Udp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                10000,
+            )),
+            &ctx,
+            &mut cache,
+            &mut pending,
+            &mut rate_limiter,
+        )
+        .await;
+
+        handle_incoming_query(
+            &q_aaaa,
+            ClientOrigin::Udp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+                20000,
+            )),
+            &ctx,
+            &mut cache,
+            &mut pending,
+            &mut rate_limiter,
+        )
+        .await;
+
+        assert_eq!(
+            pending.len(),
+            2,
+            "A and AAAA queries must NOT coalesce into one request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tcp_dns_framing_invalid_lengths_and_eof() {
+        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        client.write_all(&5u16.to_be_bytes()).await.unwrap();
+        client.write_all(&[1, 2, 3, 4, 5]).await.unwrap();
+        assert_eq!(read_tcp_dns_query(&mut server).await, None);
+
+        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        client.write_all(&0u16.to_be_bytes()).await.unwrap();
+        assert_eq!(read_tcp_dns_query(&mut server).await, None);
+
+        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        client.write_all(&20u16.to_be_bytes()).await.unwrap();
+        client.write_all(&[1, 2, 3]).await.unwrap();
+        drop(client);
+        assert_eq!(read_tcp_dns_query(&mut server).await, None);
+    }
+
+    #[test]
+    fn test_extract_client_max_payload_bounds_clamping() {
+        let qname = Name::from_ascii("bounds.test.").unwrap();
+
+        let mut q_small = Message::new(0x100, hickory_proto::op::MessageType::Query, OpCode::Query);
+        q_small.add_query(hickory_proto::op::Query::query(
+            qname.clone(),
+            RecordType::A,
+        ));
+        let mut edns_small = hickory_proto::op::Edns::new();
+        edns_small.set_max_payload(100);
+        q_small.set_edns(edns_small);
+        let mut bytes_small = Vec::new();
+        let mut enc = BinEncoder::new(&mut bytes_small);
+        q_small.emit(&mut enc).unwrap();
+        assert_eq!(extract_client_max_payload(&bytes_small), 512);
+
+        let mut q_large = Message::new(0x200, hickory_proto::op::MessageType::Query, OpCode::Query);
+        q_large.add_query(hickory_proto::op::Query::query(qname, RecordType::A));
+        let mut edns_large = hickory_proto::op::Edns::new();
+        edns_large.set_max_payload(65535);
+        q_large.set_edns(edns_large);
+        let mut bytes_large = Vec::new();
+        let mut enc = BinEncoder::new(&mut bytes_large);
+        q_large.emit(&mut enc).unwrap();
+        assert_eq!(extract_client_max_payload(&bytes_large), 4096);
+    }
+
+    #[test]
+    fn test_negative_caching_soa_clamping_bounds() {
+        use hickory_proto::rr::rdata::SOA;
+
+        let mut msg_low = Message::new(1, hickory_proto::op::MessageType::Response, OpCode::Query);
+        msg_low.metadata.response_code = hickory_proto::op::ResponseCode::NXDomain;
+        let soa_low = SOA::new(
+            Name::from_ascii("ns.test.").unwrap(),
+            Name::from_ascii("hostmaster.test.").unwrap(),
+            1,
+            7200,
+            3600,
+            1209600,
+            0,
+        );
+        msg_low.add_authority(Record::from_rdata(
+            Name::from_ascii("test.").unwrap(),
+            300,
+            RData::SOA(soa_low),
+        ));
+        assert_eq!(calculate_cache_ttl(&msg_low), Some(Duration::from_secs(5)));
+
+        let mut msg_high = Message::new(2, hickory_proto::op::MessageType::Response, OpCode::Query);
+        msg_high.metadata.response_code = hickory_proto::op::ResponseCode::NXDomain;
+        let soa_high = SOA::new(
+            Name::from_ascii("ns.test.").unwrap(),
+            Name::from_ascii("hostmaster.test.").unwrap(),
+            1,
+            7200,
+            3600,
+            1209600,
+            100_000,
+        );
+        msg_high.add_authority(Record::from_rdata(
+            Name::from_ascii("test.").unwrap(),
+            100_000,
+            RData::SOA(soa_high),
+        ));
+        assert_eq!(
+            calculate_cache_ttl(&msg_high),
+            Some(Duration::from_secs(300))
+        );
     }
 }
