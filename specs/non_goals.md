@@ -34,3 +34,14 @@ This document explicitly tracks architectural features, designs, and capabilitie
     *   Dangerous syscalls (`socket`, `bind`, `connect`, `open`, `openat`, `execve`, `fork`, `clone`, `mount`, `reboot`, etc.) are already universally blocked by the single shared Seccomp-BPF allowlist in `src/services/utils.rs`.
     *   Maintaining separate per-service syscall allowlists across three CPU architectures (`x86_64`, `aarch64`, `armhf`) increases maintenance overhead and introduces crash fragility without measurable security gains.
 
+---
+
+## 4. Encrypted Upstream DNS Protocols (DNS-over-TLS & DNS-over-HTTPS)
+
+*   **Status**: **Rejected / Non-Goal**
+*   **Rationale**:
+    *   **Cold-Boot Time Deadlock**: TLS certificate validation (`notBefore`/`notAfter`) requires a synchronized real-time clock. In a minimalist embedded appliance without a persistent battery-backed hardware RTC, time synchronization requires SNTP, which in turn requires DNS resolution (`time.google.com`). Requiring TLS for DNS creates a cyclical startup dependency that risks deadlocking system boot.
+    *   **Root CA Trust Store Maintenance**: Validating public X.509 certificates requires embedding and maintaining a full Web PKI root bundle (such as Mozilla's CA certificates). In an immutable read-only appliance without automated CA bundle refresh mechanisms, certificate expirations inevitably cause resolution outages.
+    *   **Footprint & Surface Area**: DoT and DoH introduce substantial dependencies into the unprivileged static binary (TLS handshakes, cryptography backends, HTTP/2 multiplexing, HPACK decoding, and URI parsing), conflicting with `trimrouter`'s goal of maintaining a minimal, auditable, and self-contained PID 1 footprint.
+    *   **Standard Conformance**: `trimrouter` adheres strictly to standard DNS forwarding over UDP (RFC 1035) and TCP (RFC 7766) on port 53.
+
