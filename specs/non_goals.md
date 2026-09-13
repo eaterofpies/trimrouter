@@ -45,3 +45,17 @@ This document explicitly tracks architectural features, designs, and capabilitie
     *   **Footprint & Surface Area**: DoT and DoH introduce substantial dependencies into the unprivileged static binary (TLS handshakes, cryptography backends, HTTP/2 multiplexing, HPACK decoding, and URI parsing), conflicting with `trimrouter`'s goal of maintaining a minimal, auditable, and self-contained PID 1 footprint.
     *   **Standard Conformance**: `trimrouter` adheres strictly to standard DNS forwarding over UDP (RFC 1035) and TCP (RFC 7766) on port 53.
 
+---
+
+## 5. IPv6 Dual-Stack Routing, SLAAC, & DHCPv6 Support
+
+*   **Status**: **Rejected / Non-Goal**
+*   **Rationale**:
+    *   `trimrouter` is purpose-built as a lean, minimalist, single-binary appliance for standard IPv4 network routing, DHCPv4 leasing, Netfilter NAT masquerading, and DNS forwarding.
+    *   Adding dual-stack IPv6 introduces significant architectural complexity:
+        *   WAN DHCPv6 client and Prefix Delegation (DHCPv6-PD) management.
+        *   LAN ICMPv6 Router Advertisement (SLAAC / RDNSS) daemon and state tracking.
+        *   Dedicated IPv6 Netfilter firewall tables and chains with complex ingress filtering and ICMPv6 neighbor discovery rules.
+        *   Dual-stack DNS forwarder lookup logic and reverse mapping handlers (`ip6.arpa`).
+    *   Focusing strictly on IPv4 allows the entire appliance (PID 1, network supervisors, sandboxed workers, Netfilter firewall, and storage management) to remain compact, deterministic, easily auditable, and free of multi-protocol complexity.
+
