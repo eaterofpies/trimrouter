@@ -59,9 +59,13 @@ Configuration is read from the TOML configuration file `/boot/config/trimrouter.
 # The MAC addresses used to map the WAN and LAN interfaces (Required)
 wan_mac = "52:54:00:12:34:56"
 lan_mac = "52:54:00:12:34:57"
+# dns_servers = ["1.1.1.1", "1.0.0.1"]
 
-# Optional static LAN gateway IP and subnet (default: "192.168.1.1/24")
-lan_ip = "192.168.1.1/24"
+[lan]
+# Primary and fallback network addressing (gateway derived automatically as .1)
+primary_network = "192.168.1.0"      # Optional (default: "192.168.1.0")
+fallback_network = "10.0.0.0"        # Optional (default: "10.0.0.0")
+prefix_length = 24                   # Optional shared prefix length (default: 24)
 
 [logging]
 # Optional maximum size for active log before rotation in MiB (default: 100)
@@ -69,7 +73,7 @@ max_log_size_mb = 100
 # Optional log level filter: "error", "warn", "info", "debug", "trace" (default: "info")
 level = "info"
 
-[dhcp]
+# [dhcp]
 # Optional static DHCP lease reservations by MAC address
 # reservations = [
 #     { mac = "52:54:00:12:34:58", ip = "192.168.1.50" },
@@ -79,7 +83,7 @@ level = "info"
 # [[port_forwarding]]
 # proto = "tcp"                   # "tcp", "udp", or "both" (default: "tcp")
 # external_port = 8080            # External WAN port (1-65535)
-# internal_ip = "192.168.1.50"    # Destination LAN host IP
+# internal_ip = "192.168.1.50"    # Destination LAN host IP (auto-translated on fallback subnet)
 # internal_port = 80              # Optional destination port (defaults to external_port)
 
 [system]

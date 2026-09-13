@@ -20,12 +20,14 @@ pub async fn test_lan_wan_conflict(
     // Default initial LAN IP is "192.168.1.1/24" and backup is "10.0.0.1/24"
     let mut lan_manager = LanManager::new(
         "lan".to_string(),
+        "wan".to_string(),
         "192.168.1.1/24".to_string(),
         "10.0.0.1/24".to_string(),
         lease_rx,
         None,
         None,
         HashMap::new(),
+        Vec::new(),
     );
 
     if let Err(e) = lan_manager.start().await {
@@ -142,12 +144,14 @@ pub async fn test_lan_dhcp_handshake(lease_rx: WanLeaseReceiver) -> Result<LanMa
     // 1. Start LanManager service on "lan" (which starts the LAN DHCP server)
     let mut lan_manager = LanManager::new(
         "lan".to_string(),
+        "wan".to_string(),
         "192.168.1.1/24".to_string(),
         "10.0.0.1/24".to_string(),
         lease_rx,
         None,
         None,
         HashMap::new(),
+        Vec::new(),
     );
     if let Err(e) = lan_manager.start().await {
         return Err(format!("Failed to start LanManager: {}", e));
@@ -188,12 +192,14 @@ pub async fn test_lan_static_lease(lease_rx: WanLeaseReceiver) -> Result<(), Str
 
     let mut lan_manager = LanManager::new(
         "lan".to_string(),
+        "wan".to_string(),
         "192.168.1.1/24".to_string(),
         "10.0.0.1/24".to_string(),
         lease_rx,
         None,
         None,
         static_leases,
+        Vec::new(),
     );
 
     if let Err(e) = lan_manager.start().await {

@@ -298,12 +298,14 @@ fn build_managed_interfaces(
     let lan_services = vec![interface::RouterService::LanManager(
         services::LanManager::new(
             network::LAN_INTERFACE.to_string(),
+            network::WAN_INTERFACE.to_string(),
             config.lan_ip.clone(),
             config.backup_lan_ip.clone(),
             lease_rx,
             Some(heartbeat_tx),
             Some(local_hosts_tx),
             config.static_leases.clone(),
+            config.port_forwards.clone(),
         ),
     )];
     let lan_iface = interface::ManagedInterface::new(

@@ -93,43 +93,41 @@ impl std::fmt::Debug for RouterConfig {
     }
 }
 
+const DEFAULT_PRIMARY_NETWORK: &str = "192.168.1.0";
+const DEFAULT_FALLBACK_NETWORK: &str = "10.0.0.0";
+const DEFAULT_LAN_PREFIX_LENGTH: u8 = 24;
+const MIN_LAN_PREFIX_LENGTH: u8 = 8;
+const MAX_LAN_PREFIX_LENGTH: u8 = 30;
+
 #[derive(Deserialize)]
 struct ConfigToml {
     network: NetworkSection,
+    lan: Option<LanSection>,
     dhcp: Option<DhcpSection>,
     system: Option<SystemSection>,
     logging: Option<LoggingSection>,
     dns: Option<DnsSection>,
     port_forwarding: Option<Vec<PortForwardToml>>,
-    port_forwards: Option<Vec<PortForwardToml>>,
-    firewall: Option<FirewallSection>,
 }
 
-#[derive(Deserialize)]
-struct FirewallSection {
-    port_forwarding: Option<Vec<PortForwardToml>>,
-    port_forwards: Option<Vec<PortForwardToml>>,
+#[derive(Deserialize, Default)]
+struct LanSection {
+    primary_network: Option<String>,
+    fallback_network: Option<String>,
+    prefix_length: Option<u8>,
 }
 
 #[derive(Deserialize)]
 struct PortForwardToml {
     proto: Option<String>,
-    protocol: Option<String>,
     external_port: Option<u16>,
-    ext_port: Option<u16>,
-    port: Option<u16>,
     internal_ip: Option<String>,
-    int_ip: Option<String>,
-    ip: Option<String>,
     internal_port: Option<u16>,
-    int_port: Option<u16>,
     description: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct NetworkSection {
-    lan_ip: Option<String>,
-    backup_lan_ip: Option<String>,
     wan_mac: String,
     lan_mac: String,
     dns_servers: Option<Vec<String>>,
@@ -143,7 +141,7 @@ struct DhcpSection {
 #[derive(Deserialize)]
 struct DhcpReservationToml {
     mac: String,
-    ip: String,
+    ip: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -197,29 +195,137 @@ fn parse_mac_addresses(net: &NetworkSection) -> Result<(MacAddr, MacAddr), Route
     Ok((wan_mac, lan_mac))
 }
 
-fn validate_lan_subnet(name: &str, cidr: &str) -> Result<ipnet::Ipv4Net, RouterError> {
-    let net = ipnet::Ipv4Net::from_str(cidr)
-        .map_err(|e| RouterError::Generic(format!("Invalid {} CIDR '{}': {}", name, cidr, e)))?;
-    if net.prefix_len() < 8 || net.prefix_len() > 30 {
+fn parse_lan_network(
+    raw_str: Option<&str>,
+    prefix_len: u8,
+    default_network: &str,
+    field_name: &str,
+) -> Result<(ipnet::Ipv4Net, String), RouterError> {
+    let input = raw_str.unwrap_or(default_network).trim();
+    if input.is_empty() {
         return Err(RouterError::Generic(format!(
-            "Invalid {} prefix length /{} (must be between /8 and /30)",
-            name,
-            net.prefix_len()
+            "{} cannot be empty",
+            field_name
         )));
     }
-    if net.addr() == net.network() {
+
+    if !(MIN_LAN_PREFIX_LENGTH..=MAX_LAN_PREFIX_LENGTH).contains(&prefix_len) {
         return Err(RouterError::Generic(format!(
-            "{} '{}' cannot use the network address as the router host IP",
-            name, cidr
+            "Invalid prefix_length /{} (must be between /{} and /{})",
+            prefix_len, MIN_LAN_PREFIX_LENGTH, MAX_LAN_PREFIX_LENGTH
         )));
     }
-    if net.addr() == net.broadcast() {
+
+    let base_ip = Ipv4Addr::from_str(input).map_err(|e| {
+        RouterError::Generic(format!("Invalid {} IP in '{}': {}", field_name, input, e))
+    })?;
+
+    let net = ipnet::Ipv4Net::new(base_ip, prefix_len).map_err(|e| {
+        RouterError::Generic(format!(
+            "Invalid {} CIDR for '{}': {}",
+            field_name, input, e
+        ))
+    })?;
+
+    let gateway_ip = if base_ip == net.network() {
+        Ipv4Addr::from(u32::from(net.network()) + 1)
+    } else if base_ip == net.broadcast() {
         return Err(RouterError::Generic(format!(
             "{} '{}' cannot use the broadcast address as the router host IP",
-            name, cidr
+            field_name, input
+        )));
+    } else {
+        base_ip
+    };
+
+    let full_cidr_str = format!("{}/{}", gateway_ip, prefix_len);
+    let gateway_net = ipnet::Ipv4Net::new(gateway_ip, prefix_len).map_err(|e| {
+        RouterError::Generic(format!(
+            "Invalid derived {} CIDR '{}': {}",
+            field_name, full_cidr_str, e
+        ))
+    })?;
+
+    Ok((gateway_net, full_cidr_str))
+}
+
+fn parse_lan_subnets(
+    lan_sec: Option<&LanSection>,
+) -> Result<(ipnet::Ipv4Net, ipnet::Ipv4Net, String, String), RouterError> {
+    let prefix_length = lan_sec
+        .and_then(|l| l.prefix_length)
+        .unwrap_or(DEFAULT_LAN_PREFIX_LENGTH);
+
+    let primary_raw = lan_sec.and_then(|l| l.primary_network.as_deref());
+    let fallback_raw = lan_sec.and_then(|l| l.fallback_network.as_deref());
+
+    let (lan_net, lan_ip) = parse_lan_network(
+        primary_raw,
+        prefix_length,
+        DEFAULT_PRIMARY_NETWORK,
+        "primary_network",
+    )?;
+    let (backup_net, backup_lan_ip) = parse_lan_network(
+        fallback_raw,
+        prefix_length,
+        DEFAULT_FALLBACK_NETWORK,
+        "fallback_network",
+    )?;
+
+    if lan_net.contains(&backup_net.network()) || backup_net.contains(&lan_net.network()) {
+        return Err(RouterError::Generic(format!(
+            "primary network ({}) and fallback network ({}) must not overlap with each other",
+            lan_ip, backup_lan_ip
         )));
     }
-    Ok(net)
+
+    Ok((lan_net, backup_net, lan_ip, backup_lan_ip))
+}
+
+fn validate_target_ip(
+    ip: Ipv4Addr,
+    lan_net: &ipnet::Ipv4Net,
+    backup_net: &ipnet::Ipv4Net,
+    context: &str,
+) -> Result<(), RouterError> {
+    if !lan_net.contains(&ip)
+        || ip == lan_net.network()
+        || ip == lan_net.broadcast()
+        || ip == lan_net.addr()
+    {
+        return Err(RouterError::Generic(format!(
+            "{} IP '{}' must be a valid host IP within LAN subnet '{}' and not the router's gateway IP",
+            context, ip, lan_net
+        )));
+    }
+
+    let offset = u32::from(ip)
+        .checked_sub(u32::from(lan_net.network()))
+        .ok_or_else(|| {
+            RouterError::Generic(format!("{} IP '{}' underflow on LAN subnet", context, ip))
+        })?;
+    let backup_u32 = u32::from(backup_net.network())
+        .checked_add(offset)
+        .ok_or_else(|| {
+            RouterError::Generic(format!(
+                "{} host offset {} overflows fallback subnet",
+                context, offset
+            ))
+        })?;
+    let backup_ip = Ipv4Addr::from(backup_u32);
+
+    if !backup_net.contains(&backup_ip)
+        || backup_ip == backup_net.network()
+        || backup_ip == backup_net.broadcast()
+        || backup_ip == backup_net.addr()
+    {
+        return Err(RouterError::Generic(format!(
+            "{} IP '{}' (host offset {}) is invalid on fallback subnet '{}' (exceeds subnet range or collides with fallback gateway)",
+            context, ip, offset, backup_net
+        )));
+    }
+
+    Ok(())
 }
 
 fn parse_logging_config(logging: Option<&LoggingSection>) -> Result<LoggingConfig, RouterError> {
@@ -281,6 +387,7 @@ fn parse_dns_servers(
 fn parse_dhcp_reservations(
     dhcp: Option<&DhcpSection>,
     lan_net: &ipnet::Ipv4Net,
+    backup_net: &ipnet::Ipv4Net,
 ) -> Result<HashMap<MacAddr, Ipv4Addr>, RouterError> {
     let mut static_leases = HashMap::new();
     let mut seen_ips = HashSet::new();
@@ -306,23 +413,19 @@ fn parse_dhcp_reservations(
             )));
         }
 
-        let ip: Ipv4Addr = res.ip.parse().map_err(|_| {
+        let ip_str = res.ip.as_deref().ok_or_else(|| {
             RouterError::Generic(format!(
-                "DHCP reservation IP '{}' must be a valid IPv4 address",
-                res.ip
+                "DHCP reservation for MAC '{}' is missing 'ip'",
+                res.mac
             ))
         })?;
-
-        if !lan_net.contains(&ip)
-            || ip == lan_net.network()
-            || ip == lan_net.broadcast()
-            || ip == lan_net.addr()
-        {
-            return Err(RouterError::Generic(format!(
-                "DHCP reservation IP '{}' must be a valid host IP within LAN subnet '{}' and not the router's gateway IP",
-                ip, lan_net
-            )));
-        }
+        let ip = Ipv4Addr::from_str(ip_str.trim()).map_err(|e| {
+            RouterError::Generic(format!(
+                "DHCP reservation MAC '{}' IP '{}' must be a valid IPv4 address: {}",
+                res.mac, ip_str, e
+            ))
+        })?;
+        validate_target_ip(ip, lan_net, backup_net, "DHCP reservation")?;
 
         if static_leases.insert(mac, ip).is_some() {
             return Err(RouterError::Generic(format!(
@@ -342,81 +445,35 @@ fn parse_dhcp_reservations(
     Ok(static_leases)
 }
 
-fn collect_raw_port_forward_rules(config: &ConfigToml) -> Vec<&PortForwardToml> {
-    let mut list = Vec::new();
-    if let Some(ref rules) = config.port_forwarding {
-        list.extend(rules.iter());
-    }
-    if let Some(ref rules) = config.port_forwards {
-        list.extend(rules.iter());
-    }
-    if let Some(ref fw) = config.firewall {
-        if let Some(ref rules) = fw.port_forwarding {
-            list.extend(rules.iter());
-        }
-        if let Some(ref rules) = fw.port_forwards {
-            list.extend(rules.iter());
-        }
-    }
-    list
-}
-
 fn validate_and_build_port_forward_rule(
     raw: &PortForwardToml,
     lan_net: &ipnet::Ipv4Net,
+    backup_net: &ipnet::Ipv4Net,
 ) -> Result<PortForwardRule, RouterError> {
-    let proto_str = raw
-        .proto
-        .as_deref()
-        .or(raw.protocol.as_deref())
-        .unwrap_or("tcp");
+    let proto_str = raw.proto.as_deref().unwrap_or("tcp");
     let protocol = ForwardProtocol::from_str(proto_str)?;
 
-    let external_port = raw
-        .external_port
-        .or(raw.ext_port)
-        .or(raw.port)
-        .ok_or_else(|| {
-            RouterError::Generic(
-                "Port forwarding rule is missing 'external_port' (or 'ext_port' / 'port')"
-                    .to_string(),
-            )
-        })?;
+    let external_port = raw.external_port.ok_or_else(|| {
+        RouterError::Generic("Port forwarding rule is missing 'external_port'".to_string())
+    })?;
     if external_port == 0 {
         return Err(RouterError::Generic(
             "Port forwarding 'external_port' must be between 1 and 65535 (cannot be 0)".to_string(),
         ));
     }
 
-    let ip_str = raw
-        .internal_ip
-        .as_deref()
-        .or(raw.int_ip.as_deref())
-        .or(raw.ip.as_deref())
-        .ok_or_else(|| {
-            RouterError::Generic(
-                "Port forwarding rule is missing 'internal_ip' (or 'int_ip' / 'ip')".to_string(),
-            )
-        })?;
-    let internal_ip: Ipv4Addr = ip_str.parse().map_err(|_| {
+    let ip_str = raw.internal_ip.as_deref().ok_or_else(|| {
+        RouterError::Generic("Port forwarding rule is missing 'internal_ip'".to_string())
+    })?;
+    let internal_ip = Ipv4Addr::from_str(ip_str.trim()).map_err(|e| {
         RouterError::Generic(format!(
-            "Port forwarding target IP '{}' must be a valid IPv4 address",
-            ip_str
+            "Port forwarding target IP '{}' must be a valid IPv4 address: {}",
+            ip_str, e
         ))
     })?;
+    validate_target_ip(internal_ip, lan_net, backup_net, "Port forwarding")?;
 
-    if !lan_net.contains(&internal_ip)
-        || internal_ip == lan_net.network()
-        || internal_ip == lan_net.broadcast()
-        || internal_ip == lan_net.addr()
-    {
-        return Err(RouterError::Generic(format!(
-            "Port forwarding target IP '{}' must be a valid host IP within LAN subnet '{}' and not the router's gateway IP",
-            internal_ip, lan_net
-        )));
-    }
-
-    let internal_port = raw.internal_port.or(raw.int_port).unwrap_or(external_port);
+    let internal_port = raw.internal_port.unwrap_or(external_port);
     if internal_port == 0 {
         return Err(RouterError::Generic(
             "Port forwarding 'internal_port' must be between 1 and 65535 (cannot be 0)".to_string(),
@@ -470,14 +527,15 @@ fn check_port_forward_conflicts(
 fn parse_port_forward_rules(
     config_toml: &ConfigToml,
     lan_net: &ipnet::Ipv4Net,
+    backup_net: &ipnet::Ipv4Net,
 ) -> Result<Vec<PortForwardRule>, RouterError> {
     let mut rules = Vec::new();
     let mut bound_tcp_ports = HashSet::new();
     let mut bound_udp_ports = HashSet::new();
 
-    let raw_rules = collect_raw_port_forward_rules(config_toml);
+    let raw_rules = config_toml.port_forwarding.as_deref().unwrap_or_default();
     for raw in raw_rules {
-        let rule = validate_and_build_port_forward_rule(raw, lan_net)?;
+        let rule = validate_and_build_port_forward_rule(raw, lan_net, backup_net)?;
         check_port_forward_conflicts(&rule, &mut bound_tcp_ports, &mut bound_udp_ports)?;
         rules.push(rule);
     }
@@ -503,31 +561,10 @@ impl RouterConfig {
 
         let (wan_mac, lan_mac) = parse_mac_addresses(&parsed.network)?;
         let dns_servers = parse_dns_servers(&parsed.network, parsed.dns.as_ref())?;
-        let lan_ip = parsed
-            .network
-            .lan_ip
-            .as_deref()
-            .unwrap_or("192.168.1.1/24")
-            .to_string();
-        let backup_lan_ip = parsed
-            .network
-            .backup_lan_ip
-            .as_deref()
-            .unwrap_or("10.0.0.1/24")
-            .to_string();
+        let (lan_net, backup_net, lan_ip, backup_lan_ip) = parse_lan_subnets(parsed.lan.as_ref())?;
 
-        let lan_net = validate_lan_subnet("lan_ip", &lan_ip)?;
-        let backup_net = validate_lan_subnet("backup_lan_ip", &backup_lan_ip)?;
-
-        if lan_net.contains(&backup_net.network()) || backup_net.contains(&lan_net.network()) {
-            return Err(RouterError::Generic(format!(
-                "lan_ip ({}) and backup_lan_ip ({}) must not overlap with each other",
-                lan_ip, backup_lan_ip
-            )));
-        }
-
-        let static_leases = parse_dhcp_reservations(parsed.dhcp.as_ref(), &lan_net)?;
-        let port_forwards = parse_port_forward_rules(&parsed, &lan_net)?;
+        let static_leases = parse_dhcp_reservations(parsed.dhcp.as_ref(), &lan_net, &backup_net)?;
+        let port_forwards = parse_port_forward_rules(&parsed, &lan_net, &backup_net)?;
         let logging = parse_logging_config(parsed.logging.as_ref())?;
         let watchdog = parsed
             .system
@@ -578,7 +615,6 @@ mod tests {
         sys.config_content = r#"
             [network]
             wan_mac = "52:54:00:12:34:56"
-            backup_lan_ip = "10.0.0.1/24"
         "#
         .to_string();
         let res = RouterConfig::parse(&sys);
@@ -591,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_parsing_missing_backup_lan_ip() {
+    fn test_config_parsing_defaults() {
         let mut sys = MockSystem::new();
         sys.config_content = r#"
             [network]
@@ -605,14 +641,17 @@ mod tests {
     }
 
     #[test]
-    fn test_config_parsing_with_mac() {
+    fn test_config_parsing_with_lan_section() {
         let mut sys = MockSystem::new();
         sys.config_content = r#"
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "10.0.0.1/24"
-            backup_lan_ip = "172.16.0.1/24"
+
+            [lan]
+            primary_network = "10.0.0.0"
+            fallback_network = "172.16.0.0"
+            prefix_length = 24
         "#
         .to_string();
 
@@ -627,23 +666,6 @@ mod tests {
             config.lan_mac,
             MacAddr::from_str("52:54:00:12:34:57").unwrap()
         );
-    }
-
-    #[test]
-    fn test_config_parsing_with_backup_lan_ip() {
-        let mut sys = MockSystem::new();
-        sys.config_content = r#"
-            [network]
-            wan_mac = "52:54:00:12:34:56"
-            lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
-            backup_lan_ip = "172.16.0.1/24"
-        "#
-        .to_string();
-
-        let config = RouterConfig::parse(&sys).unwrap();
-        assert_eq!(config.lan_ip, "192.168.1.1/24");
-        assert_eq!(config.backup_lan_ip, "172.16.0.1/24");
     }
 
     #[test]
@@ -711,13 +733,15 @@ mod tests {
     }
 
     #[test]
-    fn test_config_parsing_invalid_cidr_rejected() {
+    fn test_config_parsing_invalid_primary_network_rejected() {
         let mut sys = MockSystem::new();
         sys.config_content = r#"
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/invalid"
+
+            [lan]
+            primary_network = "invalid_ip"
         "#
         .to_string();
         assert!(RouterConfig::parse(&sys).is_err());
@@ -730,7 +754,9 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/32"
+
+            [lan]
+            prefix_length = 32
         "#
         .to_string();
         let res = RouterConfig::parse(&sys);
@@ -749,22 +775,23 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.0/24"
+
+            [lan]
+            primary_network = "192.168.1.0"
+            prefix_length = 24
         "#
         .to_string();
-        let res = RouterConfig::parse(&sys);
-        assert!(res.is_err());
-        assert!(
-            res.unwrap_err()
-                .to_string()
-                .contains("cannot use the network address")
-        );
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg.lan_ip, "192.168.1.1/24");
 
         sys.config_content = r#"
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.255/24"
+
+            [lan]
+            primary_network = "192.168.1.255"
+            prefix_length = 24
         "#
         .to_string();
         let res2 = RouterConfig::parse(&sys);
@@ -783,8 +810,11 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
-            backup_lan_ip = "192.168.1.100/24"
+
+            [lan]
+            primary_network = "192.168.1.0"
+            fallback_network = "192.168.1.0"
+            prefix_length = 24
         "#
         .to_string();
         let res = RouterConfig::parse(&sys);
@@ -799,7 +829,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            backup_lan_ip = "10.0.0.1/24"
             [system]
             watchdog = false
         "#
@@ -1011,7 +1040,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
             [[dhcp.reservations]]
             mac = "52:54:00:12:34:58"
@@ -1043,7 +1071,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
             [[dhcp.reservations]]
             mac = "52:54:00:12:34:58"
@@ -1060,7 +1087,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
             [[dhcp.reservations]]
             mac = "52:54:00:12:34:58"
@@ -1077,7 +1103,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
             [[dhcp.reservations]]
             mac = "52:54:00:12:34:58"
@@ -1098,7 +1123,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
             [[dhcp.reservations]]
             mac = "52:54:00:12:34:58"
@@ -1119,7 +1143,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
             [[port_forwarding]]
             proto = "tcp"
@@ -1165,12 +1188,11 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
-            [[port_forwards]]
+            [[port_forwarding]]
             proto = "both"
-            ext_port = 2222
-            int_ip = "192.168.1.100"
+            external_port = 2222
+            internal_ip = "192.168.1.100"
         "#
         .to_string();
         let cfg = RouterConfig::parse(&sys).unwrap();
@@ -1225,7 +1247,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
             [[port_forwarding]]
             proto = "tcp"
@@ -1243,7 +1264,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
             [[port_forwarding]]
             proto = "tcp"
@@ -1266,7 +1286,6 @@ mod tests {
             [network]
             wan_mac = "52:54:00:12:34:56"
             lan_mac = "52:54:00:12:34:57"
-            lan_ip = "192.168.1.1/24"
 
             [[port_forwarding]]
             proto = "udp"
@@ -1281,5 +1300,207 @@ mod tests {
                 .to_string()
                 .contains("conflicts with WAN DHCP client")
         );
+    }
+
+    #[test]
+    fn test_config_parsing_lan_section_with_primary_fallback_and_prefix_length() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [lan]
+            primary_network = "192.168.1.0"
+            fallback_network = "10.0.0.0"
+            prefix_length = 24
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg.lan_ip, "192.168.1.1/24");
+        assert_eq!(cfg.backup_lan_ip, "10.0.0.1/24");
+    }
+
+    #[test]
+    fn test_config_parsing_lan_section_with_dhcp_and_port_forward() {
+        let mut sys = MockSystem::new();
+        let client_mac = MacAddr::new(0x52, 0x54, 0x00, 0x12, 0x34, 0x58);
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [lan]
+            primary_network = "192.168.1.0"
+            fallback_network = "10.0.0.0"
+            prefix_length = 24
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.50"
+
+            [[port_forwarding]]
+            proto = "tcp"
+            external_port = 8080
+            internal_ip = "192.168.1.50"
+            internal_port = 80
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(
+            cfg.static_leases.get(&client_mac),
+            Some(&Ipv4Addr::new(192, 168, 1, 50))
+        );
+        assert_eq!(cfg.port_forwards.len(), 1);
+        assert_eq!(
+            cfg.port_forwards[0].internal_ip,
+            Ipv4Addr::new(192, 168, 1, 50)
+        );
+        assert_eq!(cfg.port_forwards[0].external_port, 8080);
+        assert_eq!(cfg.port_forwards[0].internal_port, 80);
+    }
+
+    #[test]
+    fn test_config_parsing_reservation_overflows_fallback_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [lan]
+            prefix_length = 28
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.50"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("must be a valid host IP within LAN subnet")
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_port_forward_overflows_fallback_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [lan]
+            prefix_length = 28
+
+            [[port_forwarding]]
+            proto = "tcp"
+            external_port = 8080
+            internal_ip = "192.168.1.50"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("must be a valid host IP within LAN subnet")
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_missing_internal_ip_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [[port_forwarding]]
+            proto = "tcp"
+            external_port = 8080
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Port forwarding rule is missing 'internal_ip'")
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_missing_external_port_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [[port_forwarding]]
+            proto = "tcp"
+            internal_ip = "192.168.1.50"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Port forwarding rule is missing 'external_port'")
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_missing_reservation_ip_rejected() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("is missing 'ip'"));
+    }
+
+    #[test]
+    fn test_config_parsing_lan_prefix_length_bounds() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [lan]
+            primary_network = "10.0.0.0"
+            fallback_network = "172.16.0.0"
+            prefix_length = 8
+        "#
+        .to_string();
+        let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg.lan_ip, "10.0.0.1/8");
+
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [lan]
+            primary_network = "192.168.1.0"
+            fallback_network = "10.0.0.0"
+            prefix_length = 30
+        "#
+        .to_string();
+        let cfg2 = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg2.lan_ip, "192.168.1.1/30");
     }
 }

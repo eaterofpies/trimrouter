@@ -1,3 +1,5 @@
+use crate::config::PortForwardRule;
+use crate::init::firewall;
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::network;
 use crate::services::ipc::LocalHostSender;
@@ -21,6 +23,7 @@ const LAN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 pub struct LanManager {
     lan_interface: String,
+    wan_interface: String,
     initial_ip: String,
     backup_ip: String,
     lease_rx: WanLeaseReceiver,
@@ -28,20 +31,25 @@ pub struct LanManager {
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
     static_leases: HashMap<MacAddr, Ipv4Addr>,
+    port_forwards: Vec<PortForwardRule>,
 }
 
 impl LanManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         lan_interface: String,
+        wan_interface: String,
         initial_ip: String,
         backup_ip: String,
         lease_rx: WanLeaseReceiver,
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_tx: Option<LocalHostSender>,
         static_leases: HashMap<MacAddr, Ipv4Addr>,
+        port_forwards: Vec<PortForwardRule>,
     ) -> Self {
         Self {
             lan_interface,
+            wan_interface,
             initial_ip,
             backup_ip,
             lease_rx,
@@ -49,6 +57,7 @@ impl LanManager {
             heartbeat_tx,
             local_hosts_tx,
             static_leases,
+            port_forwards,
         }
     }
 }
@@ -57,12 +66,14 @@ impl Service for LanManager {
     async fn start(&mut self) -> Result<(), ServiceError> {
         let mut runner = LanRunner::new(
             self.lan_interface.clone(),
+            self.wan_interface.clone(),
             self.initial_ip.clone(),
             self.backup_ip.clone(),
             self.lease_rx.clone(),
             self.heartbeat_tx.clone(),
             self.local_hosts_tx.clone(),
             self.static_leases.clone(),
+            self.port_forwards.clone(),
         );
 
         self.controller.start(|shutdown_rx| async move {
@@ -77,24 +88,30 @@ impl Service for LanManager {
 
 struct LanRunner {
     lan_interface: String,
+    wan_interface: String,
+    initial_ip: String,
     current_ip: String,
     backup_ip: String,
     lease_rx: WanLeaseReceiver,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
     static_leases: HashMap<MacAddr, Ipv4Addr>,
+    port_forwards: Vec<PortForwardRule>,
     dhcp_server: DhcpServer,
 }
 
 impl LanRunner {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         lan_interface: String,
+        wan_interface: String,
         initial_ip: String,
         backup_ip: String,
         lease_rx: WanLeaseReceiver,
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_tx: Option<LocalHostSender>,
         static_leases: HashMap<MacAddr, Ipv4Addr>,
+        port_forwards: Vec<PortForwardRule>,
     ) -> Self {
         let dhcp_server = DhcpServer::new(
             lan_interface.clone(),
@@ -105,12 +122,15 @@ impl LanRunner {
         );
         Self {
             lan_interface,
+            wan_interface,
+            initial_ip: initial_ip.clone(),
             current_ip: initial_ip,
             backup_ip,
             lease_rx,
             heartbeat_tx,
             local_hosts_tx,
             static_leases,
+            port_forwards,
             dhcp_server,
         }
     }
@@ -189,6 +209,18 @@ impl LanRunner {
             error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
         }
 
+        self.reconfigure_lan_interface_ip(&new_ip).await;
+        self.current_ip = new_ip.clone();
+        self.notify_router_dns_host(&new_ip);
+
+        let (remapped_leases, remapped_forwards) = self.compute_remapped_rules(&new_ip);
+        self.update_firewall_for_subnet(&remapped_forwards);
+        self.restart_dhcp_server_on_subnet(remapped_leases).await;
+
+        info!("[lan-manager] LAN subnet shifted successfully.");
+    }
+
+    async fn reconfigure_lan_interface_ip(&self, new_ip: &str) {
         if let Some(index) = network::get_interface_index(&self.lan_interface).await {
             debug!(
                 "[lan-manager] Cleaning up IP addresses on interface {}...",
@@ -208,13 +240,12 @@ impl LanRunner {
             "[lan-manager] Reconfiguring interface {} with new subnet {}...",
             self.lan_interface, new_ip
         );
-        if let Err(e) = network::configure_interface_ip(&self.lan_interface, &new_ip).await {
+        if let Err(e) = network::configure_interface_ip(&self.lan_interface, new_ip).await {
             error!("[lan-manager] Failed to reconfigure LAN IP: {}", e);
-            return;
         }
+    }
 
-        self.current_ip = new_ip.clone();
-
+    fn notify_router_dns_host(&self, new_ip: &str) {
         if let Some(ref tx) = self.local_hosts_tx
             && let Ok(new_net) = new_ip.parse::<Ipv4Net>()
         {
@@ -223,20 +254,53 @@ impl LanRunner {
                 ip: new_net.addr(),
             });
         }
+    }
 
+    fn compute_remapped_rules(
+        &self,
+        new_ip: &str,
+    ) -> (HashMap<MacAddr, Ipv4Addr>, Vec<PortForwardRule>) {
+        let Ok(primary_net) = self.initial_ip.parse::<Ipv4Net>() else {
+            error!("[lan-manager] Invalid initial IP: {}", self.initial_ip);
+            return (self.static_leases.clone(), self.port_forwards.clone());
+        };
+        let Ok(target_net) = new_ip.parse::<Ipv4Net>() else {
+            error!("[lan-manager] Invalid target IP: {}", new_ip);
+            return (self.static_leases.clone(), self.port_forwards.clone());
+        };
+
+        let remapped_leases =
+            remap_static_leases_for_subnet(&self.static_leases, &primary_net, &target_net);
+        let remapped_forwards =
+            remap_port_forwards_for_subnet(&self.port_forwards, &primary_net, &target_net);
+        (remapped_leases, remapped_forwards)
+    }
+
+    fn update_firewall_for_subnet(&self, remapped_forwards: &[PortForwardRule]) {
+        if let Err(e) = firewall::configure_firewall(
+            &self.wan_interface,
+            &self.lan_interface,
+            remapped_forwards,
+        ) {
+            error!(
+                "[lan-manager] Failed to update firewall rules for fallback subnet: {}",
+                e
+            );
+        }
+    }
+
+    async fn restart_dhcp_server_on_subnet(&mut self, remapped_leases: HashMap<MacAddr, Ipv4Addr>) {
         info!("[lan-manager] Restarting LAN DHCP server on new subnet...");
         self.dhcp_server = DhcpServer::new(
             self.lan_interface.clone(),
             self.current_ip.clone(),
             self.heartbeat_tx.clone(),
             self.local_hosts_tx.clone(),
-            self.static_leases.clone(),
+            remapped_leases,
         );
         if let Err(e) = self.dhcp_server.start().await {
             error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
         }
-
-        info!("[lan-manager] LAN subnet shifted successfully.");
     }
 
     /// Checks for IP subnet collisions between the active WAN lease and current LAN subnet.
@@ -328,9 +392,84 @@ fn is_subnet_overlap(net1: &Ipv4Net, net2: &Ipv4Net) -> bool {
     net1.contains(&net2.network()) || net2.contains(&net1.network())
 }
 
+/// Translates an IPv4 address from `from_net` to `to_net` by preserving the host offset from the network base address.
+///
+/// Returns `Some(mapped_ip)` if `mapped_ip` is within `to_net`, is not the gateway (`to_net.addr()`),
+/// and is not the broadcast address (`to_net.broadcast()`).
+/// Returns `None` otherwise.
+pub fn translate_ip_to_subnet(
+    ip: Ipv4Addr,
+    from_net: &Ipv4Net,
+    to_net: &Ipv4Net,
+) -> Option<Ipv4Addr> {
+    if !from_net.contains(&ip) {
+        return None;
+    }
+    let from_base = u32::from(from_net.network());
+    let ip_u32 = u32::from(ip);
+    let offset = ip_u32.checked_sub(from_base)?;
+    let to_base = u32::from(to_net.network());
+    let mapped_u32 = to_base.checked_add(offset)?;
+    let mapped_ip = Ipv4Addr::from(mapped_u32);
+
+    if to_net.contains(&mapped_ip) && mapped_ip != to_net.addr() && mapped_ip != to_net.broadcast()
+    {
+        Some(mapped_ip)
+    } else {
+        None
+    }
+}
+
+pub fn remap_static_leases_for_subnet(
+    static_leases: &HashMap<MacAddr, Ipv4Addr>,
+    primary_net: &Ipv4Net,
+    target_net: &Ipv4Net,
+) -> HashMap<MacAddr, Ipv4Addr> {
+    if primary_net == target_net {
+        return static_leases.clone();
+    }
+    let mut remapped = HashMap::new();
+    for (&mac, &ip) in static_leases {
+        if let Some(mapped_ip) = translate_ip_to_subnet(ip, primary_net, target_net) {
+            remapped.insert(mac, mapped_ip);
+        } else {
+            warn!(
+                "[lan-manager] Static lease for MAC {} ({}) cannot be mapped to fallback subnet {}. Falling back to dynamic allocation.",
+                mac, ip, target_net
+            );
+        }
+    }
+    remapped
+}
+
+pub fn remap_port_forwards_for_subnet(
+    port_forwards: &[PortForwardRule],
+    primary_net: &Ipv4Net,
+    target_net: &Ipv4Net,
+) -> Vec<PortForwardRule> {
+    if primary_net == target_net {
+        return port_forwards.to_vec();
+    }
+    let mut remapped = Vec::new();
+    for rule in port_forwards {
+        if let Some(mapped_ip) = translate_ip_to_subnet(rule.internal_ip, primary_net, target_net) {
+            let mut new_rule = rule.clone();
+            new_rule.internal_ip = mapped_ip;
+            remapped.push(new_rule);
+        } else {
+            warn!(
+                "[lan-manager] Port forward {} (target {}) cannot be mapped to fallback subnet {}. Skipping rule.",
+                rule.external_port, rule.internal_ip, target_net
+            );
+        }
+    }
+    remapped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ForwardProtocol;
     use crate::services::utils::WanLease;
     use rtnetlink::packet_core::NetlinkPayload;
     use rtnetlink::packet_route::RouteNetlinkMessage;
@@ -346,12 +485,14 @@ mod tests {
     ) -> LanRunner {
         LanRunner::new(
             "lan".to_string(),
+            "wan".to_string(),
             current_ip.to_string(),
             backup_ip.to_string(),
             lease_rx,
             None,
             None,
             HashMap::new(),
+            Vec::new(),
         )
     }
 
@@ -517,12 +658,186 @@ mod tests {
         let (lh_tx, _lh_rx) = tokio::sync::mpsc::channel(1);
         let _mgr = LanManager::new(
             "lan".to_string(),
+            "wan".to_string(),
             "192.168.1.1/24".to_string(),
             "10.0.0.1/24".to_string(),
             lease_rx,
             Some(hb_tx),
             Some(lh_tx),
             HashMap::new(),
+            Vec::new(),
         );
+    }
+
+    #[test]
+    fn test_translate_ip_to_subnet_valid() {
+        let from_net: Ipv4Net = "192.168.1.1/24".parse().unwrap();
+        let to_net: Ipv4Net = "10.0.0.1/24".parse().unwrap();
+
+        let mapped = translate_ip_to_subnet(Ipv4Addr::new(192, 168, 1, 50), &from_net, &to_net);
+        assert_eq!(mapped, Some(Ipv4Addr::new(10, 0, 0, 50)));
+
+        let mapped_high =
+            translate_ip_to_subnet(Ipv4Addr::new(192, 168, 1, 200), &from_net, &to_net);
+        assert_eq!(mapped_high, Some(Ipv4Addr::new(10, 0, 0, 200)));
+    }
+
+    #[test]
+    fn test_translate_ip_to_subnet_rejects_gateway_and_broadcast() {
+        let from_net: Ipv4Net = "192.168.1.1/24".parse().unwrap();
+        let to_net: Ipv4Net = "10.0.0.1/24".parse().unwrap();
+
+        // 192.168.1.1 maps to 10.0.0.1 (gateway), which should be rejected
+        assert_eq!(
+            translate_ip_to_subnet(Ipv4Addr::new(192, 168, 1, 1), &from_net, &to_net),
+            None
+        );
+
+        // 192.168.1.255 maps to 10.0.0.255 (broadcast), which should be rejected
+        assert_eq!(
+            translate_ip_to_subnet(Ipv4Addr::new(192, 168, 1, 255), &from_net, &to_net),
+            None
+        );
+
+        // Off-subnet IP should be rejected
+        assert_eq!(
+            translate_ip_to_subnet(Ipv4Addr::new(172, 16, 0, 1), &from_net, &to_net),
+            None
+        );
+    }
+
+    #[test]
+    fn test_translate_ip_to_subnet_narrower_subnet_overflow() {
+        let from_net: Ipv4Net = "192.168.1.1/24".parse().unwrap();
+        let to_net: Ipv4Net = "10.0.0.1/28".parse().unwrap(); // hosts .1 to .14
+
+        // Host .50 exceeds /28 range -> rejected
+        assert_eq!(
+            translate_ip_to_subnet(Ipv4Addr::new(192, 168, 1, 50), &from_net, &to_net),
+            None
+        );
+
+        // Host .5 is within /28 range -> accepted
+        assert_eq!(
+            translate_ip_to_subnet(Ipv4Addr::new(192, 168, 1, 5), &from_net, &to_net),
+            Some(Ipv4Addr::new(10, 0, 0, 5))
+        );
+    }
+
+    #[test]
+    fn test_remap_static_leases_and_port_forwards() {
+        let primary_net: Ipv4Net = "192.168.1.1/24".parse().unwrap();
+        let backup_net: Ipv4Net = "10.0.0.1/24".parse().unwrap();
+
+        let mac1 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let mac2 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x66);
+        let mut static_leases = HashMap::new();
+        static_leases.insert(mac1, Ipv4Addr::new(192, 168, 1, 50));
+        static_leases.insert(mac2, Ipv4Addr::new(192, 168, 1, 60));
+
+        let remapped_leases =
+            remap_static_leases_for_subnet(&static_leases, &primary_net, &backup_net);
+        assert_eq!(remapped_leases.len(), 2);
+        assert_eq!(
+            remapped_leases.get(&mac1),
+            Some(&Ipv4Addr::new(10, 0, 0, 50))
+        );
+        assert_eq!(
+            remapped_leases.get(&mac2),
+            Some(&Ipv4Addr::new(10, 0, 0, 60))
+        );
+
+        let port_forwards = vec![PortForwardRule {
+            protocol: ForwardProtocol::Tcp,
+            external_port: 8080,
+            internal_ip: Ipv4Addr::new(192, 168, 1, 50),
+            internal_port: 80,
+            description: Some("HTTP".to_string()),
+        }];
+
+        let remapped_forwards =
+            remap_port_forwards_for_subnet(&port_forwards, &primary_net, &backup_net);
+        assert_eq!(remapped_forwards.len(), 1);
+        assert_eq!(
+            remapped_forwards[0].internal_ip,
+            Ipv4Addr::new(10, 0, 0, 50)
+        );
+        assert_eq!(remapped_forwards[0].external_port, 8080);
+        assert_eq!(remapped_forwards[0].internal_port, 80);
+    }
+
+    #[test]
+    fn test_remap_static_leases_and_port_forwards_identical_subnets() {
+        let primary_net: Ipv4Net = "192.168.1.1/24".parse().unwrap();
+        let mac1 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let mut static_leases = HashMap::new();
+        static_leases.insert(mac1, Ipv4Addr::new(192, 168, 1, 50));
+
+        let remapped_leases =
+            remap_static_leases_for_subnet(&static_leases, &primary_net, &primary_net);
+        assert_eq!(remapped_leases.len(), 1);
+        assert_eq!(
+            remapped_leases.get(&mac1),
+            Some(&Ipv4Addr::new(192, 168, 1, 50))
+        );
+
+        let port_forwards = vec![PortForwardRule {
+            protocol: ForwardProtocol::Tcp,
+            external_port: 8080,
+            internal_ip: Ipv4Addr::new(192, 168, 1, 50),
+            internal_port: 80,
+            description: None,
+        }];
+        let remapped_forwards =
+            remap_port_forwards_for_subnet(&port_forwards, &primary_net, &primary_net);
+        assert_eq!(remapped_forwards.len(), 1);
+        assert_eq!(
+            remapped_forwards[0].internal_ip,
+            Ipv4Addr::new(192, 168, 1, 50)
+        );
+    }
+
+    #[test]
+    fn test_remap_static_leases_and_port_forwards_unmappable_skipped() {
+        let primary_net: Ipv4Net = "192.168.1.1/24".parse().unwrap();
+        let backup_net: Ipv4Net = "10.0.0.1/28".parse().unwrap(); // hosts .1 to .14
+
+        let mac1 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let mac2 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x66);
+        let mut static_leases = HashMap::new();
+        static_leases.insert(mac1, Ipv4Addr::new(192, 168, 1, 5)); // offset 5 -> valid
+        static_leases.insert(mac2, Ipv4Addr::new(192, 168, 1, 50)); // offset 50 -> out of /28 bounds
+
+        let remapped_leases =
+            remap_static_leases_for_subnet(&static_leases, &primary_net, &backup_net);
+        assert_eq!(remapped_leases.len(), 1);
+        assert_eq!(
+            remapped_leases.get(&mac1),
+            Some(&Ipv4Addr::new(10, 0, 0, 5))
+        );
+        assert_eq!(remapped_leases.get(&mac2), None);
+
+        let port_forwards = vec![
+            PortForwardRule {
+                protocol: ForwardProtocol::Tcp,
+                external_port: 8080,
+                internal_ip: Ipv4Addr::new(192, 168, 1, 5),
+                internal_port: 80,
+                description: None,
+            },
+            PortForwardRule {
+                protocol: ForwardProtocol::Tcp,
+                external_port: 9090,
+                internal_ip: Ipv4Addr::new(192, 168, 1, 50),
+                internal_port: 90,
+                description: None,
+            },
+        ];
+
+        let remapped_forwards =
+            remap_port_forwards_for_subnet(&port_forwards, &primary_net, &backup_net);
+        assert_eq!(remapped_forwards.len(), 1);
+        assert_eq!(remapped_forwards[0].external_port, 8080);
+        assert_eq!(remapped_forwards[0].internal_ip, Ipv4Addr::new(10, 0, 0, 5));
     }
 }

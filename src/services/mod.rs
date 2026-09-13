@@ -53,12 +53,14 @@ mod tests {
 
         let _lan_manager = LanManager::new(
             "lan".to_string(),
+            "wan".to_string(),
             "192.168.1.1/24".to_string(),
             "10.0.0.1/24".to_string(),
             lease_rx.clone(),
             Some(hb_tx),
             Some(lh_tx),
             std::collections::HashMap::new(),
+            Vec::new(),
         );
 
         let _sntp_client = SntpClient::new(lease_rx);

@@ -105,7 +105,7 @@ Writes `"1"` to `/proc/sys/net/ipv4/ip_forward` at startup.
 Creates an IPv4 table named `trimrouter` containing three chains:
 
 **`nat_prerouting`** — type `nat`, hook `prerouting`, priority `-100`, policy `accept`:
-- DNAT rules: matches inbound traffic on the WAN interface (`iif == wan`), protocol (`tcp`, `udp`), and destination port (`dport == external_port`), rewriting the destination IP to the target LAN host (`internal_ip`) and destination port (`internal_port`).
+- DNAT rules: matches inbound traffic on the WAN interface (`iif == wan`), protocol (`tcp`, `udp`), and destination port (`dport == external_port`), rewriting the destination IP to the target LAN host (`internal_ip`) and destination port (`internal_port`). When `LanManager` shifts to `backup_lan_ip`, DNAT target IPs are automatically remapped to the fallback subnet using host-offset translation and re-applied to the Netfilter table.
 
 **`nat_postrouting`** — type `nat`, hook `postrouting`, priority `100`, policy `accept`:
 - Masquerade rule: matches outbound traffic on the WAN interface (`oif`) and applies `masquerade`.
@@ -148,9 +148,12 @@ Settings are read from `/boot/config/trimrouter.toml` on the boot partition:
 [network]
 wan_mac = "52:54:00:12:34:56"   # Required — maps WAN interface, renames it to "wan"
 lan_mac = "52:54:00:12:34:57"   # Required — maps LAN interface, renames it to "lan"
-lan_ip = "192.168.1.1/24"       # Optional — defaults to "192.168.1.1/24"
-backup_lan_ip = "10.0.0.1/24"   # Optional — defaults to "10.0.0.1/24"
 dns_servers = ["1.1.1.1", "1.0.0.1"] # Optional — custom upstream DNS resolvers (overrides WAN DHCP DNS)
+
+[lan]
+primary_network = "192.168.1.0"      # Optional — base address for primary LAN (default: "192.168.1.0")
+fallback_network = "10.0.0.0"        # Optional — base address for WAN conflict fallback (default: "10.0.0.0")
+prefix_length = 24                   # Optional — shared prefix length (8-30, default: 24)
 
 [system]
 watchdog = true                 # Optional — enable /dev/watchdog hardware supervisor (default: true)
@@ -164,12 +167,12 @@ watchdog = true                 # Optional — enable /dev/watchdog hardware sup
 [[port_forwarding]]
 proto = "tcp"                   # Optional — "tcp", "udp", or "both" (default: "tcp")
 external_port = 8080            # Required — external WAN port (1-65535)
-internal_ip = "192.168.1.50"    # Required — destination LAN host IP within LAN subnet
+internal_ip = "192.168.1.50"    # Required — destination LAN host IP (auto-translated on fallback subnet)
 internal_port = 80              # Optional — destination port (defaults to external_port)
 description = "Web Server"      # Optional — human-readable description
 ```
 
-If `wan_mac` or `lan_mac` is missing, invalid (e.g. zero, broadcast, multicast, or identical MACs), if `lan_ip`/`backup_lan_ip` are invalid CIDRs (or overlap with each other), if `dns_servers` contains invalid IP addresses, if port forwarding targets are invalid or conflict, or if the configuration file cannot be read, PID 1 prints a descriptive configuration error and halts.
+If `wan_mac` or `lan_mac` is missing, invalid (e.g. zero, broadcast, multicast, or identical MACs), if `primary_network`/`fallback_network` overlap or have invalid prefix lengths, if `dns_servers` contains invalid IP addresses, if static leases or port forwarding targets are invalid or conflict with primary/fallback subnets, or if the configuration file cannot be read, PID 1 prints a descriptive configuration error and halts.
 
 ---
 

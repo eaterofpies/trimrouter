@@ -110,7 +110,8 @@ The `LanManager` service manages the LAN interface configuration and encapsulate
 2.  **Child DHCP Server Teardown**: The child DHCP Server service is stopped and its active tasks are terminated.
 3.  **Address Cleanup**: The active IPv4 address configurations on the LAN interface are deleted/flushed to ensure clean reinitialization. The interface state (UP/DOWN link state) is left untouched.
 4.  **Reconfiguration**: If the `backup_lan_ip` does not also collide with the WAN subnet, the LAN interface is configured with the backup IP address specified by `backup_lan_ip` (e.g. `10.0.0.1/24`).
-5.  **Child DHCP Server Restart**: The child DHCP Server is re-instantiated with the new LAN IP/subnet range and restarted. The active lease table is cleared, forcing existing clients to re-negotiate leases within the updated range (e.g. `10.0.0.2` to `10.0.0.254`).
+5.  **Static Lease & Port Forward Host-Offset Remapping**: The `LanManager` computes the host offset of each static lease reservation and port forwarding rule relative to the primary network base address ($\text{offset} = \text{target\_ip} - \text{primary\_base}$) and translates them to the fallback subnet ($\text{fallback\_ip} = \text{backup\_base} + \text{offset}$). Netfilter DNAT rules are dynamically reconfigured, and any reservation that cannot be cleanly mapped (e.g. out of range or gateway collision) falls back to dynamic DHCP allocation.
+6.  **Child DHCP Server Restart**: The child DHCP Server is re-instantiated with the new LAN IP/subnet range and remapped static reservations, then restarted. The active dynamic lease table is cleared, forcing existing clients to re-negotiate leases within the updated range (e.g. `10.0.0.2` to `10.0.0.254`).
 
 ---
 
@@ -131,10 +132,11 @@ mac = "52:54:00:12:34:59"
 ip = "192.168.1.60"
 ```
 
-### 7.2 Validation Rules
+### 7.2 Validation & Fallback Subnet Translation Rules
 1. **Unicast MAC**: The MAC address must be a valid, non-zero, non-multicast unicast MAC address.
-2. **Subnet Scope**: The reserved IP must be a valid IPv4 host address within the configured `lan_ip` subnet and must not match the router's own gateway IP, network address, or broadcast address.
+2. **Subnet Scope**: The reserved IP must be a valid IPv4 host address within the configured primary LAN subnet and fallback subnet (via host-offset translation), and must not match the router's gateway IP, network address, or broadcast address on either subnet.
 3. **No Duplicates**: Each reservation must specify a unique MAC address and a unique IP address.
+4. **Subnet Migration**: When migrating to the fallback subnet upon WAN conflict detection, the DHCP server dynamically translates reservation IPs to the fallback subnet by preserving the host offset from the network base address.
 
 ### 7.3 Allocation & Dynamic Pool Isolation
 1. **Reserved Client Allocation**: When a client whose MAC matches a reservation sends `DHCPDISCOVER`, the server immediately offers its assigned static IP address.
