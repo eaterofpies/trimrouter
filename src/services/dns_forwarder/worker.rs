@@ -8,6 +8,7 @@ use crate::services::utils::{
 use hickory_proto::op::{Message, OpCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::A, rdata::PTR};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
+
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::io::Error as IoError;
@@ -997,6 +998,7 @@ fn build_authoritative_nxdomain_response(query_msg: &Message) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::services::utils::is_valid_upstream_resolver;
+    use hickory_proto::rr::rdata::SOA;
 
     #[test]
     fn test_get_cache_key_valid() {
@@ -1247,11 +1249,6 @@ mod tests {
 
     #[test]
     fn test_insert_cache_nxdomain_rfc2308_with_soa() {
-        use hickory_proto::rr::Name;
-        use hickory_proto::rr::Record;
-        use hickory_proto::rr::rdata::SOA;
-        use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-
         let mut msg = Message::new(
             1234,
             hickory_proto::op::MessageType::Response,
@@ -1670,9 +1667,8 @@ mod tests {
 
     #[test]
     fn test_calculate_cache_ttl_and_negative_ttl_bounds() {
-        use hickory_proto::rr::rdata::SOA;
-
         // Truncated packet returns None
+
         let mut msg_tc = Message::new(100, hickory_proto::op::MessageType::Response, OpCode::Query);
         msg_tc.metadata.truncation = true;
         assert_eq!(calculate_cache_ttl(&msg_tc), None);
@@ -2698,9 +2694,8 @@ mod tests {
 
     #[test]
     fn test_negative_caching_soa_clamping_bounds() {
-        use hickory_proto::rr::rdata::SOA;
-
         let mut msg_low = Message::new(1, hickory_proto::op::MessageType::Response, OpCode::Query);
+
         msg_low.metadata.response_code = hickory_proto::op::ResponseCode::NXDomain;
         let soa_low = SOA::new(
             Name::from_ascii("ns.test.").unwrap(),
