@@ -14,7 +14,7 @@ FROM rust:${RUST_VERSION} AS builder
 ARG ARCH="x86_64"
 
 # renovate: datasource=repology depName=debian_13/linux
-ARG KERNEL_PACKAGE_VERSION="6.12.94-1"
+ARG KERNEL_PACKAGE_VERSION="6.12.107-1"
 
 # Accept Git commit SHA and build metadata via build arguments
 ARG VERGEN_GIT_SHA="unknown"
