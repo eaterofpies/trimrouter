@@ -22,7 +22,7 @@
         "(^|/)Dockerfile$"
       ],
       "matchStrings": [
-        "#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+?)\\s+depName=(?<depName>[^\\s]+?)(?:\\s+versioning=(?<versioning>[a-z-]+?))?\\nARG\\s+[A-Z_]+=\"(?<currentValue>[^\"]+)\""
+        "#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+?)\\s+depName=(?<depName>[^\\s]+?)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+?))?(?:\\s+versioning=(?<versioning>[a-z-]+?))?\\nARG\\s+[A-Z_]+=\"(?<currentValue>[^\"]+)\""
       ],
       "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}"
     }
