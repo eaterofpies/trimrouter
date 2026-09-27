@@ -1,15 +1,12 @@
 # syntax=docker/dockerfile:1
 
-# renovate: datasource=docker depName=rust
-ARG RUST_VERSION="1.98.1"
-
 # Target architecture: x86_64, arm64, or armhf
 ARG ARCH="x86_64"
 
 # =========================================================================
 # Stage 1: Build & Test Environment (pinned base image & kernel package)
 # =========================================================================
-FROM rust:${RUST_VERSION} AS builder
+FROM rust:1.98.1-slim-trixie AS builder
 
 ARG ARCH="x86_64"
 
