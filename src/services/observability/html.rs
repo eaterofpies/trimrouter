@@ -28,15 +28,21 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     .status-pill.online { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
     .status-pill.warn { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.25rem; margin-bottom: 1.5rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.25rem; margin-bottom: 1.5rem; }
     .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 0.75rem; padding: 1.25rem; }
     .card-title { font-size: 0.875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 0.75rem; display: flex; justify-content: space-between; align-items: center; }
-    .stat-val { font-size: 1.5rem; font-weight: 700; color: var(--text-main); margin-bottom: 0.25rem; }
-    .stat-sub { font-size: 0.8rem; color: var(--text-muted); }
-    .key-value { display: flex; flex-direction: column; gap: 0.5rem; }
-    .kv-row { display: flex; justify-content: space-between; font-size: 0.85rem; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 0.35rem; }
+    .key-value { display: flex; flex-direction: column; gap: 0.45rem; }
+    .kv-row { display: flex; justify-content: space-between; font-size: 0.85rem; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 0.3rem; }
     .kv-key { color: var(--text-muted); }
     .kv-val { font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .chart-box { margin-top: 0.75rem; background: var(--terminal-bg); border: 1px solid var(--card-border); border-radius: 0.5rem; padding: 0.6rem; }
+    .chart-head { display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.35rem; }
+    .chart-legend { display: inline-flex; align-items: center; gap: 0.75rem; }
+    .legend-item { display: inline-flex; align-items: center; gap: 0.3rem; }
+    .legend-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+    .rx-color { background-color: #38bdf8; }
+    .tx-color { background-color: #f59e0b; }
+    .bandwidth-canvas { width: 100%; height: 70px; display: block; }
     table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
     th { text-align: left; padding: 0.6rem 0.75rem; color: var(--text-muted); font-weight: 600; border-bottom: 1px solid var(--card-border); }
     td { padding: 0.6rem 0.75rem; border-bottom: 1px solid rgba(255,255,255,0.05); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.85rem; }
@@ -76,30 +82,59 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="key-value">
         <div class="kv-row"><span class="kv-key">Uptime</span><span class="kv-val" id="sys-uptime">--</span></div>
         <div class="kv-row"><span class="kv-key">Load Average</span><span class="kv-val" id="sys-load">--</span></div>
-        <div class="kv-row"><span class="kv-key">Memory Used</span><span class="kv-val" id="sys-mem">--</span></div>
-        <div class="kv-row"><span class="kv-key">Memory Total</span><span class="kv-val" id="sys-mem-total">--</span></div>
+        <div class="kv-row"><span class="kv-key">Total RAM</span><span class="kv-val" id="sys-mem-total">--</span></div>
+        <div class="kv-row"><span class="kv-key">Used RAM</span><span class="kv-val" id="sys-mem-used">--</span></div>
+        <div class="kv-row"><span class="kv-key">Free RAM</span><span class="kv-val" id="sys-mem-free">--</span></div>
+        <div class="kv-row"><span class="kv-key">Log Storage (SD)</span><span class="kv-val" id="sys-storage">--</span></div>
       </div>
     </div>
 
     <!-- WAN Interface -->
     <div class="card">
-      <div class="card-title">WAN Interface (<span id="wan-iface">wan</span>)</div>
+      <div class="card-title">
+        <span>WAN Interface (<span id="wan-iface">wan</span>)</span>
+        <span id="wan-rate-badge" class="badge" style="font-size:0.7rem;">0 B/s</span>
+      </div>
       <div class="key-value">
+        <div class="kv-row"><span class="kv-key">MAC Address</span><span class="kv-val" id="wan-mac">--</span></div>
         <div class="kv-row"><span class="kv-key">IP Address</span><span class="kv-val" id="wan-ip">--</span></div>
         <div class="kv-row"><span class="kv-key">Gateway</span><span class="kv-val" id="wan-gw">--</span></div>
         <div class="kv-row"><span class="kv-key">DNS Servers</span><span class="kv-val" id="wan-dns">--</span></div>
-        <div class="kv-row"><span class="kv-key">RX / TX Traffic</span><span class="kv-val" id="wan-traffic">--</span></div>
+        <div class="kv-row"><span class="kv-key">Total RX / TX</span><span class="kv-val" id="wan-traffic">--</span></div>
+      </div>
+      <div class="chart-box">
+        <div class="chart-head">
+          <span>Live Bandwidth</span>
+          <div class="chart-legend">
+            <span class="legend-item"><span class="legend-dot rx-color"></span> RX</span>
+            <span class="legend-item"><span class="legend-dot tx-color"></span> TX</span>
+          </div>
+        </div>
+        <canvas id="wan-chart" class="bandwidth-canvas" width="300" height="70"></canvas>
       </div>
     </div>
 
     <!-- LAN Interface -->
     <div class="card">
-      <div class="card-title">LAN Interface (<span id="lan-iface">lan</span>)</div>
+      <div class="card-title">
+        <span>LAN Interface (<span id="lan-iface">lan</span>)</span>
+        <span id="lan-rate-badge" class="badge" style="font-size:0.7rem;">0 B/s</span>
+      </div>
       <div class="key-value">
+        <div class="kv-row"><span class="kv-key">MAC Address</span><span class="kv-val" id="lan-mac">--</span></div>
         <div class="kv-row"><span class="kv-key">Gateway IP</span><span class="kv-val" id="lan-ip">--</span></div>
         <div class="kv-row"><span class="kv-key">Subnet Mode</span><span class="kv-val" id="lan-mode">primary</span></div>
-        <div class="kv-row"><span class="kv-key">MAC Address</span><span class="kv-val" id="lan-mac">--</span></div>
-        <div class="kv-row"><span class="kv-key">RX / TX Traffic</span><span class="kv-val" id="lan-traffic">--</span></div>
+        <div class="kv-row"><span class="kv-key">Total RX / TX</span><span class="kv-val" id="lan-traffic">--</span></div>
+      </div>
+      <div class="chart-box">
+        <div class="chart-head">
+          <span>Live Bandwidth</span>
+          <div class="chart-legend">
+            <span class="legend-item"><span class="legend-dot rx-color"></span> RX</span>
+            <span class="legend-item"><span class="legend-dot tx-color"></span> TX</span>
+          </div>
+        </div>
+        <canvas id="lan-chart" class="bandwidth-canvas" width="300" height="70"></canvas>
       </div>
     </div>
 
@@ -157,11 +192,15 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
   <script>
     function formatBytes(bytes) {
-      if (bytes === 0) return '0 B';
+      if (bytes === 0 || !bytes) return '0 B';
       const k = 1024;
       const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
       const i = Math.floor(Math.log(bytes) / Math.log(k));
       return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + sizes[i];
+    }
+
+    function formatRate(bytesPerSec) {
+      return formatBytes(bytesPerSec) + '/s';
     }
 
     function formatUptime(seconds) {
@@ -176,6 +215,89 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       return res;
     }
 
+    const wanHistory = [];
+    const lanHistory = [];
+    let prevWanTraffic = null;
+    let prevLanTraffic = null;
+    let prevTimestamp = null;
+    const MAX_POINTS = 30;
+
+    function drawBandwidthChart(canvasId, history) {
+      const canvas = document.getElementById(canvasId);
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      if (history.length < 2) return;
+
+      let maxVal = 1024; // At least 1 KB/s minimum ceiling
+      for (const pt of history) {
+        if (pt.rx > maxVal) maxVal = pt.rx;
+        if (pt.tx > maxVal) maxVal = pt.tx;
+      }
+
+      // Draw horizontal reference grid line
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, h * 0.5);
+      ctx.lineTo(w, h * 0.5);
+      ctx.stroke();
+
+      const step = w / (MAX_POINTS - 1);
+      const startX = (MAX_POINTS - history.length) * step;
+
+      // Draw RX Line and fill (Cyan)
+      ctx.strokeStyle = '#38bdf8';
+      ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(startX, h);
+      for (let i = 0; i < history.length; i++) {
+        const x = startX + i * step;
+        const y = h - (history[i].rx / maxVal) * (h - 6) - 3;
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(startX + (history.length - 1) * step, h);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.beginPath();
+      for (let i = 0; i < history.length; i++) {
+        const x = startX + i * step;
+        const y = h - (history[i].rx / maxVal) * (h - 6) - 3;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // Draw TX Line and fill (Amber)
+      ctx.strokeStyle = '#f59e0b';
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.15)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(startX, h);
+      for (let i = 0; i < history.length; i++) {
+        const x = startX + i * step;
+        const y = h - (history[i].tx / maxVal) * (h - 6) - 3;
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(startX + (history.length - 1) * step, h);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.beginPath();
+      for (let i = 0; i < history.length; i++) {
+        const x = startX + i * step;
+        const y = h - (history[i].tx / maxVal) * (h - 6) - 3;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
     async function fetchStatus() {
       try {
         const res = await fetch('/api/status');
@@ -186,21 +308,60 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         document.getElementById('sha-badge').textContent = 'git:' + data.system.git_sha.substring(0, 7);
         document.getElementById('sys-uptime').textContent = formatUptime(data.system.uptime_seconds);
         document.getElementById('sys-load').textContent = data.system.load_average.map(n => n.toFixed(2)).join(', ');
-        document.getElementById('sys-mem').textContent = formatBytes(data.system.memory.used_bytes);
-        document.getElementById('sys-mem-total').textContent = formatBytes(data.system.memory.total_bytes);
 
+        // Memory
+        document.getElementById('sys-mem-total').textContent = formatBytes(data.system.memory.total_bytes);
+        document.getElementById('sys-mem-used').textContent = formatBytes(data.system.memory.used_bytes);
+        document.getElementById('sys-mem-free').textContent = formatBytes(data.system.memory.free_bytes);
+
+        // SD Storage
+        if (data.system.storage && data.system.storage.total_bytes > 0) {
+          document.getElementById('sys-storage').textContent = formatBytes(data.system.storage.free_bytes) + ' free / ' + formatBytes(data.system.storage.total_bytes);
+        } else {
+          document.getElementById('sys-storage').textContent = '--';
+        }
+
+        // WAN
         document.getElementById('wan-iface').textContent = data.network.wan.interface;
+        document.getElementById('wan-mac').textContent = data.network.wan.mac;
         document.getElementById('wan-ip').textContent = (data.network.wan.ip || 'No Lease') + (data.network.wan.prefix_len ? '/' + data.network.wan.prefix_len : '');
         document.getElementById('wan-gw').textContent = data.network.wan.gateway || '--';
         document.getElementById('wan-dns').textContent = data.network.wan.dns_servers.join(', ') || '--';
         document.getElementById('wan-traffic').textContent = formatBytes(data.network.wan.rx_bytes) + ' / ' + formatBytes(data.network.wan.tx_bytes);
 
+        // LAN
         document.getElementById('lan-iface').textContent = data.network.lan.interface;
+        document.getElementById('lan-mac').textContent = data.network.lan.mac;
         document.getElementById('lan-ip').textContent = data.network.lan.ip + '/' + data.network.lan.prefix_len;
         document.getElementById('lan-mode').textContent = data.network.lan.mode;
-        document.getElementById('lan-mac').textContent = data.network.lan.mac;
         document.getElementById('lan-traffic').textContent = formatBytes(data.network.lan.rx_bytes) + ' / ' + formatBytes(data.network.lan.tx_bytes);
 
+        // Bandwidth calculation & graphing
+        const now = Date.now() / 1000;
+        if (prevTimestamp !== null && now > prevTimestamp && prevWanTraffic && prevLanTraffic) {
+          const dt = now - prevTimestamp;
+          const wanRxRate = Math.max(0, (data.network.wan.rx_bytes - prevWanTraffic.rx) / dt);
+          const wanTxRate = Math.max(0, (data.network.wan.tx_bytes - prevWanTraffic.tx) / dt);
+          wanHistory.push({ rx: wanRxRate, tx: wanTxRate });
+          if (wanHistory.length > MAX_POINTS) wanHistory.shift();
+
+          const lanRxRate = Math.max(0, (data.network.lan.rx_bytes - prevLanTraffic.rx) / dt);
+          const lanTxRate = Math.max(0, (data.network.lan.tx_bytes - prevLanTraffic.tx) / dt);
+          lanHistory.push({ rx: lanRxRate, tx: lanTxRate });
+          if (lanHistory.length > MAX_POINTS) lanHistory.shift();
+
+          document.getElementById('wan-rate-badge').textContent = '▼ ' + formatRate(wanRxRate) + '  ▲ ' + formatRate(wanTxRate);
+          document.getElementById('lan-rate-badge').textContent = '▼ ' + formatRate(lanRxRate) + '  ▲ ' + formatRate(lanTxRate);
+
+          drawBandwidthChart('wan-chart', wanHistory);
+          drawBandwidthChart('lan-chart', lanHistory);
+        }
+
+        prevWanTraffic = { rx: data.network.wan.rx_bytes, tx: data.network.wan.tx_bytes };
+        prevLanTraffic = { rx: data.network.lan.rx_bytes, tx: data.network.lan.tx_bytes };
+        prevTimestamp = now;
+
+        // Services
         document.getElementById('dns-queries').textContent = data.dns_forwarder.queries_total.toLocaleString();
         document.getElementById('dns-cache').textContent = (data.dns_forwarder.cache_hit_ratio * 100).toFixed(1) + '% (' + data.dns_forwarder.cached_entries_count + ' items)';
         document.getElementById('dhcp-count').textContent = data.dhcp_server.active_leases_count;
@@ -298,7 +459,7 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     }
 
     fetchStatus();
-    setInterval(fetchStatus, 3000);
+    setInterval(fetchStatus, 2000);
     initLogs();
   </script>
 </body>

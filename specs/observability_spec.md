@@ -64,8 +64,11 @@ All endpoints are served over standard HTTP on port `80` of the LAN gateway IP a
 * **Features**:
   * Visual status indicators for WAN link, LAN subnet, DNS forwarder, and SNTP synchronization.
   * Real-time active DHCP client table with hostnames, IP addresses, and lease expiry timers.
+  * Live responsive bandwidth sparkline charts and rate monitors (RX/TX) for both WAN and LAN interfaces.
+  * Hardware MAC address displays for both WAN and LAN interfaces.
+  * Transparent memory utilization metrics (Total RAM, Used RAM, Free / Available RAM) and SD card log partition space.
   * Live log terminal panel backed by `/api/logs/stream` with pause, auto-scroll, and level filtering (`INFO`, `WARN`, `ERROR`).
-  * Auto-refreshing system resource cards (uptime, CPU load, memory utilization, RX/TX traffic).
+  * Auto-refreshing system resource cards (uptime, CPU load, memory, storage, traffic).
 
 ---
 
@@ -81,8 +84,14 @@ All endpoints are served over standard HTTP on port `80` of the LAN gateway IP a
     "git_sha": "f56161b",
     "uptime_seconds": 86400,
     "memory": {
+      "total_bytes": 134217728,
       "used_bytes": 14680064,
-      "total_bytes": 134217728
+      "free_bytes": 119537664
+    },
+    "storage": {
+      "total_bytes": 104857600,
+      "used_bytes": 5242880,
+      "free_bytes": 99614720
     },
     "load_average": [0.05, 0.02, 0.00],
     "watchdog_active": true

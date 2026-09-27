@@ -2,6 +2,7 @@ use crate::services::ipc::{DhcpLeaseInfo, DnsStatsInfo};
 use crate::services::utils::{WanLease, mask_to_prefix_len};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::sync::{OnceLock, RwLock};
@@ -12,6 +13,8 @@ const PROC_UPTIME_PATH: &str = "/proc/uptime";
 const PROC_LOADAVG_PATH: &str = "/proc/loadavg";
 const PROC_MEMINFO_PATH: &str = "/proc/meminfo";
 const SYS_CLASS_NET_PATH: &str = "/sys/class/net";
+
+pub const LOG_PARTITION_PATH: &str = "/var/log";
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct StatusResponse {
@@ -28,14 +31,23 @@ pub struct SystemStatus {
     pub git_sha: String,
     pub uptime_seconds: u64,
     pub memory: MemoryStatus,
+    pub storage: StorageStatus,
     pub load_average: [f64; 3],
     pub watchdog_active: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MemoryStatus {
-    pub used_bytes: u64,
     pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StorageStatus {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -250,12 +262,47 @@ pub fn parse_meminfo_str(content: &str) -> MemoryStatus {
     };
 
     let total_bytes = total_kb.saturating_mul(1024);
-    let avail_bytes = effective_avail_kb.saturating_mul(1024);
-    let used_bytes = total_bytes.saturating_sub(avail_bytes);
+    let free_bytes = effective_avail_kb.saturating_mul(1024);
+    let used_bytes = total_bytes.saturating_sub(free_bytes);
 
     MemoryStatus {
-        used_bytes,
         total_bytes,
+        used_bytes,
+        free_bytes,
+    }
+}
+
+pub fn read_storage_stats(path: &str) -> StorageStatus {
+    let c_path = match CString::new(path) {
+        Ok(p) => p,
+        Err(_) => {
+            return StorageStatus {
+                total_bytes: 0,
+                used_bytes: 0,
+                free_bytes: 0,
+            };
+        }
+    };
+
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if res != 0 {
+        return StorageStatus {
+            total_bytes: 0,
+            used_bytes: 0,
+            free_bytes: 0,
+        };
+    }
+
+    let block_size = stat.f_frsize as u64;
+    let total_bytes = (stat.f_blocks as u64).saturating_mul(block_size);
+    let free_bytes = (stat.f_bavail as u64).saturating_mul(block_size);
+    let used_bytes = total_bytes.saturating_sub(free_bytes);
+
+    StorageStatus {
+        total_bytes,
+        used_bytes,
+        free_bytes,
     }
 }
 
@@ -305,12 +352,14 @@ pub fn collect_system_status(watchdog_active: bool) -> SystemStatus {
 
     let meminfo_str = fs::read_to_string(PROC_MEMINFO_PATH).unwrap_or_default();
     let memory = parse_meminfo_str(&meminfo_str);
+    let storage = read_storage_stats(LOG_PARTITION_PATH);
 
     SystemStatus {
         version,
         git_sha,
         uptime_seconds,
         memory,
+        storage,
         load_average,
         watchdog_active,
     }
@@ -506,6 +555,7 @@ Cached:            65536 kB
 "#;
         let mem = parse_meminfo_str(meminfo);
         assert_eq!(mem.total_bytes, 131072 * 1024);
+        assert_eq!(mem.free_bytes, 116736 * 1024);
         assert_eq!(mem.used_bytes, (131072 - 116736) * 1024);
     }
 
@@ -520,7 +570,20 @@ Cached:            65536 kB
         let mem = parse_meminfo_str(meminfo);
         assert_eq!(mem.total_bytes, 131072 * 1024);
         let avail = 10240 + 4096 + 65536;
+        assert_eq!(mem.free_bytes, avail * 1024);
         assert_eq!(mem.used_bytes, (131072 - avail) * 1024);
+    }
+
+    #[test]
+    fn test_read_storage_stats_root_or_nonexistent() {
+        let storage = read_storage_stats("/");
+        assert!(storage.total_bytes > 0);
+        assert!(storage.free_bytes > 0);
+
+        let invalid = read_storage_stats("/nonexistent_path_xyz_123");
+        assert_eq!(invalid.total_bytes, 0);
+        assert_eq!(invalid.used_bytes, 0);
+        assert_eq!(invalid.free_bytes, 0);
     }
 
     #[test]
@@ -562,5 +625,7 @@ Cached:            65536 kB
         assert!(json.contains("\"queries_total\": 100"));
         assert!(json.contains("\"workstation-1\""));
         assert!(json.contains("\"time.google.com\""));
+        assert!(json.contains("\"free_bytes\""));
+        assert!(json.contains("\"storage\""));
     }
 }
