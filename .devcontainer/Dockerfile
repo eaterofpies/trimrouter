@@ -1,4 +1,4 @@
-FROM rust:1.97.1-slim-trixie
+FROM rust:1.98.1-slim-trixie
 
 ARG USERNAME=vscode 
 ARG USER_UID=1000
