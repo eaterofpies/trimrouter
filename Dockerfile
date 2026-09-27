@@ -13,7 +13,7 @@ FROM rust:${RUST_VERSION} AS builder
 
 ARG ARCH="x86_64"
 
-# renovate: datasource=repology depName=debian_trixie/linux versioning=loose
+# renovate: datasource=deb depName=linux-image-amd64 registryUrl=https://deb.debian.org/debian?suite=trixie&components=main&binaryArch=amd64 versioning=deb
 ARG KERNEL_PACKAGE_VERSION="6.12.107-1"
 
 # Accept Git commit SHA and build metadata via build arguments
