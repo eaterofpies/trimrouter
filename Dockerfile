@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # renovate: datasource=docker depName=rust
-ARG RUST_VERSION="1.97.1-slim-trixie"
+ARG RUST_VERSION="1.98.1-slim-trixie"
 
 # Target architecture: x86_64, arm64, or armhf
 ARG ARCH="x86_64"
