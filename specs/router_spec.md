@@ -127,6 +127,7 @@ Creates an IPv4 table named `trimrouter` containing three chains:
 | DHCP Server (LAN) | [`dhcp_server_spec.md`](dhcp_server_spec.md) |
 | DNS Forwarder | [`dns_forwarder_spec.md`](dns_forwarder_spec.md) |
 | NTP Client (SNTP) | [`sntp_client_spec.md`](sntp_client_spec.md) |
+| Observability & Dashboard | [`observability_spec.md`](observability_spec.md) |
 | Interface Lifecycle | [`interface_spec.md`](interface_spec.md) |
 | Hardware Watchdog | [`watchdog_spec.md`](watchdog_spec.md) |
 
@@ -155,8 +156,12 @@ primary_network = "192.168.1.0"      # Optional — base address for primary LAN
 fallback_network = "10.0.0.0"        # Optional — base address for WAN conflict fallback (default: "10.0.0.0")
 prefix_length = 24                   # Optional — shared prefix length (8-30, default: 24)
 
+[logging]
+max_log_size_mb = 100                # Optional — maximum active log size before rotation (default: 100)
+level = "info"                       # Optional — log filter level (default: "info")
+
 [system]
-watchdog = true                 # Optional — enable /dev/watchdog hardware supervisor (default: true)
+watchdog = true                      # Optional — enable /dev/watchdog hardware supervisor (default: true)
 
 [dhcp]
 # Optional static DHCP lease reservations by MAC address
