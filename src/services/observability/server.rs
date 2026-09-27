@@ -38,10 +38,51 @@ pub struct AppState {
     pub sse_semaphore: Arc<Semaphore>,
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFilterParam {
+    Off,
+    Error,
+    #[serde(alias = "warning")]
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<LogFilterParam> for LevelFilter {
+    fn from(param: LogFilterParam) -> Self {
+        match param {
+            LogFilterParam::Off => LevelFilter::Off,
+            LogFilterParam::Error => LevelFilter::Error,
+            LogFilterParam::Warn => LevelFilter::Warn,
+            LogFilterParam::Info => LevelFilter::Info,
+            LogFilterParam::Debug => LevelFilter::Debug,
+            LogFilterParam::Trace => LevelFilter::Trace,
+        }
+    }
+}
+
+impl std::str::FromStr for LogFilterParam {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "error" => Ok(Self::Error),
+            "warn" | "warning" => Ok(Self::Warn),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub struct LogsQueryParams {
     pub lines: Option<usize>,
-    pub level: Option<String>,
+    pub level: Option<LogFilterParam>,
 }
 
 pub struct StreamPermitGuard<S> {
@@ -123,7 +164,7 @@ async fn handle_logs(Query(params): Query<LogsQueryParams>) -> Json<LogsResponse
         .lines
         .unwrap_or(DEFAULT_LOG_LINES_COUNT)
         .min(MAX_LOG_LINES_COUNT);
-    let level_filter = params.level.as_deref().and_then(parse_level_filter);
+    let level_filter = params.level.map(LevelFilter::from);
     let lines = get_recent_logs(lines_count, level_filter);
     let total_lines_available = get_ring_buffer_len();
 
@@ -164,18 +205,6 @@ async fn handle_logs_stream(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-pub fn parse_level_filter(val: &str) -> Option<LevelFilter> {
-    match val.to_ascii_lowercase().as_str() {
-        "error" => Some(LevelFilter::Error),
-        "warn" | "warning" => Some(LevelFilter::Warn),
-        "info" => Some(LevelFilter::Info),
-        "debug" => Some(LevelFilter::Debug),
-        "trace" => Some(LevelFilter::Trace),
-        "off" => Some(LevelFilter::Off),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,15 +214,25 @@ mod tests {
     use tokio::sync::watch;
 
     #[test]
-    fn test_parse_level_filter() {
-        assert_eq!(parse_level_filter("error"), Some(LevelFilter::Error));
-        assert_eq!(parse_level_filter("WARN"), Some(LevelFilter::Warn));
-        assert_eq!(parse_level_filter("warning"), Some(LevelFilter::Warn));
-        assert_eq!(parse_level_filter("info"), Some(LevelFilter::Info));
-        assert_eq!(parse_level_filter("debug"), Some(LevelFilter::Debug));
-        assert_eq!(parse_level_filter("trace"), Some(LevelFilter::Trace));
-        assert_eq!(parse_level_filter("off"), Some(LevelFilter::Off));
-        assert_eq!(parse_level_filter("invalid"), None);
+    fn test_log_filter_param_from_str_and_conversion() {
+        assert_eq!("error".parse::<LogFilterParam>(), Ok(LogFilterParam::Error));
+        assert_eq!("WARN".parse::<LogFilterParam>(), Ok(LogFilterParam::Warn));
+        assert_eq!(
+            "warning".parse::<LogFilterParam>(),
+            Ok(LogFilterParam::Warn)
+        );
+        assert_eq!("info".parse::<LogFilterParam>(), Ok(LogFilterParam::Info));
+        assert_eq!("debug".parse::<LogFilterParam>(), Ok(LogFilterParam::Debug));
+        assert_eq!("trace".parse::<LogFilterParam>(), Ok(LogFilterParam::Trace));
+        assert_eq!("off".parse::<LogFilterParam>(), Ok(LogFilterParam::Off));
+        assert!("invalid".parse::<LogFilterParam>().is_err());
+
+        assert_eq!(LevelFilter::from(LogFilterParam::Error), LevelFilter::Error);
+        assert_eq!(LevelFilter::from(LogFilterParam::Warn), LevelFilter::Warn);
+        assert_eq!(LevelFilter::from(LogFilterParam::Info), LevelFilter::Info);
+        assert_eq!(LevelFilter::from(LogFilterParam::Debug), LevelFilter::Debug);
+        assert_eq!(LevelFilter::from(LogFilterParam::Trace), LevelFilter::Trace);
+        assert_eq!(LevelFilter::from(LogFilterParam::Off), LevelFilter::Off);
     }
 
     #[tokio::test]

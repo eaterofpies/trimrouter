@@ -3,7 +3,7 @@ pub mod server;
 pub mod status;
 
 pub use html::DASHBOARD_HTML;
-pub use server::{HTTP_PORT, HttpServer};
+pub use server::{HTTP_PORT, HttpServer, LogFilterParam};
 pub use status::{
     DEFAULT_LAN_INTERFACE, DEFAULT_WAN_INTERFACE, ObservabilityTracker, StatusResponse,
     get_tracker, set_lan_info, update_current_lan_ip, update_dhcp_leases, update_dns_stats,
