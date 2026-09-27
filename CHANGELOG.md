@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.0](https://github.com/eaterofpies/trimrouter/compare/v0.2.0...v0.3.0) (2026-09-19)
+
+
+### Features
+
+* **config:** add [lan] section and runtime host-offset subnet translation ([772b8de](https://github.com/eaterofpies/trimrouter/commit/772b8deb42586040088418ad33e13eebfb544a98))
+* **dns_forwarder:** implement in-flight query deduplication and request joining ([a860a50](https://github.com/eaterofpies/trimrouter/commit/a860a50f2c8b7c4e39a8c4395ba656b4778e6b30))
+* **dns_forwarder:** implement inbound TCP listener on port 53 (RFC 7766) ([379b0b9](https://github.com/eaterofpies/trimrouter/commit/379b0b9a89b37b8035fdb7972f95ea00b8bbab7f))
+* **dns_forwarder:** implement upstream TCP fallback and secondary resolver failover ([cee6c8c](https://github.com/eaterofpies/trimrouter/commit/cee6c8c6e67448f93fe9fe583f3d3a42d1c0ce5f))
+* **firewall:** implement inbound port forwarding and DNAT rules ([2bc26dd](https://github.com/eaterofpies/trimrouter/commit/2bc26ddd387b2e966a1bc62badc2b2bd7a9ae689))
+* implement 2-phase child process teardown with auto-reboot on panic ([4f1fdd6](https://github.com/eaterofpies/trimrouter/commit/4f1fdd6b0aa262ecdd9a61ceef2ca4a99c20e4e6))
+* implement per-client token-bucket rate limiting for upstream DNS queries ([a964e46](https://github.com/eaterofpies/trimrouter/commit/a964e46d893dcbbf3a2d409fa875968a9d0601f8))
+* support EDNS0 buffer sizing and TC=1 truncation in DNS forwarder ([dedef62](https://github.com/eaterofpies/trimrouter/commit/dedef6280a6eba4e1f843237ba552c5c536eac9a))
+
+
+### Bug Fixes
+
+* **docker:** update Debian Trixie kernel package version to 6.12.107-1 ([2a85c4e](https://github.com/eaterofpies/trimrouter/commit/2a85c4e380bd75a50b5d912e0fb7c3c83bee0355))
+* **supervisor:** prevent worker respawn race during service teardown ([d1ad286](https://github.com/eaterofpies/trimrouter/commit/d1ad286ee21d5adbcc53377c47e52fe4fc0f9b55))
+
 ## [0.2.0](https://github.com/eaterofpies/trimrouter/compare/v0.1.0...v0.2.0) (2026-09-03)
 
 
