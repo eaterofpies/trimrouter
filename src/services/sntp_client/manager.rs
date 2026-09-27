@@ -183,6 +183,7 @@ fn set_system_clock(seconds: i64, nanoseconds: i64) {
         error!("[sntp-client-parent] Failed to set system clock: {}", e);
     } else {
         info!("[sntp-client-parent] Successfully set system clock.");
+        crate::services::observability::update_sntp_sync(DEFAULT_NTP_SERVER, 2);
     }
 }
 

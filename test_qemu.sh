@@ -41,7 +41,7 @@ if [ "$ARCH" = "x86_64" ]; then
       -drive file="$IMAGE",format=raw,media=disk,if=virtio \
       -netdev user,id=wan0,net=10.0.2.0/24 \
       -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
-      -netdev user,id=lan0,net=192.168.1.0/24 \
+      -netdev user,id=lan0,net=192.168.1.0/24,hostfwd=tcp:127.0.0.1:8080-192.168.1.1:80 \
       -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
       -nographic
 elif [ "$ARCH" = "arm64" ]; then
@@ -55,7 +55,7 @@ elif [ "$ARCH" = "arm64" ]; then
       -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
       -netdev user,id=wan0 \
       -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
-      -netdev user,id=lan0 \
+      -netdev user,id=lan0,net=192.168.1.0/24,hostfwd=tcp:127.0.0.1:8080-192.168.1.1:80 \
       -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0" \
       -nographic
 elif [ "$ARCH" = "armhf" ]; then
@@ -69,7 +69,7 @@ elif [ "$ARCH" = "armhf" ]; then
       -device virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56 \
       -netdev user,id=wan0 \
       -device virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57 \
-      -netdev user,id=lan0 \
+      -netdev user,id=lan0,net=192.168.1.0/24,hostfwd=tcp:127.0.0.1:8080-192.168.1.1:80 \
       -append "console=ttyAMA0,115200 root=/dev/ram0 rdinit=/init quiet net.ifnames=0" \
       -nographic
 else

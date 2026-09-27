@@ -295,19 +295,26 @@ fn build_managed_interfaces(
         wan_services,
     );
 
-    let lan_services = vec![interface::RouterService::LanManager(
-        services::LanManager::new(
+    let lan_services = vec![
+        interface::RouterService::LanManager(services::LanManager::new(
             network::LAN_INTERFACE.to_string(),
             network::WAN_INTERFACE.to_string(),
             config.lan_ip.clone(),
             config.backup_lan_ip.clone(),
-            lease_rx,
+            lease_rx.clone(),
             Some(heartbeat_tx),
             Some(local_hosts_tx),
             config.static_leases.clone(),
             config.port_forwards.clone(),
-        ),
-    )];
+        )),
+        interface::RouterService::Observability(services::ObservabilityService::new(
+            network::LAN_INTERFACE.to_string(),
+            config.lan_ip.clone(),
+            lease_rx,
+            config.watchdog,
+            services::observability::HTTP_PORT,
+        )),
+    ];
     let lan_iface = interface::ManagedInterface::new(
         network::LAN_INTERFACE.to_string(),
         config.lan_mac,
@@ -352,6 +359,6 @@ mod tests {
         // LAN interface assertions
         assert_eq!(ifaces[1].name, "lan");
         assert_eq!(ifaces[1].mac, config.lan_mac);
-        assert_eq!(ifaces[1].active_services.len(), 1);
+        assert_eq!(ifaces[1].active_services.len(), 2);
     }
 }

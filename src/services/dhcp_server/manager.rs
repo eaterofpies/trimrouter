@@ -122,8 +122,12 @@ async fn run_parent_dhcp_server_monitor(
             _ = shutdown_rx.changed() => break,
             ipc_msg = recv_msg::<DhcpServerWorkerToParentMsg, _>(&mut ipc_reader) => {
                 match ipc_msg {
-                    Ok(Some(DhcpServerWorkerToParentMsg::Heartbeat)) => {
-                        send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::LanManager);
+                    Ok(Some(DhcpServerWorkerToParentMsg::Heartbeat { leases })) => {
+                        send_service_heartbeat(
+                            heartbeat_tx.as_ref(),
+                            MonitoredService::LanManager,
+                        );
+                        crate::services::observability::update_dhcp_leases(leases);
                     }
                     Ok(Some(DhcpServerWorkerToParentMsg::RegisterLocalHost { name, ip })) => {
                         if let Some(ref tx) = local_hosts_tx {

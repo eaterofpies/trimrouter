@@ -153,7 +153,7 @@ impl Drop for TestEnv {
 
 #[tokio::main]
 async fn main() {
-    std::println!("\nrunning 9 integration test steps in QEMU VM");
+    std::println!("\nrunning integration test suite in QEMU VM");
 
     let test_timeout = std::time::Duration::from_secs(300);
     let start_time = std::time::Instant::now();
@@ -721,15 +721,18 @@ async fn handle_unsolicited_wan_traffic(
     let mut packet_received = false;
     while monitor_start.elapsed() < Duration::from_secs(1) {
         if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(50), mock.recv_frame()).await
-            && let Some((src_ip, dest_ip, src_port, dest_port, _)) =
-                parse_udp_packet(&f).ok().flatten()
-            && src_ip == MOCK_CLIENT_IP
-            && dest_ip == MOCK_SERVER_IP
-            && src_port == 53
-            && dest_port == 12345
         {
-            packet_received = true;
-            break;
+            if let Some((src_ip, dest_ip, src_port, dest_port, _)) =
+                parse_udp_packet(&f).ok().flatten()
+                && src_ip == MOCK_CLIENT_IP
+                && dest_ip == MOCK_SERVER_IP
+                && src_port == 53
+                && dest_port == 12345
+            {
+                packet_received = true;
+                break;
+            }
+            process_wan_dhcp_renewal(mock, verification_tx, client_mac, &f).await;
         }
     }
 
@@ -803,14 +806,17 @@ async fn handle_invalid_conntrack_traffic(
     let mut packet_received = false;
     while monitor_start.elapsed() < Duration::from_secs(1) {
         if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(50), mock.recv_frame()).await
-            && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&f)
-            && eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4
-            && let Some(ip) = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())
-            && ip.get_source() == MOCK_CLIENT_IP
-            && ip.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Tcp
         {
-            packet_received = true;
-            break;
+            if let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&f)
+                && eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4
+                && let Some(ip) = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())
+                && ip.get_source() == MOCK_CLIENT_IP
+                && ip.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Tcp
+            {
+                packet_received = true;
+                break;
+            }
+            process_wan_dhcp_renewal(mock, verification_tx, client_mac, &f).await;
         }
     }
 

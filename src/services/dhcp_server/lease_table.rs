@@ -267,6 +267,26 @@ impl LeaseTable {
         );
     }
 
+    /// Returns all active leases for telemetry and observability inspection.
+    pub fn get_active_leases(&self) -> Vec<crate::services::ipc::DhcpLeaseInfo> {
+        let now = Instant::now();
+        let mut result = Vec::new();
+        for (&mac, lease) in &self.by_mac {
+            if lease.expiry > now {
+                let remaining_secs = (lease.expiry - now).as_secs();
+                let is_static = self.static_leases.contains_key(&mac);
+                result.push(crate::services::ipc::DhcpLeaseInfo {
+                    mac,
+                    ip: lease.ip,
+                    hostname: lease.hostname.clone(),
+                    expires_in_seconds: remaining_secs,
+                    is_static,
+                });
+            }
+        }
+        result
+    }
+
     /// Number of active leases. Used in tests.
     #[cfg(test)]
     pub fn len(&self) -> usize {
@@ -337,6 +357,9 @@ pub enum LeaseCommand {
         static_leases: HashMap<MacAddr, Ipv4Addr>,
         reply_tx: oneshot::Sender<()>,
     },
+    GetActiveLeases {
+        reply_tx: oneshot::Sender<Vec<crate::services::ipc::DhcpLeaseInfo>>,
+    },
 }
 
 #[derive(Clone)]
@@ -345,6 +368,18 @@ pub struct LeaseHandle {
 }
 
 impl LeaseHandle {
+    pub async fn get_active_leases(&self) -> Vec<crate::services::ipc::DhcpLeaseInfo> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(LeaseCommand::GetActiveLeases { reply_tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.await.unwrap_or_default()
+    }
     pub async fn get_existing_ip(&self, client_mac: MacAddr) -> Option<Ipv4Addr> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -597,6 +632,10 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
         }
         LeaseCommand::AddNeighbor { mac, ip } => {
             leases.update_from_neighbor(mac, ip);
+        }
+        LeaseCommand::GetActiveLeases { reply_tx } => {
+            let active = leases.get_active_leases();
+            let _ = reply_tx.send(active);
         }
     }
 }

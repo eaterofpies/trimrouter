@@ -3,6 +3,7 @@ pub mod dhcp_server;
 pub mod dns_forwarder;
 pub mod ipc;
 pub mod lan;
+pub mod observability;
 pub mod sntp_client;
 pub mod supervisor;
 pub mod utils;
@@ -12,6 +13,7 @@ pub use dhcp_server::{DhcpServer, run_dhcp_server_worker};
 pub use dns_forwarder::{DnsForwarder, run_dns_forwarder_worker};
 pub use ipc::{LocalHostEvent, LocalHostReceiver, LocalHostSender};
 pub use lan::LanManager;
+pub use observability::{OBSERVABILITY_SERVICE_NAME, ObservabilityService};
 pub use sntp_client::{SntpClient, run_sntp_client_worker};
 pub use supervisor::{
     DHCP_CLIENT_SERVICE_NAME, DHCP_SERVER_SERVICE_NAME, DNS_FORWARDER_SERVICE_NAME, ExternalWorker,
@@ -63,6 +65,14 @@ mod tests {
             Vec::new(),
         );
 
-        let _sntp_client = SntpClient::new(lease_rx);
+        let _sntp_client = SntpClient::new(lease_rx.clone());
+
+        let _observability = ObservabilityService::new(
+            "lan".to_string(),
+            "192.168.1.1/24".to_string(),
+            lease_rx,
+            true,
+            observability::HTTP_PORT,
+        );
     }
 }

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Datelike, Utc};
-pub use log::Level;
-use log::{LevelFilter, Log, Metadata, Record};
+pub use log::{Level, LevelFilter};
+use log::{Log, Metadata, Record};
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -13,6 +14,8 @@ pub const DEFAULT_LOG_FILE: &str = "/var/log/system.log";
 pub const DEFAULT_MAX_LOG_SIZE_MB: u64 = 100;
 pub const BYTES_PER_MB: u64 = 1024 * 1024;
 pub const MIN_USABLE_LOG_SPACE: u64 = 64 * 1024; // 64 KiB
+pub const MAX_RING_BUFFER_LINES: usize = 500;
+const BROADCAST_CHANNEL_CAPACITY: usize = 128;
 
 pub const DIRTY_EXPIRE_CENTISECS_PATH: &str = "/proc/sys/vm/dirty_expire_centisecs";
 pub const DIRTY_EXPIRE_CENTISECS_VALUE: &str = "3000";
@@ -20,6 +23,68 @@ pub const DIRTY_WRITEBACK_CENTISECS_PATH: &str = "/proc/sys/vm/dirty_writeback_c
 pub const DIRTY_WRITEBACK_CENTISECS_VALUE: &str = "500";
 
 type SpaceChecker = Box<dyn Fn(&Path) -> io::Result<u64> + Send + Sync>;
+
+static LOG_RING_BUFFER: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+static LOG_BROADCASTER: OnceLock<tokio::sync::broadcast::Sender<String>> = OnceLock::new();
+
+fn get_ring_buffer() -> &'static Mutex<VecDeque<String>> {
+    LOG_RING_BUFFER.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_RING_BUFFER_LINES)))
+}
+
+pub fn get_broadcaster() -> &'static tokio::sync::broadcast::Sender<String> {
+    LOG_BROADCASTER.get_or_init(|| {
+        let (tx, _rx) = tokio::sync::broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        tx
+    })
+}
+
+pub fn subscribe_logs() -> tokio::sync::broadcast::Receiver<String> {
+    get_broadcaster().subscribe()
+}
+
+pub fn get_ring_buffer_len() -> usize {
+    if let Ok(buf) = get_ring_buffer().lock() {
+        buf.len()
+    } else {
+        0
+    }
+}
+
+pub fn push_to_ring_buffer_and_broadcast(formatted_line: &str) {
+    if let Ok(mut buf) = get_ring_buffer().lock() {
+        if buf.len() >= MAX_RING_BUFFER_LINES {
+            buf.pop_front();
+        }
+        buf.push_back(formatted_line.to_string());
+    }
+    let broadcaster = get_broadcaster();
+    let _ = broadcaster.send(formatted_line.to_string());
+}
+
+pub fn get_recent_logs(max_lines: usize, min_level: Option<LevelFilter>) -> Vec<String> {
+    let Ok(buf) = get_ring_buffer().lock() else {
+        return Vec::new();
+    };
+    let count = max_lines.min(MAX_RING_BUFFER_LINES);
+    let mut result: Vec<String> = buf
+        .iter()
+        .filter(|line| {
+            if let Some(filter) = min_level {
+                let lvl = parse_line_level(line);
+                lvl <= filter
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+
+    if result.len() > count {
+        let skip = result.len() - count;
+        result = result.split_off(skip);
+    }
+    result
+}
 
 pub struct Logger {
     pub log_dir: PathBuf,
@@ -324,6 +389,7 @@ impl Logger {
 
     pub fn write_entry(&mut self, formatted_line: &str) {
         std::print!("{}", formatted_line);
+        push_to_ring_buffer_and_broadcast(formatted_line);
 
         if self.log_disabled || self.log_file.is_none() {
             return;
@@ -692,5 +758,31 @@ mod tests {
             format_raw_line_with_explicit_level(ts, Some(Level::Info), plain),
             "[2026-08-14T14:30:00Z] [INFO] [system] Boot completed\n"
         );
+    }
+
+    #[tokio::test]
+    async fn test_ring_buffer_push_and_subscribe() {
+        let mut rx = subscribe_logs();
+        let test_line = "[2026-09-27T18:30:00Z] [INFO] [test] Test log broadcast\n";
+        push_to_ring_buffer_and_broadcast(test_line);
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received, test_line);
+
+        let recent = get_recent_logs(10, None);
+        assert!(recent.iter().any(|l| l == test_line));
+        assert!(get_ring_buffer_len() > 0);
+    }
+
+    #[test]
+    fn test_ring_buffer_level_filtering() {
+        let err_line = "[2026-09-27T18:30:00Z] [ERROR] [test] Error log line\n";
+        let info_line = "[2026-09-27T18:30:01Z] [INFO] [test] Info log line\n";
+        push_to_ring_buffer_and_broadcast(err_line);
+        push_to_ring_buffer_and_broadcast(info_line);
+
+        let errors_only = get_recent_logs(50, Some(LevelFilter::Error));
+        assert!(errors_only.iter().any(|l| l == err_line));
+        assert!(!errors_only.iter().any(|l| l == info_line));
     }
 }

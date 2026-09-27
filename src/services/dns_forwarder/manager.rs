@@ -131,8 +131,12 @@ async fn run_parent_dns_monitor(
             _ = params.shutdown_rx.changed() => break,
             ipc_msg = recv_msg::<DnsWorkerToParentMsg, _>(&mut ipc_reader) => {
                 match ipc_msg {
-                    Ok(Some(DnsWorkerToParentMsg::Heartbeat)) => {
-                        send_service_heartbeat(params.heartbeat_tx.as_ref(), MonitoredService::DnsForwarder);
+                    Ok(Some(DnsWorkerToParentMsg::Heartbeat { stats })) => {
+                        send_service_heartbeat(
+                            params.heartbeat_tx.as_ref(),
+                            MonitoredService::DnsForwarder,
+                        );
+                        crate::services::observability::update_dns_stats(stats);
                     }
                     Ok(None) | Err(_) => {
                         info!("[dns-forwarder-parent] Worker closed IPC. Shutting down monitor.");
