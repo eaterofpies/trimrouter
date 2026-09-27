@@ -5,6 +5,16 @@
     ":automergeAll"
   ],
   "platformAutomerge": true,
+  "packageRules": [
+    {
+      "matchPackagePatterns": [
+        "*"
+      ],
+      "groupName": "all dependencies",
+      "groupSlug": "all",
+      "groupSingleUpdates": true
+    }
+  ],
   "customManagers": [
     {
       "customType": "regex",
