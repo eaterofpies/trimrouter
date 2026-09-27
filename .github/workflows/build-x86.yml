@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build and extract x86_64 image
         run: |
@@ -36,7 +36,7 @@ jobs:
             .
 
       - name: Upload image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trimrouter-x86_64.img.xz
           path: ./dist/trimrouter-x86_64.img.xz
