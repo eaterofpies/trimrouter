@@ -365,23 +365,16 @@ pub fn collect_system_status(watchdog_active: bool) -> SystemStatus {
     }
 }
 
-pub fn collect_network_status(
-    wan_lease: &WanLease,
-    wan_iface: &str,
-    lan_iface: &str,
-    current_lan_ip_str: &str,
-    initial_lan_ip_str: &str,
-) -> NetworkStatus {
+pub fn collect_wan_status(wan_lease: &WanLease, wan_iface: &str) -> WanStatus {
     let wan_mac = read_interface_mac(wan_iface);
-    let (wan_rx_bytes, wan_tx_bytes, wan_rx_packets, wan_tx_packets) =
-        read_interface_traffic(wan_iface);
+    let (rx_bytes, tx_bytes, rx_packets, tx_packets) = read_interface_traffic(wan_iface);
+    let prefix_len = wan_lease.mask.and_then(|m| mask_to_prefix_len(m).ok());
 
-    let wan_prefix_len = wan_lease.mask.and_then(|m| mask_to_prefix_len(m).ok());
-    let wan = WanStatus {
+    WanStatus {
         interface: wan_iface.to_string(),
         mac: wan_mac,
         ip: wan_lease.ip.map(|ip| ip.to_string()),
-        prefix_len: wan_prefix_len,
+        prefix_len,
         gateway: wan_lease.gateway.map(|gw| gw.to_string()),
         dns_servers: wan_lease
             .dns_servers
@@ -389,38 +382,53 @@ pub fn collect_network_status(
             .map(|ip| ip.to_string())
             .collect(),
         lease_expiry_seconds: None,
-        rx_bytes: wan_rx_bytes,
-        tx_bytes: wan_tx_bytes,
-        rx_packets: wan_rx_packets,
-        tx_packets: wan_tx_packets,
-    };
+        rx_bytes,
+        tx_bytes,
+        rx_packets,
+        tx_packets,
+    }
+}
 
+pub fn collect_lan_status(
+    lan_iface: &str,
+    current_lan_ip_str: &str,
+    initial_lan_ip_str: &str,
+) -> LanStatus {
     let lan_mac = read_interface_mac(lan_iface);
-    let (lan_rx_bytes, lan_tx_bytes, lan_rx_packets, lan_tx_packets) =
-        read_interface_traffic(lan_iface);
-
+    let (rx_bytes, tx_bytes, rx_packets, tx_packets) = read_interface_traffic(lan_iface);
     let lan_net = current_lan_ip_str
         .parse::<ipnet::Ipv4Net>()
         .unwrap_or_else(|_| "192.168.1.1/24".parse().unwrap());
-    let lan_mode = if current_lan_ip_str == initial_lan_ip_str {
+    let mode = if current_lan_ip_str == initial_lan_ip_str {
         "primary".to_string()
     } else {
         "backup".to_string()
     };
 
-    let lan = LanStatus {
+    LanStatus {
         interface: lan_iface.to_string(),
         mac: lan_mac,
         ip: lan_net.addr().to_string(),
         prefix_len: lan_net.prefix_len(),
-        mode: lan_mode,
-        rx_bytes: lan_rx_bytes,
-        tx_bytes: lan_tx_bytes,
-        rx_packets: lan_rx_packets,
-        tx_packets: lan_tx_packets,
-    };
+        mode,
+        rx_bytes,
+        tx_bytes,
+        rx_packets,
+        tx_packets,
+    }
+}
 
-    NetworkStatus { wan, lan }
+pub fn collect_network_status(
+    wan_lease: &WanLease,
+    wan_iface: &str,
+    lan_iface: &str,
+    current_lan_ip_str: &str,
+    initial_lan_ip_str: &str,
+) -> NetworkStatus {
+    NetworkStatus {
+        wan: collect_wan_status(wan_lease, wan_iface),
+        lan: collect_lan_status(lan_iface, current_lan_ip_str, initial_lan_ip_str),
+    }
 }
 
 pub fn collect_dhcp_status() -> DhcpServerStatus {
