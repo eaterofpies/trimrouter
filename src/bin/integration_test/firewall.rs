@@ -84,3 +84,43 @@ pub async fn test_conntrack_invalid_drop() -> Result<(), String> {
     std::println!("[test] Firewall conntrack invalid drop check completed.");
     Ok(())
 }
+
+const ANTI_SPOOFING_TEST_PORT: u16 = 23459;
+
+pub async fn test_anti_spoofing_wan_drop() -> Result<(), String> {
+    std::println!("[test] Starting Anti-Spoofing Reverse Path Filtering WAN Drop test...");
+
+    // 1. Bind to UDP port 23459 on all interfaces to verify no spoofed packet arrives
+    let bind_addr = format!("0.0.0.0:{}", ANTI_SPOOFING_TEST_PORT);
+    let socket = UdpSocket::bind(&bind_addr).map_err(|e| e.to_string())?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .map_err(|e| e.to_string())?;
+
+    // 2. Tell the host runner to inject a packet on WAN with a spoofed internal LAN source IP
+    std::println!("[test-control] TRIGGER_SPOOFED_INTERNAL_WAN_TRAFFIC");
+
+    // 3. Verify no packet is delivered (dropped by strict rp_filter in kernel)
+    let mut buf = [0u8; 512];
+    match socket.recv_from(&mut buf) {
+        Ok((amt, src)) => Err(format!(
+            "Anti-spoofing failure: Received spoofed packet from {} ({} bytes: {:?})",
+            src,
+            amt,
+            String::from_utf8_lossy(&buf[..amt])
+        )),
+        Err(ref e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            std::println!(
+                "[test] Anti-spoofing check completed: Spoofed internal packet was dropped."
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "Socket read error during anti-spoofing test: {}",
+            e
+        )),
+    }
+}

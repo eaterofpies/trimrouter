@@ -88,8 +88,9 @@ At early startup, PID 1 mounts the required pseudo-filesystems before initializi
 
 `trimrouter` configures the kernel entirely via Netlink — no external binaries required.
 
-#### 2.2.1 IP Forwarding
-Writes `"1"` to `/proc/sys/net/ipv4/ip_forward` at startup.
+#### 2.2.1 IP Forwarding & Reverse Path Filtering (Anti-Spoofing)
+1. **IP Forwarding**: Writes `"1"` to `/proc/sys/net/ipv4/ip_forward` at startup.
+2. **Reverse Path Filtering (BCP 38 / RFC 3704 Anti-Spoofing)**: Enables strict reverse path filtering by writing `"1"` to `/proc/sys/net/ipv4/conf/all/rp_filter`, `/proc/sys/net/ipv4/conf/default/rp_filter`, and interface-specific `/proc/sys/net/ipv4/conf/<iface>/rp_filter` upon interface configuration. Ingress packets with spoofed source addresses that do not match the best reverse route (such as external WAN packets bearing internal LAN source IPs) are dropped at the kernel FIB routing level.
 
 #### 2.2.2 Netlink Interface & Route Management (`NETLINK_ROUTE`)
 

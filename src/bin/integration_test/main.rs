@@ -366,6 +366,18 @@ async fn main() {
                 failed += 1;
             }
         }
+
+        // Test 5c: Anti-Spoofing Reverse Path Filtering WAN Drop
+        match firewall::test_anti_spoofing_wan_drop().await {
+            Ok(_) => {
+                std::println!("[test-control] TEST_PASSED anti_spoofing_wan_drop");
+                passed += 1;
+            }
+            Err(e) => {
+                std::println!("[test-control] TEST_FAILED anti_spoofing_wan_drop {}", e);
+                failed += 1;
+            }
+        }
     } else {
         std::println!("[test] Skipping Firewall Drop tests (DHCP Client binding failed).");
     }
