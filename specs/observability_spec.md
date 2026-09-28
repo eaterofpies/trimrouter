@@ -64,6 +64,7 @@ All endpoints are served over standard HTTP on port `80` of the LAN gateway IP a
 * **Features**:
   * Visual status indicators for WAN link, LAN subnet, DNS forwarder, and SNTP synchronization.
   * Real-time active DHCP client table with hostnames, IP addresses, and lease expiry timers.
+  * Live kernel ARP cache / neighbor table across WAN and LAN interfaces.
   * Live responsive bandwidth sparkline charts and rate monitors (RX/TX) for both WAN and LAN interfaces.
   * Hardware MAC address displays for both WAN and LAN interfaces.
   * Transparent memory utilization metrics (Total RAM, Used RAM, Free / Available RAM) and SD card log partition space.
@@ -120,7 +121,21 @@ All endpoints are served over standard HTTP on port `80` of the LAN gateway IP a
       "tx_bytes": 104857600,
       "rx_packets": 95000,
       "tx_packets": 120000
-    }
+    },
+    "arp_cache": [
+      {
+        "ip": "100.66.208.1",
+        "mac": "1c:90:be:da:13:c2",
+        "interface": "wan",
+        "flags": "0x2"
+      },
+      {
+        "ip": "192.168.1.4",
+        "mac": "a4:08:01:5f:63:cd",
+        "interface": "lan",
+        "flags": "0x2"
+      }
+    ]
   },
   "dhcp_server": {
     "active_leases_count": 3,

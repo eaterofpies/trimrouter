@@ -5,7 +5,7 @@ pub mod status;
 pub use html::DASHBOARD_HTML;
 pub use server::{HTTP_PORT, HttpServer, LogFilterParam};
 pub use status::{
-    DEFAULT_LAN_INTERFACE, DEFAULT_WAN_INTERFACE, DhcpLeasesReceiver, DhcpLeasesSender,
+    ArpEntry, DEFAULT_LAN_INTERFACE, DEFAULT_WAN_INTERFACE, DhcpLeasesReceiver, DhcpLeasesSender,
     DnsStatsReceiver, DnsStatsSender, ObservabilityReceivers, SntpStatus, SntpStatusReceiver,
     SntpStatusSender, StatusResponse, WatchdogActiveReceiver, WatchdogActiveSender,
     null_dhcp_leases_sender, null_dns_stats_sender, null_sntp_status_sender,

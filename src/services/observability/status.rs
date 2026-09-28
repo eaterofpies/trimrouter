@@ -87,6 +87,7 @@ pub const DEFAULT_LAN_INTERFACE: &str = "lan";
 const PROC_UPTIME_PATH: &str = "/proc/uptime";
 const PROC_LOADAVG_PATH: &str = "/proc/loadavg";
 const PROC_MEMINFO_PATH: &str = "/proc/meminfo";
+pub const PROC_NET_ARP_PATH: &str = "/proc/net/arp";
 const SYS_CLASS_NET_PATH: &str = "/sys/class/net";
 
 pub const LOG_PARTITION_PATH: &str = "/var/log";
@@ -125,10 +126,19 @@ pub struct StorageStatus {
     pub free_bytes: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ArpEntry {
+    pub ip: String,
+    pub mac: String,
+    pub interface: String,
+    pub flags: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct NetworkStatus {
     pub wan: WanStatus,
     pub lan: LanStatus,
+    pub arp_cache: Vec<ArpEntry>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -421,6 +431,29 @@ pub fn collect_lan_status(lan_iface: &str, current_lan_ip_str: &str) -> LanStatu
     }
 }
 
+pub fn parse_arp_cache_str(content: &str) -> Vec<ArpEntry> {
+    let mut entries = Vec::new();
+    for line in content.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 6 {
+            entries.push(ArpEntry {
+                ip: cols[0].to_string(),
+                flags: cols[2].to_string(),
+                mac: cols[3].to_string(),
+                interface: cols[5].to_string(),
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.interface.cmp(&b.interface).then_with(|| a.ip.cmp(&b.ip)));
+    entries
+}
+
+pub fn collect_arp_cache(arp_path: &str) -> Vec<ArpEntry> {
+    fs::read_to_string(arp_path)
+        .map(|c| parse_arp_cache_str(&c))
+        .unwrap_or_default()
+}
+
 pub fn collect_network_status(
     wan_lease: &WanLease,
     wan_iface: &str,
@@ -430,6 +463,7 @@ pub fn collect_network_status(
     NetworkStatus {
         wan: collect_wan_status(wan_lease, wan_iface),
         lan: collect_lan_status(lan_iface, current_lan_ip_str),
+        arp_cache: collect_arp_cache(PROC_NET_ARP_PATH),
     }
 }
 
@@ -618,5 +652,34 @@ Cached:            65536 kB
         assert!(json.contains("\"time.google.com\""));
         assert!(json.contains("\"free_bytes\""));
         assert!(json.contains("\"storage\""));
+        assert!(json.contains("\"arp_cache\""));
+    }
+
+    #[test]
+    fn test_parse_arp_cache_str() {
+        let arp_data = r#"IP address       HW type     Flags       HW address            Mask     Device
+192.168.1.4      0x1         0x2         a4:08:01:5f:63:cd     *        lan
+100.66.208.1     0x1         0x2         1c:90:be:da:13:c2     *        wan
+192.168.1.5      0x1         0x0         00:00:00:00:00:00     *        lan
+"#;
+        let entries = parse_arp_cache_str(arp_data);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].ip, "192.168.1.4");
+        assert_eq!(entries[0].flags, "0x2");
+        assert_eq!(entries[0].mac, "a4:08:01:5f:63:cd");
+        assert_eq!(entries[0].interface, "lan");
+
+        assert_eq!(entries[1].ip, "192.168.1.5");
+        assert_eq!(entries[1].flags, "0x0");
+        assert_eq!(entries[1].mac, "00:00:00:00:00:00");
+        assert_eq!(entries[1].interface, "lan");
+
+        assert_eq!(entries[2].ip, "100.66.208.1");
+        assert_eq!(entries[2].flags, "0x2");
+        assert_eq!(entries[2].mac, "1c:90:be:da:13:c2");
+        assert_eq!(entries[2].interface, "wan");
+
+        let empty = parse_arp_cache_str("");
+        assert!(empty.is_empty());
     }
 }

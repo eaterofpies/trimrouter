@@ -45,6 +45,9 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     .bandwidth-canvas { width: 100%; height: 70px; display: block; }
     table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
     th { text-align: left; padding: 0.6rem 0.75rem; color: var(--text-muted); font-weight: 600; border-bottom: 1px solid var(--card-border); }
+    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable:hover { color: var(--accent); }
+    .sort-icon { font-size: 0.7rem; margin-left: 0.25rem; opacity: 0.8; }
     td { padding: 0.6rem 0.75rem; border-bottom: 1px solid rgba(255,255,255,0.05); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.85rem; }
     .terminal-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 0.75rem; padding: 1.25rem; margin-top: 1.5rem; }
     .terminal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem; }
@@ -157,15 +160,35 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <table>
         <thead>
           <tr>
-            <th>IP Address</th>
-            <th>MAC Address</th>
-            <th>Hostname</th>
-            <th>Expires In</th>
-            <th>Type</th>
+            <th class="sortable" onclick="setDhcpSort('ip')">IP Address<span id="dhcp-sort-ip" class="sort-icon"> ▲</span></th>
+            <th class="sortable" onclick="setDhcpSort('mac')">MAC Address<span id="dhcp-sort-mac" class="sort-icon"></span></th>
+            <th class="sortable" onclick="setDhcpSort('hostname')">Hostname<span id="dhcp-sort-hostname" class="sort-icon"></span></th>
+            <th class="sortable" onclick="setDhcpSort('expires_in_seconds')">Expires In<span id="dhcp-sort-expires_in_seconds" class="sort-icon"></span></th>
+            <th class="sortable" onclick="setDhcpSort('is_static')">Type<span id="dhcp-sort-is_static" class="sort-icon"></span></th>
           </tr>
         </thead>
         <tbody id="leases-body">
           <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No active leases</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ARP Cache / Neighbors Table -->
+  <div class="card" style="margin-bottom: 1.5rem;">
+    <div class="card-title">ARP Cache / Neighbors</div>
+    <div style="overflow-x: auto;">
+      <table>
+        <thead>
+          <tr>
+            <th class="sortable" onclick="setArpSort('ip')">IP Address<span id="arp-sort-ip" class="sort-icon"></span></th>
+            <th class="sortable" onclick="setArpSort('mac')">MAC Address<span id="arp-sort-mac" class="sort-icon"></span></th>
+            <th class="sortable" onclick="setArpSort('interface')">Interface<span id="arp-sort-interface" class="sort-icon"> ▲</span></th>
+            <th class="sortable" onclick="setArpSort('flags')">Flags<span id="arp-sort-flags" class="sort-icon"></span></th>
+          </tr>
+        </thead>
+        <tbody id="arp-body">
+          <tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No ARP entries</td></tr>
         </tbody>
       </table>
     </div>
@@ -227,7 +250,124 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     let prevWanTraffic = null;
     let prevLanTraffic = null;
     let prevTimestamp = null;
+    let lastStatusData = null;
+    let arpSortKey = 'interface';
+    let arpSortAsc = true;
+    let dhcpSortKey = 'ip';
+    let dhcpSortAsc = true;
     const MAX_POINTS = 30;
+
+    function parseIpForSort(ipStr) {
+      if (!ipStr) return [0, 0, 0, 0];
+      return String(ipStr).split('.').map(n => parseInt(n, 10) || 0);
+    }
+
+    function compareIps(a, b) {
+      const octA = parseIpForSort(a);
+      const octB = parseIpForSort(b);
+      for (let i = 0; i < 4; i++) {
+        if (octA[i] !== octB[i]) return octA[i] - octB[i];
+      }
+      return 0;
+    }
+
+    function sortArpList(list) {
+      return [...list].sort((a, b) => {
+        let cmp = 0;
+        if (arpSortKey === 'ip') {
+          cmp = compareIps(a.ip, b.ip);
+        } else {
+          const valA = String(a[arpSortKey] || '');
+          const valB = String(b[arpSortKey] || '');
+          cmp = valA.localeCompare(valB);
+        }
+        return arpSortAsc ? cmp : -cmp;
+      });
+    }
+
+    function sortDhcpList(list) {
+      return [...list].sort((a, b) => {
+        let cmp = 0;
+        if (dhcpSortKey === 'ip') {
+          cmp = compareIps(a.ip, b.ip);
+        } else if (dhcpSortKey === 'expires_in_seconds') {
+          cmp = (a.expires_in_seconds || 0) - (b.expires_in_seconds || 0);
+        } else if (dhcpSortKey === 'is_static') {
+          cmp = (a.is_static === b.is_static) ? 0 : (a.is_static ? -1 : 1);
+        } else {
+          const valA = String(a[dhcpSortKey] || '');
+          const valB = String(b[dhcpSortKey] || '');
+          cmp = valA.localeCompare(valB);
+        }
+        return dhcpSortAsc ? cmp : -cmp;
+      });
+    }
+
+    function updateSortIndicators() {
+      ['ip', 'mac', 'interface', 'flags'].forEach(k => {
+        const el = document.getElementById('arp-sort-' + k);
+        if (el) el.textContent = (arpSortKey === k) ? (arpSortAsc ? ' ▲' : ' ▼') : '';
+      });
+      ['ip', 'mac', 'hostname', 'expires_in_seconds', 'is_static'].forEach(k => {
+        const el = document.getElementById('dhcp-sort-' + k);
+        if (el) el.textContent = (dhcpSortKey === k) ? (dhcpSortAsc ? ' ▲' : ' ▼') : '';
+      });
+    }
+
+    function setArpSort(key) {
+      if (arpSortKey === key) {
+        arpSortAsc = !arpSortAsc;
+      } else {
+        arpSortKey = key;
+        arpSortAsc = true;
+      }
+      updateSortIndicators();
+      if (lastStatusData) renderTables(lastStatusData);
+    }
+
+    function setDhcpSort(key) {
+      if (dhcpSortKey === key) {
+        dhcpSortAsc = !dhcpSortAsc;
+      } else {
+        dhcpSortKey = key;
+        dhcpSortAsc = true;
+      }
+      updateSortIndicators();
+      if (lastStatusData) renderTables(lastStatusData);
+    }
+
+    function renderTables(data) {
+      const tbody = document.getElementById('leases-body');
+      if (data.dhcp_server.leases && data.dhcp_server.leases.length > 0) {
+        const sortedLeases = sortDhcpList(data.dhcp_server.leases);
+        tbody.innerHTML = sortedLeases.map(l => `
+          <tr>
+            <td>${escapeHtml(l.ip)}</td>
+            <td>${escapeHtml(l.mac)}</td>
+            <td>${l.hostname ? escapeHtml(l.hostname) : '<span style="color:var(--text-muted);">unknown</span>'}</td>
+            <td>${formatUptime(l.expires_in_seconds)}</td>
+            <td><span class="badge" style="font-size:0.7rem;">${l.is_static ? 'STATIC' : 'DYNAMIC'}</span></td>
+          </tr>
+        `).join('');
+      } else {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No active leases</td></tr>';
+      }
+
+      const arpBody = document.getElementById('arp-body');
+      if (data.network.arp_cache && data.network.arp_cache.length > 0) {
+        const sortedArp = sortArpList(data.network.arp_cache);
+        arpBody.innerHTML = sortedArp.map(a => `
+          <tr>
+            <td>${escapeHtml(a.ip)}</td>
+            <td>${escapeHtml(a.mac)}</td>
+            <td><span class="badge" style="font-size:0.7rem;">${escapeHtml(a.interface)}</span></td>
+            <td>${escapeHtml(a.flags)}</td>
+          </tr>
+        `).join('');
+      } else {
+        arpBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No ARP entries</td></tr>';
+      }
+    }
 
     function drawBandwidthChart(canvasId, history) {
       const canvas = document.getElementById(canvasId);
@@ -376,20 +516,8 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         const sntpText = data.sntp.synchronized ? ('Synced (' + (data.sntp.server || 'NTP') + ')') : 'Not Synchronized';
         document.getElementById('sntp-sync').textContent = sntpText;
 
-        const tbody = document.getElementById('leases-body');
-        if (data.dhcp_server.leases && data.dhcp_server.leases.length > 0) {
-          tbody.innerHTML = data.dhcp_server.leases.map(l => `
-            <tr>
-              <td>${escapeHtml(l.ip)}</td>
-              <td>${escapeHtml(l.mac)}</td>
-              <td>${l.hostname ? escapeHtml(l.hostname) : '<span style="color:var(--text-muted);">unknown</span>'}</td>
-              <td>${formatUptime(l.expires_in_seconds)}</td>
-              <td><span class="badge" style="font-size:0.7rem;">${l.is_static ? 'STATIC' : 'DYNAMIC'}</span></td>
-            </tr>
-          `).join('');
-        } else {
-          tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No active leases</td></tr>';
-        }
+        lastStatusData = data;
+        renderTables(data);
       } catch (err) {
         console.error('Failed to fetch status:', err);
       }

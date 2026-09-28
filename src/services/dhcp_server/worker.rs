@@ -171,7 +171,9 @@ async fn run_server_loop(
                         ip_address,
                         mac_address,
                     })) => {
-                        leases.add_neighbor(mac_address, ip_address).await;
+                        if config.net.contains(&ip_address) && ip_address != config.server_ip {
+                            leases.add_neighbor(mac_address, ip_address).await;
+                        }
                     }
                     Ok(Some(DhcpServerParentToWorkerMsg::SetStaticLeases {
                         leases: static_leases,
