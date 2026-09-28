@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/eaterofpies/trimrouter/compare/v0.3.0...v0.4.0) (2026-09-28)
+
+
+### Features
+
+* **network:** enable strict reverse path filtering and add anti-spoofing tests ([#20](https://github.com/eaterofpies/trimrouter/issues/20)) ([954cac5](https://github.com/eaterofpies/trimrouter/commit/954cac5c8942406d8ae11d0cfd65f0a300880f29))
+* observability ([#19](https://github.com/eaterofpies/trimrouter/issues/19)) ([1ae57d0](https://github.com/eaterofpies/trimrouter/commit/1ae57d02447e5c8313605960bc89f4583b9c9851))
+
+
+### Bug Fixes
+
+* **deps:** update all dependencies ([#13](https://github.com/eaterofpies/trimrouter/issues/13)) ([3709c94](https://github.com/eaterofpies/trimrouter/commit/3709c949c4f2b9b78b36345e0868ce2833be0b4f))
+
 ## [0.3.0](https://github.com/eaterofpies/trimrouter/compare/v0.2.0...v0.3.0) (2026-09-19)
 
 
