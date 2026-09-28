@@ -29,6 +29,8 @@ pub enum RouterService {
     SntpClient(services::SntpClient),
     /// LAN Manager service.
     LanManager(services::LanManager),
+    /// Observability HTTP and Web Dashboard service.
+    Observability(services::ObservabilityService),
 }
 
 impl Service for RouterService {
@@ -38,6 +40,7 @@ impl Service for RouterService {
             RouterService::DhcpClient(s) => s.start().await,
             RouterService::SntpClient(s) => s.start().await,
             RouterService::LanManager(s) => s.start().await,
+            RouterService::Observability(s) => s.start().await,
         }
     }
 
@@ -47,6 +50,7 @@ impl Service for RouterService {
             RouterService::DhcpClient(s) => s.stop().await,
             RouterService::SntpClient(s) => s.stop().await,
             RouterService::LanManager(s) => s.stop().await,
+            RouterService::Observability(s) => s.stop().await,
         }
     }
 }

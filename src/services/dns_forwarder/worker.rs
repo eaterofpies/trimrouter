@@ -1,6 +1,8 @@
 use crate::services::DNS_FORWARDER_SERVICE_NAME;
 use crate::services::dns_forwarder::rate_limiter::DnsRateLimiter;
-use crate::services::ipc::{DnsParentToWorkerMsg, DnsWorkerToParentMsg, recv_msg, send_msg};
+use crate::services::ipc::{
+    DnsParentToWorkerMsg, DnsStatsInfo, DnsWorkerToParentMsg, recv_msg, send_msg,
+};
 use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_tcp_listener, async_udp_socket,
     run_sandboxed_worker,
@@ -174,10 +176,20 @@ async fn run_forwarder_loop(
     let (tcp_event_tx, mut tcp_event_rx) =
         mpsc_channel::<UpstreamTcpEvent>(TCP_EVENT_CHANNEL_CAPACITY);
 
+    let mut dns_stats = DnsStatsInfo::default();
+
     loop {
         tokio::select! {
             _ = cleanup_timer.tick() => {
-                if let Err(e) = send_msg(&mut ipc_writer, &DnsWorkerToParentMsg::Heartbeat).await {
+                dns_stats.cached_entries_count = cache.len();
+                if let Err(e) = send_msg(
+                    &mut ipc_writer,
+                    &DnsWorkerToParentMsg::Heartbeat {
+                        stats: dns_stats.clone(),
+                    },
+                )
+                .await
+                {
                     debug!("[dns-forwarder-worker] Failed to send heartbeat to parent: {}", e);
                 }
                 evict_expired_cache(&mut cache);
@@ -226,6 +238,7 @@ async fn run_forwarder_loop(
                         &mut cache,
                         &mut pending_queries,
                         &mut rate_limiter,
+                        &mut dns_stats,
                     ).await;
                 }
             }
@@ -257,6 +270,7 @@ async fn run_forwarder_loop(
                     &mut cache,
                     &mut pending_queries,
                     &mut rate_limiter,
+                    &mut dns_stats,
                 ).await;
             }
             upstream_recv = upstream_socket.recv_from(&mut upstream_buf) => {
@@ -371,10 +385,13 @@ async fn handle_incoming_query(
     cache: &mut HashMap<Vec<u8>, CacheEntry>,
     pending: &mut HashMap<u16, PendingQuery>,
     rate_limiter: &mut DnsRateLimiter,
+    stats: &mut DnsStatsInfo,
 ) {
     if query.len() < DNS_HEADER_SIZE {
         return;
     }
+
+    stats.queries_total = stats.queries_total.saturating_add(1);
 
     if let Some(local_resp) =
         try_resolve_local_query(query, ctx.local_table.hosts, ctx.local_table.ips)
@@ -388,6 +405,7 @@ async fn handle_incoming_query(
     };
 
     if let Some(mut response) = lookup_cache(&cache_key, cache) {
+        stats.cache_hits_total = stats.cache_hits_total.saturating_add(1);
         response[0] = query[0];
         response[1] = query[1];
         let max_payload = extract_client_max_payload(query);
@@ -402,6 +420,7 @@ async fn handle_incoming_query(
         IpAddr::V6(_) => return,
     };
     if !rate_limiter.check(&client_ip) {
+        stats.rate_limited_drops_total = stats.rate_limited_drops_total.saturating_add(1);
         debug!(
             "[dns-forwarder-worker] Upstream rate limit exceeded for client {}. Dropping query.",
             client_ip
@@ -1930,6 +1949,7 @@ mod tests {
             &mut cache,
             &mut pending,
             &mut rate_limiter,
+            &mut DnsStatsInfo::default(),
         )
         .await;
 
@@ -2018,6 +2038,7 @@ mod tests {
             &mut cache,
             &mut pending,
             &mut rate_limiter,
+            &mut DnsStatsInfo::default(),
         )
         .await;
 
@@ -2141,6 +2162,7 @@ mod tests {
             &mut cache,
             &mut pending,
             &mut rate_limiter,
+            &mut DnsStatsInfo::default(),
         )
         .await;
         assert_eq!(pending.len(), 1);
@@ -2153,6 +2175,7 @@ mod tests {
             &mut cache,
             &mut pending,
             &mut rate_limiter,
+            &mut DnsStatsInfo::default(),
         )
         .await;
         assert_eq!(pending.len(), 1);
@@ -2170,6 +2193,7 @@ mod tests {
             &mut cache,
             &mut pending,
             &mut rate_limiter,
+            &mut DnsStatsInfo::default(),
         )
         .await;
         assert_eq!(pending.len(), 1);
@@ -2317,6 +2341,7 @@ mod tests {
                     &mut cache,
                     &mut pending,
                     &mut rate_limiter,
+                    &mut DnsStatsInfo::default(),
                 )
                 .await;
             }
@@ -2407,6 +2432,7 @@ mod tests {
             &mut cache,
             &mut pending,
             &mut rate_limiter,
+            &mut DnsStatsInfo::default(),
         )
         .await;
 
@@ -2420,6 +2446,7 @@ mod tests {
             &mut cache,
             &mut pending,
             &mut rate_limiter,
+            &mut DnsStatsInfo::default(),
         )
         .await;
 
@@ -2623,6 +2650,7 @@ mod tests {
             &mut cache,
             &mut pending,
             &mut rate_limiter,
+            &mut DnsStatsInfo::default(),
         )
         .await;
 
@@ -2636,6 +2664,7 @@ mod tests {
             &mut cache,
             &mut pending,
             &mut rate_limiter,
+            &mut DnsStatsInfo::default(),
         )
         .await;
 

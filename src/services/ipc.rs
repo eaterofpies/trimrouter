@@ -40,6 +40,14 @@ pub enum LocalHostEvent {
 pub type LocalHostSender = tokio::sync::mpsc::Sender<LocalHostEvent>;
 pub type LocalHostReceiver = tokio::sync::mpsc::Receiver<LocalHostEvent>;
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct DnsStatsInfo {
+    pub queries_total: u64,
+    pub cache_hits_total: u64,
+    pub cached_entries_count: usize,
+    pub rate_limited_drops_total: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DnsParentToWorkerMsg {
     SetUpstreamResolvers { servers: Vec<Ipv4Addr> },
@@ -49,7 +57,16 @@ pub enum DnsParentToWorkerMsg {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DnsWorkerToParentMsg {
-    Heartbeat,
+    Heartbeat { stats: DnsStatsInfo },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DhcpLeaseInfo {
+    pub mac: MacAddr,
+    pub ip: Ipv4Addr,
+    pub hostname: Option<String>,
+    pub expires_in_seconds: u64,
+    pub is_static: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -65,7 +82,7 @@ pub enum DhcpServerParentToWorkerMsg {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DhcpServerWorkerToParentMsg {
-    Heartbeat,
+    Heartbeat { leases: Vec<DhcpLeaseInfo> },
     RegisterLocalHost { name: String, ip: Ipv4Addr },
     DeregisterLocalHost { name: String },
 }
@@ -224,17 +241,30 @@ mod tests {
         assert_eq!(received, resolved_msg);
 
         // 8. Heartbeat messages
-        send_msg(&mut w2, &DnsWorkerToParentMsg::Heartbeat)
-            .await
-            .unwrap();
+        let dns_heartbeat = DnsWorkerToParentMsg::Heartbeat {
+            stats: DnsStatsInfo {
+                queries_total: 10,
+                cache_hits_total: 5,
+                cached_entries_count: 2,
+                rate_limited_drops_total: 0,
+            },
+        };
+        send_msg(&mut w2, &dns_heartbeat).await.unwrap();
         let received: DnsWorkerToParentMsg = recv_msg(&mut r1).await.unwrap().unwrap();
-        assert_eq!(received, DnsWorkerToParentMsg::Heartbeat);
+        assert_eq!(received, dns_heartbeat);
 
-        send_msg(&mut w2, &DhcpServerWorkerToParentMsg::Heartbeat)
-            .await
-            .unwrap();
+        let dhcp_heartbeat = DhcpServerWorkerToParentMsg::Heartbeat {
+            leases: vec![DhcpLeaseInfo {
+                mac: MacAddr::new(0x52, 0x54, 0x00, 0x12, 0x34, 0x56),
+                ip: Ipv4Addr::new(192, 168, 1, 100),
+                hostname: Some("test-client".to_string()),
+                expires_in_seconds: 3600,
+                is_static: false,
+            }],
+        };
+        send_msg(&mut w2, &dhcp_heartbeat).await.unwrap();
         let received: DhcpServerWorkerToParentMsg = recv_msg(&mut r1).await.unwrap().unwrap();
-        assert_eq!(received, DhcpServerWorkerToParentMsg::Heartbeat);
+        assert_eq!(received, dhcp_heartbeat);
 
         send_msg(&mut w2, &DhcpClientToParentMsg::Heartbeat)
             .await

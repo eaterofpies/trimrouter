@@ -25,6 +25,7 @@ It manages virtual filesystems, signal forwarding, orphan reaping, and launches 
   - **DHCP Server (LAN)**: Manages LAN lease allocations, address conflicts, and lease release/decline requests.
   - **DNS Forwarder/Proxy (LAN)**: Accepts inbound queries over both UDP and TCP (RFC 7766), resolves local split-horizon hostnames (`.lan`), serves cached records at wire speed, enforces per-client token-bucket rate limiting on upstream queries, and forwards uncached requests to WAN DNS resolvers with transaction ID randomization and spoofing defense.
   - **NTP Client (SNTP)**: Periodically synchronizes the router system time from time.google.com.
+  - **Web Dashboard & Observability (LAN)**: Always-on, read-only HTTP status dashboard on port 80 of the LAN gateway (`http://router.lan`), providing a single-page HTML/CSS/JS interface, JSON status inspection API (`/api/status`), recent logs (`/api/logs`), and real-time log streaming via Server-Sent Events (`/api/logs/stream`).
 
 ---
 
@@ -104,7 +105,8 @@ To boot the image interactively inside QEMU and inspect console output:
 ```bash
 make qemu
 ```
-*Press `Ctrl+A` then `X` to exit the QEMU console.*
+* Once booted, open `http://localhost:8080` in your host browser to access the live Web Dashboard and JSON API.
+* Press `Ctrl+A` then `X` to exit the QEMU console.
 
 ---
 

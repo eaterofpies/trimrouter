@@ -1,3 +1,4 @@
+use crate::services::observability::WatchdogActiveSender;
 use log::{debug, error, info, warn};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -285,17 +286,20 @@ pub fn init_and_spawn_watchdog(
     rx: HeartbeatReceiver,
     expected_services: Vec<MonitoredService>,
     shutdown_flag: Arc<AtomicBool>,
+    watchdog_active_tx: WatchdogActiveSender,
 ) {
     if !enabled {
         info!(
             "[watchdog] Hardware watchdog is disabled by configuration. Spawning dummy heartbeat consumer."
         );
+        let _ = watchdog_active_tx.send(false);
         spawn_dummy_heartbeat_consumer(rx);
         return;
     }
 
     match LinuxWatchdog::open(DEFAULT_WATCHDOG_PATH) {
         Ok(watchdog) => {
+            let _ = watchdog_active_tx.send(true);
             tokio::spawn(start_watchdog_monitor(
                 watchdog,
                 rx,
@@ -308,6 +312,7 @@ pub fn init_and_spawn_watchdog(
                 "[watchdog] Hardware watchdog device {} unavailable ({}). Spawning dummy heartbeat consumer.",
                 DEFAULT_WATCHDOG_PATH, e
             );
+            let _ = watchdog_active_tx.send(false);
             spawn_dummy_heartbeat_consumer(rx);
         }
     }

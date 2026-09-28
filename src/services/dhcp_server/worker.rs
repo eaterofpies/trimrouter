@@ -141,7 +141,15 @@ async fn run_server_loop(
     loop {
         tokio::select! {
             _ = heartbeat_timer.tick() => {
-                if let Err(e) = send_msg(&mut ipc_writer, &DhcpServerWorkerToParentMsg::Heartbeat).await {
+                let active_leases = leases.get_active_leases().await;
+                if let Err(e) = send_msg(
+                    &mut ipc_writer,
+                    &DhcpServerWorkerToParentMsg::Heartbeat {
+                        leases: active_leases,
+                    },
+                )
+                .await
+                {
                     debug!("[dhcp-server-worker] Failed to send heartbeat to parent: {}", e);
                 }
                 let expired_hostnames = leases.evict_expired().await;
@@ -163,7 +171,9 @@ async fn run_server_loop(
                         ip_address,
                         mac_address,
                     })) => {
-                        leases.add_neighbor(mac_address, ip_address).await;
+                        if config.net.contains(&ip_address) && ip_address != config.server_ip {
+                            leases.add_neighbor(mac_address, ip_address).await;
+                        }
                     }
                     Ok(Some(DhcpServerParentToWorkerMsg::SetStaticLeases {
                         leases: static_leases,

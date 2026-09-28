@@ -3,6 +3,7 @@ pub mod dhcp_server;
 pub mod dns_forwarder;
 pub mod ipc;
 pub mod lan;
+pub mod observability;
 pub mod sntp_client;
 pub mod supervisor;
 pub mod utils;
@@ -12,6 +13,7 @@ pub use dhcp_server::{DhcpServer, run_dhcp_server_worker};
 pub use dns_forwarder::{DnsForwarder, run_dns_forwarder_worker};
 pub use ipc::{LocalHostEvent, LocalHostReceiver, LocalHostSender};
 pub use lan::LanManager;
+pub use observability::{OBSERVABILITY_SERVICE_NAME, ObservabilityService};
 pub use sntp_client::{SntpClient, run_sntp_client_worker};
 pub use supervisor::{
     DHCP_CLIENT_SERVICE_NAME, DHCP_SERVER_SERVICE_NAME, DNS_FORWARDER_SERVICE_NAME, ExternalWorker,
@@ -30,6 +32,7 @@ mod tests {
         let (lease_tx, lease_rx) = tokio::sync::watch::channel(WanLease::default());
         let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(1);
         let (lh_tx, _lh_rx) = tokio::sync::mpsc::channel(1);
+        let receivers = observability::ObservabilityReceivers::from_wan_lease(lease_rx.clone());
 
         let dhcp_client = DhcpClient::with_heartbeat("wan".to_string(), lease_tx, hb_tx.clone());
         assert_eq!(dhcp_client.get_worker_pid(), 0);
@@ -39,6 +42,7 @@ mod tests {
             "192.168.1.1/24".to_string(),
             Some(hb_tx.clone()),
             Some(lh_tx.clone()),
+            observability::null_dhcp_leases_sender(),
             std::collections::HashMap::new(),
         );
         assert_eq!(dhcp_server.get_worker_pid(), 0);
@@ -56,13 +60,21 @@ mod tests {
             "wan".to_string(),
             "192.168.1.1/24".to_string(),
             "10.0.0.1/24".to_string(),
-            lease_rx.clone(),
+            receivers.clone(),
             Some(hb_tx),
             Some(lh_tx),
+            observability::null_dhcp_leases_sender(),
             std::collections::HashMap::new(),
             Vec::new(),
         );
 
-        let _sntp_client = SntpClient::new(lease_rx);
+        let _sntp_client = SntpClient::new(lease_rx, observability::null_sntp_status_sender());
+
+        let _observability = ObservabilityService::new(
+            "lan".to_string(),
+            "192.168.1.1/24".to_string(),
+            receivers,
+            observability::HTTP_PORT,
+        );
     }
 }

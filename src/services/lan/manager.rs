@@ -3,9 +3,10 @@ use crate::init::firewall;
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::network;
 use crate::services::ipc::LocalHostSender;
+use crate::services::observability::{DhcpLeasesSender, ObservabilityReceivers};
 use crate::services::supervisor::ServiceController;
-use crate::services::utils::{WanLeaseReceiver, mask_to_prefix_len};
-use crate::services::{DhcpServer, Service, ServiceError};
+use crate::services::utils::mask_to_prefix_len;
+use crate::services::{DhcpServer, ObservabilityService, Service, ServiceError};
 use futures_util::StreamExt;
 use ipnet::Ipv4Net;
 use log::{debug, error, info, warn};
@@ -26,10 +27,11 @@ pub struct LanManager {
     wan_interface: String,
     initial_ip: String,
     backup_ip: String,
-    lease_rx: WanLeaseReceiver,
+    receivers: ObservabilityReceivers,
     controller: ServiceController,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
+    dhcp_leases_tx: DhcpLeasesSender,
     static_leases: HashMap<MacAddr, Ipv4Addr>,
     port_forwards: Vec<PortForwardRule>,
 }
@@ -41,9 +43,10 @@ impl LanManager {
         wan_interface: String,
         initial_ip: String,
         backup_ip: String,
-        lease_rx: WanLeaseReceiver,
+        receivers: ObservabilityReceivers,
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_tx: Option<LocalHostSender>,
+        dhcp_leases_tx: DhcpLeasesSender,
         static_leases: HashMap<MacAddr, Ipv4Addr>,
         port_forwards: Vec<PortForwardRule>,
     ) -> Self {
@@ -52,10 +55,11 @@ impl LanManager {
             wan_interface,
             initial_ip,
             backup_ip,
-            lease_rx,
+            receivers,
             controller: ServiceController::new(),
             heartbeat_tx,
             local_hosts_tx,
+            dhcp_leases_tx,
             static_leases,
             port_forwards,
         }
@@ -69,9 +73,10 @@ impl Service for LanManager {
             self.wan_interface.clone(),
             self.initial_ip.clone(),
             self.backup_ip.clone(),
-            self.lease_rx.clone(),
+            self.receivers.clone(),
             self.heartbeat_tx.clone(),
             self.local_hosts_tx.clone(),
+            self.dhcp_leases_tx.clone(),
             self.static_leases.clone(),
             self.port_forwards.clone(),
         );
@@ -92,12 +97,14 @@ struct LanRunner {
     initial_ip: String,
     current_ip: String,
     backup_ip: String,
-    lease_rx: WanLeaseReceiver,
+    receivers: ObservabilityReceivers,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
+    dhcp_leases_tx: DhcpLeasesSender,
     static_leases: HashMap<MacAddr, Ipv4Addr>,
     port_forwards: Vec<PortForwardRule>,
     dhcp_server: DhcpServer,
+    observability_service: ObservabilityService,
 }
 
 impl LanRunner {
@@ -107,9 +114,10 @@ impl LanRunner {
         wan_interface: String,
         initial_ip: String,
         backup_ip: String,
-        lease_rx: WanLeaseReceiver,
+        receivers: ObservabilityReceivers,
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_tx: Option<LocalHostSender>,
+        dhcp_leases_tx: DhcpLeasesSender,
         static_leases: HashMap<MacAddr, Ipv4Addr>,
         port_forwards: Vec<PortForwardRule>,
     ) -> Self {
@@ -118,7 +126,14 @@ impl LanRunner {
             initial_ip.clone(),
             heartbeat_tx.clone(),
             local_hosts_tx.clone(),
+            dhcp_leases_tx.clone(),
             static_leases.clone(),
+        );
+        let observability_service = ObservabilityService::new(
+            lan_interface.clone(),
+            initial_ip.clone(),
+            receivers.clone(),
+            crate::services::observability::HTTP_PORT,
         );
         Self {
             lan_interface,
@@ -126,12 +141,24 @@ impl LanRunner {
             initial_ip: initial_ip.clone(),
             current_ip: initial_ip,
             backup_ip,
-            lease_rx,
+            receivers,
             heartbeat_tx,
             local_hosts_tx,
+            dhcp_leases_tx,
             static_leases,
             port_forwards,
             dhcp_server,
+            observability_service,
+        }
+    }
+
+    async fn stop_services(&mut self) {
+        info!("[lan-manager] Stopping LAN services...");
+        if let Err(e) = self.dhcp_server.stop().await {
+            error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
+        }
+        if let Err(e) = self.observability_service.stop().await {
+            error!("[lan-manager] Failed to stop Observability service: {}", e);
         }
     }
 
@@ -153,6 +180,10 @@ impl LanRunner {
             return;
         }
 
+        if let Err(e) = self.observability_service.start().await {
+            error!("[lan-manager] Failed to start Observability service: {}", e);
+        }
+
         let (connection, _handle, mut messages) = match rtnetlink::new_multicast_connection(&[
             MulticastGroup::Link,
             MulticastGroup::Ipv4Ifaddr,
@@ -160,12 +191,7 @@ impl LanRunner {
             Ok(res) => res,
             Err(e) => {
                 error!("[lan-manager] Failed to create multicast netlink: {}", e);
-                if let Err(stop_err) = self.dhcp_server.stop().await {
-                    error!(
-                        "[lan-manager] Failed to stop LAN DHCP server on error: {}",
-                        stop_err
-                    );
-                }
+                self.stop_services().await;
                 return;
             }
         };
@@ -181,7 +207,7 @@ impl LanRunner {
                 _ = sleep(LAN_HEARTBEAT_INTERVAL) => {
                     send_service_heartbeat(self.heartbeat_tx.as_ref(), MonitoredService::LanManager);
                 }
-                res = self.lease_rx.changed() => {
+                res = self.receivers.wan_lease.changed() => {
                     if res.is_err() {
                         break;
                     }
@@ -196,18 +222,12 @@ impl LanRunner {
             }
         }
 
-        info!("[lan-manager] Stopping LAN DHCP server...");
-        if let Err(e) = self.dhcp_server.stop().await {
-            error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
-        }
+        self.stop_services().await;
         info!("[lan-manager] LAN manager service stopped.");
     }
 
     async fn shift_lan_subnet(&mut self, new_ip: String) {
-        info!("[lan-manager] Stopping LAN DHCP server...");
-        if let Err(e) = self.dhcp_server.stop().await {
-            error!("[lan-manager] Failed to stop LAN DHCP server: {}", e);
-        }
+        self.stop_services().await;
 
         self.reconfigure_lan_interface_ip(&new_ip).await;
         self.current_ip = new_ip.clone();
@@ -216,6 +236,7 @@ impl LanRunner {
         let (remapped_leases, remapped_forwards) = self.compute_remapped_rules(&new_ip);
         self.update_firewall_for_subnet(&remapped_forwards);
         self.restart_dhcp_server_on_subnet(remapped_leases).await;
+        self.restart_observability_on_subnet().await;
 
         info!("[lan-manager] LAN subnet shifted successfully.");
     }
@@ -296,10 +317,24 @@ impl LanRunner {
             self.current_ip.clone(),
             self.heartbeat_tx.clone(),
             self.local_hosts_tx.clone(),
+            self.dhcp_leases_tx.clone(),
             remapped_leases,
         );
         if let Err(e) = self.dhcp_server.start().await {
             error!("[lan-manager] Failed to start LAN DHCP server: {}", e);
+        }
+    }
+
+    async fn restart_observability_on_subnet(&mut self) {
+        info!("[lan-manager] Restarting Observability service on new subnet...");
+        self.observability_service = ObservabilityService::new(
+            self.lan_interface.clone(),
+            self.current_ip.clone(),
+            self.receivers.clone(),
+            crate::services::observability::HTTP_PORT,
+        );
+        if let Err(e) = self.observability_service.start().await {
+            error!("[lan-manager] Failed to start Observability service: {}", e);
         }
     }
 
@@ -309,7 +344,7 @@ impl LanRunner {
     /// resolves the conflict by migrating the LAN interface and its DHCP server to `backup_ip`.
     async fn check_and_resolve(&mut self) {
         let wan_opt = {
-            let lease = self.lease_rx.borrow();
+            let lease = self.receivers.wan_lease.borrow();
             lease.ip.zip(lease.mask)
         };
 
@@ -470,7 +505,7 @@ pub fn remap_port_forwards_for_subnet(
 mod tests {
     use super::*;
     use crate::config::ForwardProtocol;
-    use crate::services::utils::WanLease;
+    use crate::services::utils::{WanLease, WanLeaseReceiver};
     use rtnetlink::packet_core::NetlinkPayload;
     use rtnetlink::packet_route::RouteNetlinkMessage;
     use rtnetlink::packet_route::address::AddressMessage;
@@ -488,9 +523,10 @@ mod tests {
             "wan".to_string(),
             current_ip.to_string(),
             backup_ip.to_string(),
-            lease_rx,
+            ObservabilityReceivers::from_wan_lease(lease_rx),
             None,
             None,
+            crate::services::observability::null_dhcp_leases_sender(),
             HashMap::new(),
             Vec::new(),
         )
@@ -661,9 +697,10 @@ mod tests {
             "wan".to_string(),
             "192.168.1.1/24".to_string(),
             "10.0.0.1/24".to_string(),
-            lease_rx,
+            ObservabilityReceivers::from_wan_lease(lease_rx),
             Some(hb_tx),
             Some(lh_tx),
+            crate::services::observability::null_dhcp_leases_sender(),
             HashMap::new(),
             Vec::new(),
         );

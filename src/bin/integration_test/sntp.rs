@@ -1,5 +1,6 @@
 use chrono::Datelike;
 use std::time::Duration;
+use trimrouter::services::observability::null_sntp_status_sender;
 use trimrouter::services::utils::WanLeaseReceiver;
 use trimrouter::services::{Service, SntpClient};
 
@@ -7,7 +8,7 @@ pub async fn test_sntp_sync(lease_rx: WanLeaseReceiver) -> Result<SntpClient, St
     std::println!("[test] Starting SNTP Client test...");
 
     // 1. Start SNTP Client
-    let mut sntp_client = SntpClient::new(lease_rx);
+    let mut sntp_client = SntpClient::new(lease_rx, null_sntp_status_sender());
     if let Err(e) = sntp_client.start().await {
         return Err(format!("Failed to start SNTP Client: {}", e));
     }

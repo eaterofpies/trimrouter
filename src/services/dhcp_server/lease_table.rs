@@ -54,6 +54,13 @@ impl LeaseTable {
 
     /// Updates the static lease reservations mapping.
     pub fn set_static_leases(&mut self, static_leases: HashMap<MacAddr, Ipv4Addr>) {
+        for (&mac, &reserved_ip) in &static_leases {
+            if let Some(existing) = self.by_mac.get(&mac)
+                && existing.ip != reserved_ip
+            {
+                self.remove(&mac);
+            }
+        }
         self.reserved_ips = static_leases.values().copied().collect();
         self.static_leases = static_leases;
     }
@@ -254,6 +261,11 @@ impl LeaseTable {
         if mac == MacAddr::zero() || mac == MacAddr::broadcast() {
             return;
         }
+        if let Some(&reserved_ip) = self.static_leases.get(&mac)
+            && ip != reserved_ip
+        {
+            return;
+        }
         if self.get(&mac).is_some_and(|existing| existing.ip == ip) {
             return;
         }
@@ -265,6 +277,26 @@ impl LeaseTable {
                 hostname: None,
             },
         );
+    }
+
+    /// Returns all active leases for telemetry and observability inspection.
+    pub fn get_active_leases(&self) -> Vec<crate::services::ipc::DhcpLeaseInfo> {
+        let now = Instant::now();
+        let mut result = Vec::new();
+        for (&mac, lease) in &self.by_mac {
+            if lease.expiry > now {
+                let remaining_secs = (lease.expiry - now).as_secs();
+                let is_static = self.static_leases.contains_key(&mac);
+                result.push(crate::services::ipc::DhcpLeaseInfo {
+                    mac,
+                    ip: lease.ip,
+                    hostname: lease.hostname.clone(),
+                    expires_in_seconds: remaining_secs,
+                    is_static,
+                });
+            }
+        }
+        result
     }
 
     /// Number of active leases. Used in tests.
@@ -337,6 +369,9 @@ pub enum LeaseCommand {
         static_leases: HashMap<MacAddr, Ipv4Addr>,
         reply_tx: oneshot::Sender<()>,
     },
+    GetActiveLeases {
+        reply_tx: oneshot::Sender<Vec<crate::services::ipc::DhcpLeaseInfo>>,
+    },
 }
 
 #[derive(Clone)]
@@ -345,6 +380,18 @@ pub struct LeaseHandle {
 }
 
 impl LeaseHandle {
+    pub async fn get_active_leases(&self) -> Vec<crate::services::ipc::DhcpLeaseInfo> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(LeaseCommand::GetActiveLeases { reply_tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.await.unwrap_or_default()
+    }
     pub async fn get_existing_ip(&self, client_mac: MacAddr) -> Option<Ipv4Addr> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -526,7 +573,12 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             client_mac,
             reply_tx,
         } => {
-            let _ = reply_tx.send(leases.get(&client_mac).map(|l| l.ip));
+            let ip = if let Some(&reserved_ip) = leases.static_leases.get(&client_mac) {
+                Some(reserved_ip)
+            } else {
+                leases.get(&client_mac).map(|l| l.ip)
+            };
+            let _ = reply_tx.send(ip);
         }
         LeaseCommand::AllocateCandidate {
             client_mac,
@@ -597,6 +649,10 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
         }
         LeaseCommand::AddNeighbor { mac, ip } => {
             leases.update_from_neighbor(mac, ip);
+        }
+        LeaseCommand::GetActiveLeases { reply_tx } => {
+            let active = leases.get_active_leases();
+            let _ = reply_tx.send(active);
         }
     }
 }

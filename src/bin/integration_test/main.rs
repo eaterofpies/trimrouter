@@ -20,6 +20,7 @@ mod dns_forwarder;
 mod firewall;
 mod lan_manager;
 mod logging;
+mod observability;
 mod sntp;
 mod supervisor;
 
@@ -467,6 +468,18 @@ async fn main() {
         }
         Err(e) => {
             std::println!("[test-control] TEST_FAILED logging_subsystem {}", e);
+            failed += 1;
+        }
+    }
+
+    // Test 9: Observability Subsystem
+    match observability::test_observability_subsystem(lease_rx.clone()).await {
+        Ok(_) => {
+            std::println!("[test-control] TEST_PASSED observability_subsystem");
+            passed += 1;
+        }
+        Err(e) => {
+            std::println!("[test-control] TEST_FAILED observability_subsystem {}", e);
             failed += 1;
         }
     }
