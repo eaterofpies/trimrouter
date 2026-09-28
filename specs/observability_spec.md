@@ -76,94 +76,12 @@ All endpoints are served over standard HTTP on port `80` of the LAN gateway IP a
 ### 4.2 Status JSON API (`GET /api/status`)
 
 * **Purpose**: Provides a structured JSON payload representing the complete operational state of the router for scripts, CLI tools (`curl`), or custom integrations.
-* **Payload Schema**:
-
-```json
-{
-  "system": {
-    "version": "0.3.0",
-    "git_sha": "f56161b",
-    "uptime_seconds": 86400,
-    "memory": {
-      "total_bytes": 134217728,
-      "used_bytes": 14680064,
-      "free_bytes": 119537664
-    },
-    "storage": {
-      "total_bytes": 104857600,
-      "used_bytes": 5242880,
-      "free_bytes": 99614720
-    },
-    "load_average": [0.05, 0.02, 0.00],
-    "watchdog_active": true
-  },
-  "network": {
-    "wan": {
-      "interface": "wan0",
-      "mac": "52:54:00:12:34:56",
-      "ip": "192.0.2.100",
-      "prefix_len": 24,
-      "gateway": "192.0.2.1",
-      "dns_servers": ["1.1.1.1", "1.0.0.1"],
-      "lease_expiry_seconds": 3600,
-      "rx_bytes": 104857600,
-      "tx_bytes": 52428800,
-      "rx_packets": 120000,
-      "tx_packets": 95000
-    },
-    "lan": {
-      "interface": "lan0",
-      "mac": "52:54:00:12:34:57",
-      "ip": "192.168.1.1",
-      "prefix_len": 24,
-      "mode": "primary",
-      "rx_bytes": 52428800,
-      "tx_bytes": 104857600,
-      "rx_packets": 95000,
-      "tx_packets": 120000
-    },
-    "arp_cache": [
-      {
-        "ip": "100.66.208.1",
-        "mac": "1c:90:be:da:13:c2",
-        "interface": "wan",
-        "flags": "0x2"
-      },
-      {
-        "ip": "192.168.1.4",
-        "mac": "a4:08:01:5f:63:cd",
-        "interface": "lan",
-        "flags": "0x2"
-      }
-    ]
-  },
-  "dhcp_server": {
-    "active_leases_count": 3,
-    "leases": [
-      {
-        "mac": "52:54:00:aa:bb:01",
-        "ip": "192.168.1.100",
-        "hostname": "workstation-1",
-        "expires_in_seconds": 41200,
-        "is_static": false
-      }
-    ]
-  },
-  "dns_forwarder": {
-    "queries_total": 15420,
-    "cache_hits_total": 11200,
-    "cache_hit_ratio": 0.726,
-    "cached_entries_count": 45,
-    "rate_limited_drops_total": 0
-  },
-  "sntp": {
-    "synchronized": true,
-    "last_sync_timestamp": "2026-09-27T18:30:00Z",
-    "stratum": 2,
-    "server": "time.google.com"
-  }
-}
-```
+* **Payload Schema**: The schema is defined by the `StatusResponse` structure in [`src/services/observability/status.rs`](../src/services/observability/status.rs) and encompasses:
+  * **`system`** (`SystemStatus`): Application version, Git commit SHA, system uptime, memory metrics (total/used/free), log storage space, CPU load averages (1m, 5m, 15m), and hardware watchdog active status.
+  * **`network`** (`NetworkStatus`): Interface configuration, hardware MACs, IP addresses, netmasks, gateways, DNS servers, traffic counters (RX/TX bytes and packets), subnet mode for `lan` (`primary` vs. `backup`), and live kernel `arp_cache` entries across WAN and LAN interfaces.
+  * **`dhcp_server`** (`DhcpServerStatus`): Total active leases count and active lease entries (`DhcpLeaseEntry`) including assigned IP, MAC, client hostname, remaining lease time, and static reservation indicator (`is_static`).
+  * **`dns_forwarder`** (`DnsForwarderStatus`): Query counters, cache hit totals, cache hit ratio, in-memory cached entries count, and rate-limit drop metrics.
+  * **`sntp`** (`SntpStatus`): Network time synchronization status, stratum, selected upstream NTP server, and timestamp of last synchronization.
 
 ---
 
@@ -173,18 +91,9 @@ All endpoints are served over standard HTTP on port `80` of the LAN gateway IP a
 * **Query Parameters**:
   * `lines` *(optional, integer, default: `100`, max: `500`)*: Number of recent log lines to retrieve.
   * `level` *(optional, string: `"error"`, `"warn"`, `"info"`, `"debug"`)*: Minimum severity filter.
-* **Response Format**:
-
-```json
-{
-  "total_lines_available": 500,
-  "lines": [
-    "[2026-09-27T18:30:00Z] [INFO] [init] System initialized successfully.",
-    "[2026-09-27T18:30:01Z] [INFO] [dhcp-client] Acquired WAN lease 192.0.2.100",
-    "[2026-09-27T18:30:02Z] [INFO] [dhcp-server] Assigned 192.168.1.100 to 52:54:00:aa:bb:01"
-  ]
-}
-```
+* **Response Format**: Defined by the `LogsResponse` struct in [`src/services/observability/status.rs`](../src/services/observability/status.rs) containing:
+  * **`total_lines_available`**: Total count of log lines currently retained in the in-memory ring buffer.
+  * **`lines`**: Array of formatted log string entries matching query constraints.
 
 ---
 
