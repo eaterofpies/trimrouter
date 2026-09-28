@@ -7,19 +7,19 @@
   "platformAutomerge": true,
   "packageRules": [
     {
-      "matchPackagePatterns": [
-        "*"
-      ],
       "groupName": "all dependencies",
       "groupSlug": "all",
-      "groupSingleUpdates": true
+      "groupSingleUpdates": true,
+      "matchPackageNames": [
+        "*"
+      ]
     }
   ],
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": [
-        "(^|/)Dockerfile$"
+      "managerFilePatterns": [
+        "/(^|/)Dockerfile$/"
       ],
       "matchStrings": [
         "#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+?)\\s+depName=(?<depName>[^\\s]+?)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+?))?(?:\\s+versioning=(?<versioning>[a-z-]+?))?\\nARG\\s+[A-Z_]+=\"(?<currentValue>[^\"]+)\""
