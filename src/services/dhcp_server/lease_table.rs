@@ -54,6 +54,13 @@ impl LeaseTable {
 
     /// Updates the static lease reservations mapping.
     pub fn set_static_leases(&mut self, static_leases: HashMap<MacAddr, Ipv4Addr>) {
+        for (&mac, &reserved_ip) in &static_leases {
+            if let Some(existing) = self.by_mac.get(&mac)
+                && existing.ip != reserved_ip
+            {
+                self.remove(&mac);
+            }
+        }
         self.reserved_ips = static_leases.values().copied().collect();
         self.static_leases = static_leases;
     }
@@ -252,6 +259,11 @@ impl LeaseTable {
     /// Records or updates an active neighbor mapping received from Netlink.
     pub fn update_from_neighbor(&mut self, mac: MacAddr, ip: Ipv4Addr) {
         if mac == MacAddr::zero() || mac == MacAddr::broadcast() {
+            return;
+        }
+        if let Some(&reserved_ip) = self.static_leases.get(&mac)
+            && ip != reserved_ip
+        {
             return;
         }
         if self.get(&mac).is_some_and(|existing| existing.ip == ip) {
@@ -561,7 +573,12 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             client_mac,
             reply_tx,
         } => {
-            let _ = reply_tx.send(leases.get(&client_mac).map(|l| l.ip));
+            let ip = if let Some(&reserved_ip) = leases.static_leases.get(&client_mac) {
+                Some(reserved_ip)
+            } else {
+                leases.get(&client_mac).map(|l| l.ip)
+            };
+            let _ = reply_tx.send(ip);
         }
         LeaseCommand::AllocateCandidate {
             client_mac,

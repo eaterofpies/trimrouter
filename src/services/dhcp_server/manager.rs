@@ -4,6 +4,7 @@ use crate::services::ipc::{
     DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, LocalHostEvent, LocalHostSender,
     async_unix_stream, recv_msg, send_msg,
 };
+use crate::services::observability::DhcpLeasesSender;
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{setup_worker_sockets, terminate_worker};
 use futures_util::StreamExt;
@@ -26,6 +27,7 @@ pub struct DhcpServer {
     state: ExternalWorker,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
+    leases_tx: DhcpLeasesSender,
     static_leases: HashMap<MacAddr, Ipv4Addr>,
 }
 
@@ -35,6 +37,7 @@ impl DhcpServer {
         lan_ip: String,
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_tx: Option<LocalHostSender>,
+        leases_tx: DhcpLeasesSender,
         static_leases: HashMap<MacAddr, Ipv4Addr>,
     ) -> Self {
         Self {
@@ -43,6 +46,7 @@ impl DhcpServer {
             state: ExternalWorker::new(DHCP_SERVER_SERVICE_NAME),
             heartbeat_tx,
             local_hosts_tx,
+            leases_tx,
             static_leases,
         }
     }
@@ -62,35 +66,44 @@ fn start_parent_arp_listener(
     shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
+    leases_tx: DhcpLeasesSender,
     static_leases: HashMap<MacAddr, Ipv4Addr>,
 ) -> Result<JoinHandle<()>, ServiceError> {
     let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
 
-    let handle = tokio::spawn(run_parent_dhcp_server_monitor(
+    let params = DhcpMonitorParams {
         child_pid,
-        ipc_writer,
-        ipc_reader,
         shutdown_rx,
         heartbeat_tx,
         local_hosts_tx,
+        leases_tx,
         static_leases,
+    };
+
+    let handle = tokio::spawn(run_parent_dhcp_server_monitor(
+        ipc_writer, ipc_reader, params,
     ));
 
     Ok(handle)
 }
 
-async fn run_parent_dhcp_server_monitor(
+struct DhcpMonitorParams {
     child_pid: u32,
-    mut ipc_writer: OwnedWriteHalf,
-    mut ipc_reader: OwnedReadHalf,
-    mut shutdown_rx: Receiver<bool>,
+    shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
+    leases_tx: DhcpLeasesSender,
     static_leases: HashMap<MacAddr, Ipv4Addr>,
+}
+
+async fn run_parent_dhcp_server_monitor(
+    mut ipc_writer: OwnedWriteHalf,
+    mut ipc_reader: OwnedReadHalf,
+    mut params: DhcpMonitorParams,
 ) {
     let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
-        leases: static_leases.into_iter().collect(),
+        leases: params.static_leases.into_iter().collect(),
     };
     if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
         error!(
@@ -107,7 +120,7 @@ async fn run_parent_dhcp_server_monitor(
                     "[dhcp-server-parent] Failed to start Netlink ARP listener: {}",
                     e
                 );
-                terminate_worker(child_pid).await;
+                terminate_worker(params.child_pid).await;
                 return;
             }
         };
@@ -115,27 +128,27 @@ async fn run_parent_dhcp_server_monitor(
 
     info!(
         "[dhcp-server-parent] Supervising DHCP server worker (PID {})",
-        child_pid
+        params.child_pid
     );
     loop {
         tokio::select! {
-            _ = shutdown_rx.changed() => break,
+            _ = params.shutdown_rx.changed() => break,
             ipc_msg = recv_msg::<DhcpServerWorkerToParentMsg, _>(&mut ipc_reader) => {
                 match ipc_msg {
                     Ok(Some(DhcpServerWorkerToParentMsg::Heartbeat { leases })) => {
                         send_service_heartbeat(
-                            heartbeat_tx.as_ref(),
+                            params.heartbeat_tx.as_ref(),
                             MonitoredService::LanManager,
                         );
-                        crate::services::observability::update_dhcp_leases(leases);
+                        let _ = params.leases_tx.send(leases);
                     }
                     Ok(Some(DhcpServerWorkerToParentMsg::RegisterLocalHost { name, ip })) => {
-                        if let Some(ref tx) = local_hosts_tx {
+                        if let Some(ref tx) = params.local_hosts_tx {
                             let _ = tx.send(LocalHostEvent::Register { name, ip }).await;
                         }
                     }
                     Ok(Some(DhcpServerWorkerToParentMsg::DeregisterLocalHost { name })) => {
-                        if let Some(ref tx) = local_hosts_tx {
+                        if let Some(ref tx) = params.local_hosts_tx {
                             let _ = tx.send(LocalHostEvent::Deregister { name }).await;
                         }
                     }
@@ -163,7 +176,7 @@ async fn run_parent_dhcp_server_monitor(
         }
     }
 
-    terminate_worker(child_pid).await;
+    terminate_worker(params.child_pid).await;
 }
 
 fn parse_neighbor_update(
@@ -214,6 +227,7 @@ impl Service for DhcpServer {
         let lan_ip = self.lan_ip.clone();
         let heartbeat_tx = self.heartbeat_tx.clone();
         let local_hosts_tx = self.local_hosts_tx.clone();
+        let leases_tx = self.leases_tx.clone();
         let static_leases = self.static_leases.clone();
 
         self.state.start_supervised(
@@ -225,6 +239,7 @@ impl Service for DhcpServer {
                     shutdown_rx,
                     heartbeat_tx.clone(),
                     local_hosts_tx.clone(),
+                    leases_tx.clone(),
                     static_leases.clone(),
                 )
             },
@@ -250,6 +265,7 @@ mod tests {
             "192.168.1.1/24".to_string(),
             Some(hb_tx),
             Some(lh_tx),
+            crate::services::observability::null_dhcp_leases_sender(),
             HashMap::new(),
         );
         assert_eq!(srv.get_worker_pid(), 0);

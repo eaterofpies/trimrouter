@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use trimrouter::network;
+use trimrouter::services::observability::{ObservabilityReceivers, null_dhcp_leases_sender};
 use trimrouter::services::utils::{WanLease, WanLeaseReceiver, WanLeaseSender};
 use trimrouter::services::{LanManager, Service};
 
@@ -23,9 +24,10 @@ pub async fn test_lan_wan_conflict(
         "wan".to_string(),
         "192.168.1.1/24".to_string(),
         "10.0.0.1/24".to_string(),
-        lease_rx,
+        ObservabilityReceivers::from_wan_lease(lease_rx),
         None,
         None,
+        null_dhcp_leases_sender(),
         HashMap::new(),
         Vec::new(),
     );
@@ -112,6 +114,9 @@ pub async fn test_lan_wan_conflict(
     if let Err(e) = lan_manager.stop().await {
         return Err(format!("Failed to stop LanManager: {}", e));
     }
+    if let Some(index) = network::get_interface_index("wan").await {
+        let _ = network::flush_ipv4_addresses("wan", index).await;
+    }
 
     Ok(())
 }
@@ -147,9 +152,10 @@ pub async fn test_lan_dhcp_handshake(lease_rx: WanLeaseReceiver) -> Result<LanMa
         "wan".to_string(),
         "192.168.1.1/24".to_string(),
         "10.0.0.1/24".to_string(),
-        lease_rx,
+        ObservabilityReceivers::from_wan_lease(lease_rx),
         None,
         None,
+        null_dhcp_leases_sender(),
         HashMap::new(),
         Vec::new(),
     );
@@ -195,9 +201,10 @@ pub async fn test_lan_static_lease(lease_rx: WanLeaseReceiver) -> Result<(), Str
         "wan".to_string(),
         "192.168.1.1/24".to_string(),
         "10.0.0.1/24".to_string(),
-        lease_rx,
+        ObservabilityReceivers::from_wan_lease(lease_rx),
         None,
         None,
+        null_dhcp_leases_sender(),
         static_leases,
         Vec::new(),
     );

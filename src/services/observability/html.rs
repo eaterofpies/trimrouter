@@ -191,6 +191,13 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </div>
 
   <script>
+    function escapeHtml(text) {
+      if (text === null || text === undefined) return '';
+      const d = document.createElement('div');
+      d.textContent = String(text);
+      return d.innerHTML;
+    }
+
     function formatBytes(bytes) {
       if (bytes === 0 || !bytes) return '0 B';
       const k = 1024;
@@ -373,9 +380,9 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         if (data.dhcp_server.leases && data.dhcp_server.leases.length > 0) {
           tbody.innerHTML = data.dhcp_server.leases.map(l => `
             <tr>
-              <td>${l.ip}</td>
-              <td>${l.mac}</td>
-              <td>${l.hostname || '<span style="color:var(--text-muted);">unknown</span>'}</td>
+              <td>${escapeHtml(l.ip)}</td>
+              <td>${escapeHtml(l.mac)}</td>
+              <td>${l.hostname ? escapeHtml(l.hostname) : '<span style="color:var(--text-muted);">unknown</span>'}</td>
               <td>${formatUptime(l.expires_in_seconds)}</td>
               <td><span class="badge" style="font-size:0.7rem;">${l.is_static ? 'STATIC' : 'DYNAMIC'}</span></td>
             </tr>
@@ -423,7 +430,7 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
       const div = document.createElement('div');
       div.className = 'log-line';
-      div.innerHTML = `<span class="log-ts">[${parsed.ts}]</span><span class="log-line log-${parsed.level}">[${parsed.level}]</span> <span class="log-svc">[${parsed.svc}]</span> <span class="log-msg">${escapeHtml(parsed.msg)}</span>`;
+      div.innerHTML = `<span class="log-ts">[${escapeHtml(parsed.ts)}]</span><span class="log-line log-${escapeHtml(parsed.level)}">[${escapeHtml(parsed.level)}]</span> <span class="log-svc">[${escapeHtml(parsed.svc)}]</span> <span class="log-msg">${escapeHtml(parsed.msg)}</span>`;
       terminal.appendChild(div);
 
       if (autoscrollChk.checked) {
@@ -432,12 +439,6 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       if (terminal.childNodes.length > 500) {
         terminal.removeChild(terminal.firstChild);
       }
-    }
-
-    function escapeHtml(text) {
-      const d = document.createElement('div');
-      d.textContent = text;
-      return d.innerHTML;
     }
 
     // Connect SSE stream

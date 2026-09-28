@@ -9,6 +9,11 @@ pub mod watchdog;
 use crate::config::RouterConfig;
 use crate::interface;
 use crate::network;
+use crate::services::ipc::DnsStatsInfo;
+use crate::services::observability::{
+    DhcpLeasesSender, ObservabilityReceivers, SntpStatus, SntpStatusSender, WatchdogActiveReceiver,
+    WatchdogActiveSender,
+};
 use crate::services::{self, CHROOT_JAIL_PATH, Service};
 use log::{error, info, warn};
 use nix::unistd::Pid;
@@ -33,16 +38,24 @@ pub async fn run_as_init(sys: Arc<RealSystem>) {
     let config = early_boot(sys.clone());
 
     let (heartbeat_tx, heartbeat_rx) = tokio::sync::mpsc::channel(HEARTBEAT_CHANNEL_CAPACITY);
+    let (watchdog_active_tx, watchdog_active_rx) = tokio::sync::watch::channel(false);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let sig_handle = start_system_services(
         sys.clone(),
         shutdown_flag.clone(),
         config.watchdog,
         heartbeat_rx,
+        watchdog_active_tx,
     );
 
-    let mut dns_forwarder =
-        configure_networking_and_services(sys, config, heartbeat_tx, shutdown_flag.clone()).await;
+    let mut dns_forwarder = configure_networking_and_services(
+        sys,
+        config,
+        heartbeat_tx,
+        watchdog_active_rx,
+        shutdown_flag.clone(),
+    )
+    .await;
 
     // Keep the main thread alive waiting for the signal handler to finish
     if let Err(e) = sig_handle.await {
@@ -180,6 +193,7 @@ fn start_system_services(
     shutdown_flag: Arc<AtomicBool>,
     watchdog_enabled: bool,
     heartbeat_rx: HeartbeatReceiver,
+    watchdog_active_tx: WatchdogActiveSender,
 ) -> JoinHandle<()> {
     // Spawn orphan process reaper
     let reaper_sys = sys.clone();
@@ -202,6 +216,7 @@ fn start_system_services(
         heartbeat_rx,
         expected_services,
         shutdown_flag.clone(),
+        watchdog_active_tx,
     );
 
     // Spawn system signal monitor
@@ -216,11 +231,22 @@ async fn configure_networking_and_services(
     sys: Arc<RealSystem>,
     config: RouterConfig,
     heartbeat_tx: HeartbeatSender,
+    watchdog_active_rx: WatchdogActiveReceiver,
     _shutdown_flag: Arc<AtomicBool>,
 ) -> services::DnsForwarder {
     setup_loopback_and_firewall(sys.as_ref(), &config).await;
 
     let (lease_tx, lease_rx) = tokio::sync::watch::channel(services::WanLease::default());
+    let (dhcp_leases_tx, dhcp_leases_rx) = tokio::sync::watch::channel(Vec::new());
+    let (dns_stats_tx, dns_stats_rx) = tokio::sync::watch::channel(DnsStatsInfo::default());
+    let (sntp_status_tx, sntp_status_rx) = tokio::sync::watch::channel(SntpStatus::default());
+    let observability_receivers = ObservabilityReceivers::new(
+        lease_rx.clone(),
+        dhcp_leases_rx,
+        dns_stats_rx,
+        sntp_status_rx,
+        watchdog_active_rx,
+    );
     let (local_hosts_tx, local_hosts_rx) =
         tokio::sync::mpsc::channel::<services::LocalHostEvent>(64);
 
@@ -231,11 +257,12 @@ async fn configure_networking_and_services(
         });
     }
 
-    let mut dns_forwarder = services::DnsForwarder::with_custom_dns(
+    let mut dns_forwarder = services::DnsForwarder::new(
         lease_rx.clone(),
         config.dns_servers.clone(),
         Some(heartbeat_tx.clone()),
         Some(local_hosts_rx),
+        dns_stats_tx,
     );
     if let Err(e) = dns_forwarder.start().await {
         error!("[init] Failed to start DNS forwarder: {}", e);
@@ -247,6 +274,9 @@ async fn configure_networking_and_services(
         lease_rx,
         heartbeat_tx.clone(),
         local_hosts_tx,
+        observability_receivers,
+        dhcp_leases_tx,
+        sntp_status_tx,
     );
     tokio::spawn(interface::monitor_interfaces(
         managed_ifaces,
@@ -274,12 +304,16 @@ async fn setup_loopback_and_firewall(sys: &RealSystem, config: &RouterConfig) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_managed_interfaces(
     config: &RouterConfig,
     lease_tx: services::WanLeaseSender,
     lease_rx: services::WanLeaseReceiver,
     heartbeat_tx: HeartbeatSender,
     local_hosts_tx: services::LocalHostSender,
+    observability_receivers: ObservabilityReceivers,
+    dhcp_leases_tx: DhcpLeasesSender,
+    sntp_status_tx: SntpStatusSender,
 ) -> Vec<interface::ManagedInterface> {
     let wan_services = vec![
         interface::RouterService::DhcpClient(services::DhcpClient::with_heartbeat(
@@ -287,7 +321,10 @@ fn build_managed_interfaces(
             lease_tx,
             heartbeat_tx.clone(),
         )),
-        interface::RouterService::SntpClient(services::SntpClient::new(lease_rx.clone())),
+        interface::RouterService::SntpClient(services::SntpClient::new(
+            lease_rx.clone(),
+            sntp_status_tx,
+        )),
     ];
     let wan_iface = interface::ManagedInterface::new(
         network::WAN_INTERFACE.to_string(),
@@ -295,26 +332,20 @@ fn build_managed_interfaces(
         wan_services,
     );
 
-    let lan_services = vec![
-        interface::RouterService::LanManager(services::LanManager::new(
+    let lan_services = vec![interface::RouterService::LanManager(
+        services::LanManager::new(
             network::LAN_INTERFACE.to_string(),
             network::WAN_INTERFACE.to_string(),
             config.lan_ip.clone(),
             config.backup_lan_ip.clone(),
-            lease_rx.clone(),
+            observability_receivers,
             Some(heartbeat_tx),
             Some(local_hosts_tx),
+            dhcp_leases_tx,
             config.static_leases.clone(),
             config.port_forwards.clone(),
-        )),
-        interface::RouterService::Observability(services::ObservabilityService::new(
-            network::LAN_INTERFACE.to_string(),
-            config.lan_ip.clone(),
-            lease_rx,
-            config.watchdog,
-            services::observability::HTTP_PORT,
-        )),
-    ];
+        ),
+    )];
     let lan_iface = interface::ManagedInterface::new(
         network::LAN_INTERFACE.to_string(),
         config.lan_mac,
@@ -335,6 +366,7 @@ mod tests {
         let (lease_tx, lease_rx) = tokio::sync::watch::channel(services::WanLease::default());
         let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(1);
         let (lh_tx, _lh_rx) = tokio::sync::mpsc::channel(1);
+        let receivers = ObservabilityReceivers::from_wan_lease(lease_rx.clone());
 
         let config = RouterConfig {
             lan_ip: "192.168.1.1/24".to_string(),
@@ -348,7 +380,16 @@ mod tests {
             port_forwards: Vec::new(),
         };
 
-        let ifaces = build_managed_interfaces(&config, lease_tx, lease_rx, hb_tx, lh_tx);
+        let ifaces = build_managed_interfaces(
+            &config,
+            lease_tx,
+            lease_rx,
+            hb_tx,
+            lh_tx,
+            receivers,
+            services::observability::null_dhcp_leases_sender(),
+            services::observability::null_sntp_status_sender(),
+        );
         assert_eq!(ifaces.len(), 2);
 
         // WAN interface assertions
@@ -359,6 +400,6 @@ mod tests {
         // LAN interface assertions
         assert_eq!(ifaces[1].name, "lan");
         assert_eq!(ifaces[1].mac, config.lan_mac);
-        assert_eq!(ifaces[1].active_services.len(), 2);
+        assert_eq!(ifaces[1].active_services.len(), 1);
     }
 }

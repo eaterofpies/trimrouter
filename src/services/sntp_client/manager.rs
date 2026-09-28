@@ -2,6 +2,7 @@ use crate::cli::WorkerService;
 use crate::services::ipc::{
     SntpClientToParentMsg, SntpParentToClientMsg, async_unix_stream, recv_msg, send_msg,
 };
+use crate::services::observability::{SntpStatus, SntpStatusSender};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceController, ServiceError};
 use crate::services::utils::{
     NTP_PORT, WanLeaseReceiver, create_ipc_fds, is_valid_ntp_server_ip, terminate_worker,
@@ -22,13 +23,15 @@ const DEFAULT_NTP_SERVER: &str = "time.google.com";
 
 pub struct SntpClient {
     lease_rx: WanLeaseReceiver,
+    status_tx: SntpStatusSender,
     controller: ServiceController,
 }
 
 impl SntpClient {
-    pub fn new(lease_rx: WanLeaseReceiver) -> Self {
+    pub fn new(lease_rx: WanLeaseReceiver, status_tx: SntpStatusSender) -> Self {
         Self {
             lease_rx,
+            status_tx,
             controller: ServiceController::new(),
         }
     }
@@ -65,13 +68,14 @@ async fn resolve_time_server_ip() -> Result<Ipv4Addr, String> {
 async fn handle_sntp_ipc_msg(
     msg: Result<Option<SntpClientToParentMsg>, std::io::Error>,
     active_child: &mut Option<(u32, OwnedReadHalf, OwnedWriteHalf)>,
+    status_tx: &SntpStatusSender,
 ) {
     match msg {
         Ok(Some(SntpClientToParentMsg::SetSystemTime {
             seconds,
             nanoseconds,
         })) => {
-            set_system_clock(seconds, nanoseconds);
+            set_system_clock(seconds, nanoseconds, status_tx);
         }
         Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) => {
             if let Some((_, _, writer)) = active_child.as_mut() {
@@ -99,7 +103,11 @@ async fn handle_sntp_ipc_msg(
     }
 }
 
-async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: Receiver<bool>) {
+async fn run_sntp_manager_loop(
+    mut lease_rx: WanLeaseReceiver,
+    mut shutdown_rx: Receiver<bool>,
+    status_tx: SntpStatusSender,
+) {
     let mut active_child: Option<(u32, OwnedReadHalf, OwnedWriteHalf)> = None;
 
     // 1. Initial check on startup
@@ -134,7 +142,7 @@ async fn run_sntp_manager_loop(mut lease_rx: WanLeaseReceiver, mut shutdown_rx: 
                     None => std::future::pending().await,
                 }
             } => {
-                handle_sntp_ipc_msg(msg, &mut active_child).await;
+                handle_sntp_ipc_msg(msg, &mut active_child, &status_tx).await;
             }
         }
     }
@@ -170,7 +178,7 @@ fn spawn_sntp_worker() -> Result<(u32, OwnedReadHalf, OwnedWriteHalf), ServiceEr
     Ok((child_pid, ipc_reader, ipc_writer))
 }
 
-fn set_system_clock(seconds: i64, nanoseconds: i64) {
+fn set_system_clock(seconds: i64, nanoseconds: i64, status_tx: &SntpStatusSender) {
     if !is_valid_system_time(seconds, nanoseconds) {
         warn!(
             "[sntp-client-parent] Rejecting invalid/insane system time: seconds={}, nanoseconds={}",
@@ -183,7 +191,12 @@ fn set_system_clock(seconds: i64, nanoseconds: i64) {
         error!("[sntp-client-parent] Failed to set system clock: {}", e);
     } else {
         info!("[sntp-client-parent] Successfully set system clock.");
-        crate::services::observability::update_sntp_sync(DEFAULT_NTP_SERVER, 2);
+        let _ = status_tx.send(SntpStatus {
+            synchronized: true,
+            last_sync_timestamp: Some(chrono::Utc::now().to_rfc3339()),
+            stratum: Some(2),
+            server: Some(DEFAULT_NTP_SERVER.to_string()),
+        });
     }
 }
 
@@ -195,8 +208,9 @@ fn is_valid_system_time(seconds: i64, nanoseconds: i64) -> bool {
 impl Service for SntpClient {
     async fn start(&mut self) -> Result<(), ServiceError> {
         let lease_rx = self.lease_rx.clone();
+        let status_tx = self.status_tx.clone();
         self.controller.start(|shutdown_rx| async move {
-            run_sntp_manager_loop(lease_rx, shutdown_rx).await;
+            run_sntp_manager_loop(lease_rx, shutdown_rx, status_tx).await;
         })
     }
 
@@ -247,6 +261,9 @@ mod tests {
     #[test]
     fn test_sntp_client_new() {
         let (_tx, lease_rx) = tokio::sync::watch::channel(crate::services::WanLease::default());
-        let _client = SntpClient::new(lease_rx);
+        let _client = SntpClient::new(
+            lease_rx,
+            crate::services::observability::null_sntp_status_sender(),
+        );
     }
 }

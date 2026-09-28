@@ -1,11 +1,86 @@
 use crate::services::ipc::{DhcpLeaseInfo, DnsStatsInfo};
-use crate::services::utils::{WanLease, mask_to_prefix_len};
-use chrono::Utc;
+use crate::services::utils::{WanLease, WanLeaseReceiver, mask_to_prefix_len};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs;
 use std::path::Path;
-use std::sync::{OnceLock, RwLock};
+use tokio::sync::watch::{Receiver, Sender};
+
+pub type DnsStatsSender = Sender<DnsStatsInfo>;
+pub type DnsStatsReceiver = Receiver<DnsStatsInfo>;
+
+pub type DhcpLeasesSender = Sender<Vec<DhcpLeaseInfo>>;
+pub type DhcpLeasesReceiver = Receiver<Vec<DhcpLeaseInfo>>;
+
+pub type SntpStatusSender = Sender<SntpStatus>;
+pub type SntpStatusReceiver = Receiver<SntpStatus>;
+
+pub type WatchdogActiveSender = Sender<bool>;
+pub type WatchdogActiveReceiver = Receiver<bool>;
+
+pub fn null_dhcp_leases_sender() -> DhcpLeasesSender {
+    tokio::sync::watch::channel(Vec::new()).0
+}
+
+pub fn null_dns_stats_sender() -> DnsStatsSender {
+    tokio::sync::watch::channel(DnsStatsInfo::default()).0
+}
+
+pub fn null_sntp_status_sender() -> SntpStatusSender {
+    tokio::sync::watch::channel(SntpStatus::default()).0
+}
+
+pub fn null_watchdog_active_sender() -> WatchdogActiveSender {
+    tokio::sync::watch::channel(false).0
+}
+
+#[derive(Clone)]
+pub struct ObservabilityReceivers {
+    pub wan_lease: WanLeaseReceiver,
+    pub dhcp_leases: DhcpLeasesReceiver,
+    pub dns_stats: DnsStatsReceiver,
+    pub sntp_status: SntpStatusReceiver,
+    pub watchdog_active: WatchdogActiveReceiver,
+}
+
+impl ObservabilityReceivers {
+    pub fn new(
+        wan_lease: WanLeaseReceiver,
+        dhcp_leases: DhcpLeasesReceiver,
+        dns_stats: DnsStatsReceiver,
+        sntp_status: SntpStatusReceiver,
+        watchdog_active: WatchdogActiveReceiver,
+    ) -> Self {
+        Self {
+            wan_lease,
+            dhcp_leases,
+            dns_stats,
+            sntp_status,
+            watchdog_active,
+        }
+    }
+
+    pub fn from_wan_lease(wan_lease: WanLeaseReceiver) -> Self {
+        let (_tx2, dhcp_leases) = tokio::sync::watch::channel(Vec::new());
+        let (_tx3, dns_stats) = tokio::sync::watch::channel(DnsStatsInfo::default());
+        let (_tx4, sntp_status) = tokio::sync::watch::channel(SntpStatus::default());
+        let (_tx5, watchdog_active) = tokio::sync::watch::channel(false);
+        Self::new(
+            wan_lease,
+            dhcp_leases,
+            dns_stats,
+            sntp_status,
+            watchdog_active,
+        )
+    }
+}
+
+impl Default for ObservabilityReceivers {
+    fn default() -> Self {
+        let (_tx1, wan_lease) = tokio::sync::watch::channel(WanLease::default());
+        Self::from_wan_lease(wan_lease)
+    }
+}
 
 pub const DEFAULT_WAN_INTERFACE: &str = "wan";
 pub const DEFAULT_LAN_INTERFACE: &str = "lan";
@@ -128,74 +203,6 @@ pub struct SntpStatus {
 pub struct LogsResponse {
     pub total_lines_available: usize,
     pub lines: Vec<String>,
-}
-
-#[derive(Default)]
-pub struct ObservabilityTracker {
-    pub dns_stats: RwLock<DnsStatsInfo>,
-    pub dhcp_leases: RwLock<Vec<DhcpLeaseInfo>>,
-    pub sntp_state: RwLock<SntpStatus>,
-    pub lan_interface: RwLock<String>,
-    pub lan_ip: RwLock<String>,
-    pub initial_lan_ip: RwLock<String>,
-}
-
-static OBSERVABILITY_TRACKER: OnceLock<ObservabilityTracker> = OnceLock::new();
-
-pub fn get_tracker() -> &'static ObservabilityTracker {
-    OBSERVABILITY_TRACKER.get_or_init(|| ObservabilityTracker {
-        dns_stats: RwLock::new(DnsStatsInfo::default()),
-        dhcp_leases: RwLock::new(Vec::new()),
-        sntp_state: RwLock::new(SntpStatus {
-            synchronized: false,
-            last_sync_timestamp: None,
-            stratum: None,
-            server: None,
-        }),
-        lan_interface: RwLock::new(DEFAULT_LAN_INTERFACE.to_string()),
-        lan_ip: RwLock::new("192.168.1.1/24".to_string()),
-        initial_lan_ip: RwLock::new("192.168.1.1/24".to_string()),
-    })
-}
-
-pub fn update_dns_stats(stats: DnsStatsInfo) {
-    if let Ok(mut lock) = get_tracker().dns_stats.write() {
-        *lock = stats;
-    }
-}
-
-pub fn update_dhcp_leases(leases: Vec<DhcpLeaseInfo>) {
-    if let Ok(mut lock) = get_tracker().dhcp_leases.write() {
-        *lock = leases;
-    }
-}
-
-pub fn update_sntp_sync(server: &str, stratum: u8) {
-    if let Ok(mut lock) = get_tracker().sntp_state.write() {
-        lock.synchronized = true;
-        lock.last_sync_timestamp = Some(Utc::now().to_rfc3339());
-        lock.stratum = Some(stratum);
-        lock.server = Some(server.to_string());
-    }
-}
-
-pub fn set_lan_info(interface: &str, initial_lan_ip: &str) {
-    let tracker = get_tracker();
-    if let Ok(mut lock) = tracker.lan_interface.write() {
-        *lock = interface.to_string();
-    }
-    if let Ok(mut lock) = tracker.initial_lan_ip.write() {
-        *lock = initial_lan_ip.to_string();
-    }
-    if let Ok(mut lock) = tracker.lan_ip.write() {
-        *lock = initial_lan_ip.to_string();
-    }
-}
-
-pub fn update_current_lan_ip(current_lan_ip: &str) {
-    if let Ok(mut lock) = get_tracker().lan_ip.write() {
-        *lock = current_lan_ip.to_string();
-    }
 }
 
 pub fn parse_uptime_str(content: &str) -> u64 {
@@ -389,17 +396,13 @@ pub fn collect_wan_status(wan_lease: &WanLease, wan_iface: &str) -> WanStatus {
     }
 }
 
-pub fn collect_lan_status(
-    lan_iface: &str,
-    current_lan_ip_str: &str,
-    initial_lan_ip_str: &str,
-) -> LanStatus {
+pub fn collect_lan_status(lan_iface: &str, current_lan_ip_str: &str) -> LanStatus {
     let lan_mac = read_interface_mac(lan_iface);
     let (rx_bytes, tx_bytes, rx_packets, tx_packets) = read_interface_traffic(lan_iface);
     let lan_net = current_lan_ip_str
         .parse::<ipnet::Ipv4Net>()
         .unwrap_or_else(|_| "192.168.1.1/24".parse().unwrap());
-    let mode = if current_lan_ip_str == initial_lan_ip_str {
+    let mode = if current_lan_ip_str.starts_with("192.168.1.") {
         "primary".to_string()
     } else {
         "backup".to_string()
@@ -423,27 +426,20 @@ pub fn collect_network_status(
     wan_iface: &str,
     lan_iface: &str,
     current_lan_ip_str: &str,
-    initial_lan_ip_str: &str,
 ) -> NetworkStatus {
     NetworkStatus {
         wan: collect_wan_status(wan_lease, wan_iface),
-        lan: collect_lan_status(lan_iface, current_lan_ip_str, initial_lan_ip_str),
+        lan: collect_lan_status(lan_iface, current_lan_ip_str),
     }
 }
 
-pub fn collect_dhcp_status() -> DhcpServerStatus {
-    let leases_raw = get_tracker()
-        .dhcp_leases
-        .read()
-        .map(|l| l.clone())
-        .unwrap_or_default();
-
+pub fn collect_dhcp_status(leases_raw: &[DhcpLeaseInfo]) -> DhcpServerStatus {
     let leases: Vec<DhcpLeaseEntry> = leases_raw
-        .into_iter()
+        .iter()
         .map(|l| DhcpLeaseEntry {
             mac: l.mac.to_string(),
             ip: l.ip.to_string(),
-            hostname: l.hostname,
+            hostname: l.hostname.clone(),
             expires_in_seconds: l.expires_in_seconds,
             is_static: l.is_static,
         })
@@ -455,13 +451,7 @@ pub fn collect_dhcp_status() -> DhcpServerStatus {
     }
 }
 
-pub fn collect_dns_status() -> DnsForwarderStatus {
-    let stats = get_tracker()
-        .dns_stats
-        .read()
-        .map(|s| s.clone())
-        .unwrap_or_default();
-
+pub fn collect_dns_status(stats: &DnsStatsInfo) -> DnsForwarderStatus {
     let cache_hit_ratio = if stats.queries_total > 0 {
         (stats.cache_hits_total as f64 / stats.queries_total as f64 * 1000.0).round() / 1000.0
     } else {
@@ -477,55 +467,33 @@ pub fn collect_dns_status() -> DnsForwarderStatus {
     }
 }
 
-pub fn collect_sntp_status() -> SntpStatus {
-    get_tracker()
-        .sntp_state
-        .read()
-        .map(|s| s.clone())
-        .unwrap_or_else(|_| SntpStatus {
-            synchronized: false,
-            last_sync_timestamp: None,
-            stratum: None,
-            server: None,
-        })
+pub fn collect_sntp_status(sntp: &SntpStatus) -> SntpStatus {
+    sntp.clone()
 }
 
-pub fn collect_status_response(wan_lease: &WanLease, watchdog_active: bool) -> StatusResponse {
-    let tracker = get_tracker();
-    let lan_iface = tracker
-        .lan_interface
-        .read()
-        .map(|s| s.clone())
-        .unwrap_or_else(|_| DEFAULT_LAN_INTERFACE.to_string());
-    let current_lan_ip = tracker
-        .lan_ip
-        .read()
-        .map(|s| s.clone())
-        .unwrap_or_else(|_| "192.168.1.1/24".to_string());
-    let initial_lan_ip = tracker
-        .initial_lan_ip
-        .read()
-        .map(|s| s.clone())
-        .unwrap_or_else(|_| "192.168.1.1/24".to_string());
+pub fn collect_status_response(
+    receivers: &ObservabilityReceivers,
+    lan_interface: &str,
+    lan_ip: &str,
+) -> StatusResponse {
+    let wan_lease = receivers.wan_lease.borrow();
+    let dhcp_leases = receivers.dhcp_leases.borrow();
+    let dns_stats = receivers.dns_stats.borrow();
+    let sntp = receivers.sntp_status.borrow();
+    let watchdog_active = *receivers.watchdog_active.borrow();
 
     let system = collect_system_status(watchdog_active);
-    let network = collect_network_status(
-        wan_lease,
-        DEFAULT_WAN_INTERFACE,
-        &lan_iface,
-        &current_lan_ip,
-        &initial_lan_ip,
-    );
-    let dhcp_server = collect_dhcp_status();
-    let dns_forwarder = collect_dns_status();
-    let sntp = collect_sntp_status();
+    let network = collect_network_status(&wan_lease, DEFAULT_WAN_INTERFACE, lan_interface, lan_ip);
+    let dhcp_server = collect_dhcp_status(&dhcp_leases);
+    let dns_forwarder = collect_dns_status(&dns_stats);
+    let sntp_status = collect_sntp_status(&sntp);
 
     StatusResponse {
         system,
         network,
         dhcp_server,
         dns_forwarder,
-        sntp,
+        sntp: sntp_status,
     }
 }
 
@@ -534,6 +502,7 @@ mod tests {
     use super::*;
     use pnet::util::MacAddr;
     use std::net::Ipv4Addr;
+    use tokio::sync::watch;
 
     #[test]
     fn test_parse_uptime_str() {
@@ -602,25 +571,39 @@ Cached:            65536 kB
             gateway: Some(Ipv4Addr::new(192, 0, 2, 1)),
             dns_servers: vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(1, 0, 0, 1)],
         };
+        let (_wan_tx, wan_rx) = watch::channel(wan_lease);
 
-        update_dns_stats(DnsStatsInfo {
+        let (dns_tx, dns_rx) = watch::channel(DnsStatsInfo {
             queries_total: 100,
             cache_hits_total: 75,
             cached_entries_count: 10,
             rate_limited_drops_total: 0,
         });
+        let _ = dns_tx;
 
-        update_dhcp_leases(vec![DhcpLeaseInfo {
+        let (dhcp_tx, dhcp_rx) = watch::channel(vec![DhcpLeaseInfo {
             mac: MacAddr::new(0x52, 0x54, 0x00, 0xaa, 0xbb, 0x01),
             ip: Ipv4Addr::new(192, 168, 1, 100),
             hostname: Some("workstation-1".to_string()),
             expires_in_seconds: 3600,
             is_static: false,
         }]);
+        let _ = dhcp_tx;
 
-        update_sntp_sync("time.google.com", 2);
+        let (sntp_tx, sntp_rx) = watch::channel(SntpStatus {
+            synchronized: true,
+            last_sync_timestamp: Some("2026-09-27T18:30:00Z".to_string()),
+            stratum: Some(2),
+            server: Some("time.google.com".to_string()),
+        });
+        let _ = sntp_tx;
 
-        let status = collect_status_response(&wan_lease, true);
+        let (_watchdog_tx, watchdog_rx) = watch::channel(true);
+
+        let receivers = ObservabilityReceivers::new(wan_rx, dhcp_rx, dns_rx, sntp_rx, watchdog_rx);
+
+        let status = collect_status_response(&receivers, "lan", "192.168.1.1/24");
+        assert!(status.system.watchdog_active);
         assert_eq!(status.dns_forwarder.queries_total, 100);
         assert_eq!(status.dns_forwarder.cache_hits_total, 75);
         assert_eq!(status.dns_forwarder.cache_hit_ratio, 0.75);

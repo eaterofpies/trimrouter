@@ -212,17 +212,30 @@ All endpoints are served over standard HTTP on port `80` of the LAN gateway IP a
 
 ## 6. Security, Privacy & Resource Safeguards
 
-1. **Firewall Ingress Restriction**:
+1. **Firewall Ingress Restriction & Interface Binding**:
    * Port `80` is open **only on the LAN interface**.
    * Incoming traffic on the WAN interface targeting port `80` is rejected by the Netfilter default-drop rule.
-2. **Connection & Concurrency Limits**:
+   * The HTTP server binds to the LAN interface using `SO_BINDTODEVICE` and the active LAN gateway IP address, supervised directly by the `LanManager` to migrate seamlessly across subnet shifts.
+2. **Host Header Validation (DNS Rebinding Mitigation)**:
+   * Every incoming HTTP request must include a valid `Host` header matching allowed router hostnames (`router.lan`, `router`, `router.local`), local loopback addresses (`localhost`, `127.0.0.1`, `::1`), or the current LAN gateway IP address.
+   * Requests with unauthorized or foreign `Host` headers are rejected with `HTTP 400 Bad Request`.
+3. **HTTP Security Headers**:
+   * All HTTP responses include standard defensive headers:
+     * `X-Frame-Options: DENY` (clickjacking defense).
+     * `X-Content-Type-Options: nosniff` (MIME sniffing mitigation).
+     * `Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self';`
+     * `Referrer-Policy: no-referrer`
+4. **HTML Sanitization (XSS Prevention)**:
+   * Dynamic fields rendered into the dashboard DOM (such as DHCP hostnames, IP addresses, MAC addresses, and log message payloads) are strictly HTML-escaped before insertion into innerHTML or table rows.
+5. **Connection & Concurrency Limits**:
    * **Maximum Concurrent HTTP Connections**: 16.
-   * **Maximum Concurrent Live Log Streams (SSE)**: 4.
+   * **Maximum Global Concurrent Live Log Streams (SSE)**: 4.
+   * **Maximum Concurrent Live Log Streams per Client IP**: 2.
    * Requests exceeding these concurrency thresholds receive `HTTP 429 Too Many Requests` or are closed cleanly to preserve memory.
-3. **No Request Body Processing**:
+6. **No Request Body Processing**:
    * The server rejects all methods other than `GET` with `HTTP 405 Method Not Allowed`.
    * The server ignores or rejects incoming request payloads exceeding 1 KiB to eliminate buffer bloat and payload injection risks.
-4. **Privacy Isolation**:
+7. **Privacy Isolation**:
    * The DNS forwarder exposes **aggregate statistics only** (total queries, hit/miss ratios, rate-limit drops).
    * Per-client domain names and visited websites are **never** tracked, buffered, or exposed.
 

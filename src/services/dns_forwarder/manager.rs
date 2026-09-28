@@ -4,6 +4,7 @@ use crate::services::ipc::{
     DnsParentToWorkerMsg, DnsWorkerToParentMsg, LocalHostEvent, LocalHostReceiver,
     async_unix_stream, recv_msg, send_msg,
 };
+use crate::services::observability::{DnsStatsSender, null_dns_stats_sender};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{DNS_PORT, WanLeaseReceiver, create_ipc_fds, terminate_worker};
 use log::{error, info};
@@ -29,30 +30,16 @@ pub struct DnsForwarder {
     state: ExternalWorker,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts: LocalHostsState,
+    stats_tx: DnsStatsSender,
 }
 
 impl DnsForwarder {
-    pub fn new(lease_rx: WanLeaseReceiver) -> Self {
-        Self::with_custom_dns(lease_rx, Vec::new(), None, None)
-    }
-
-    pub fn with_heartbeat(lease_rx: WanLeaseReceiver, heartbeat_tx: HeartbeatSender) -> Self {
-        Self::with_custom_dns(lease_rx, Vec::new(), Some(heartbeat_tx), None)
-    }
-
-    pub fn with_local_hosts(
-        lease_rx: WanLeaseReceiver,
-        heartbeat_tx: Option<HeartbeatSender>,
-        local_hosts_rx: Option<LocalHostReceiver>,
-    ) -> Self {
-        Self::with_custom_dns(lease_rx, Vec::new(), heartbeat_tx, local_hosts_rx)
-    }
-
-    pub fn with_custom_dns(
+    pub fn new(
         lease_rx: WanLeaseReceiver,
         custom_dns: Vec<Ipv4Addr>,
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_rx: Option<LocalHostReceiver>,
+        stats_tx: DnsStatsSender,
     ) -> Self {
         Self {
             lease_rx,
@@ -63,7 +50,47 @@ impl DnsForwarder {
                 rx: Arc::new(Mutex::new(local_hosts_rx)),
                 cache: Arc::new(Mutex::new(HashMap::new())),
             },
+            stats_tx,
         }
+    }
+
+    pub fn with_custom_dns(
+        lease_rx: WanLeaseReceiver,
+        custom_dns: Vec<Ipv4Addr>,
+        heartbeat_tx: Option<HeartbeatSender>,
+        local_hosts_rx: Option<LocalHostReceiver>,
+    ) -> Self {
+        Self::new(
+            lease_rx,
+            custom_dns,
+            heartbeat_tx,
+            local_hosts_rx,
+            null_dns_stats_sender(),
+        )
+    }
+
+    pub fn with_local_hosts(
+        lease_rx: WanLeaseReceiver,
+        heartbeat_tx: Option<HeartbeatSender>,
+        local_hosts_rx: Option<LocalHostReceiver>,
+    ) -> Self {
+        Self::new(
+            lease_rx,
+            Vec::new(),
+            heartbeat_tx,
+            local_hosts_rx,
+            null_dns_stats_sender(),
+        )
+    }
+
+    pub fn with_heartbeat(lease_rx: WanLeaseReceiver, heartbeat_tx: HeartbeatSender) -> Self {
+        Self::new(
+            lease_rx,
+            Vec::new(),
+            Some(heartbeat_tx),
+            None,
+            null_dns_stats_sender(),
+        )
     }
 
     pub fn get_worker_pid(&self) -> u32 {
@@ -78,6 +105,7 @@ struct DnsMonitorParams {
     shutdown_rx: Receiver<bool>,
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts: LocalHostsState,
+    stats_tx: DnsStatsSender,
 }
 
 async fn run_parent_dns_monitor(
@@ -136,7 +164,7 @@ async fn run_parent_dns_monitor(
                             params.heartbeat_tx.as_ref(),
                             MonitoredService::DnsForwarder,
                         );
-                        crate::services::observability::update_dns_stats(stats);
+                        let _ = params.stats_tx.send(stats);
                     }
                     Ok(None) | Err(_) => {
                         info!("[dns-forwarder-parent] Worker closed IPC. Shutting down monitor.");
@@ -238,6 +266,7 @@ impl Service for DnsForwarder {
         let custom_dns = self.custom_dns.clone();
         let heartbeat_tx = self.heartbeat_tx.clone();
         let local_hosts = self.local_hosts.clone();
+        let stats_tx = self.stats_tx.clone();
 
         self.state.start_supervised(
             setup_dns_forwarder_attempt,
@@ -249,6 +278,7 @@ impl Service for DnsForwarder {
                     shutdown_rx,
                     heartbeat_tx: heartbeat_tx.clone(),
                     local_hosts: local_hosts.clone(),
+                    stats_tx: stats_tx.clone(),
                 };
                 start_parent_dns_monitor(parent_ipc_fd, params)
             },
@@ -269,7 +299,13 @@ mod tests {
     #[test]
     fn test_dns_forwarder_constructors_and_pid() {
         let (_tx, lease_rx) = tokio::sync::watch::channel(WanLease::default());
-        let fwd = DnsForwarder::new(lease_rx.clone());
+        let fwd = DnsForwarder::new(
+            lease_rx.clone(),
+            Vec::new(),
+            None,
+            None,
+            null_dns_stats_sender(),
+        );
         assert_eq!(fwd.get_worker_pid(), 0);
 
         let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(1);
