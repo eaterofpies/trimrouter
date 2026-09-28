@@ -11,17 +11,41 @@ use std::net::IpAddr;
 
 pub const WAN_INTERFACE: &str = "wan";
 pub const LAN_INTERFACE: &str = "lan";
+const PROC_IP_FORWARD_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
+const PROC_RP_FILTER_ALL_PATH: &str = "/proc/sys/net/ipv4/conf/all/rp_filter";
+const PROC_RP_FILTER_DEFAULT_PATH: &str = "/proc/sys/net/ipv4/conf/default/rp_filter";
+const STRICT_RP_FILTER_VALUE: &str = "1";
+
+pub fn enable_strict_reverse_path_filtering() -> Result<(), RouterError> {
+    debug!("[network] Enabling strict Reverse Path Filtering (rp_filter)...");
+    if let Err(e) = fs::write(PROC_RP_FILTER_ALL_PATH, STRICT_RP_FILTER_VALUE) {
+        warn!(
+            "[network] Warning: Failed to write {}: {}",
+            PROC_RP_FILTER_ALL_PATH, e
+        );
+    }
+    if let Err(e) = fs::write(PROC_RP_FILTER_DEFAULT_PATH, STRICT_RP_FILTER_VALUE) {
+        warn!(
+            "[network] Warning: Failed to write {}: {}",
+            PROC_RP_FILTER_DEFAULT_PATH, e
+        );
+    }
+    Ok(())
+}
 
 pub async fn configure_network_init() -> Result<(), RouterError> {
     // 1. Enable IPv4 Packet Forwarding
     debug!("[network] Enabling IPv4 forwarding...");
-    fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+    fs::write(PROC_IP_FORWARD_PATH, "1")?;
 
-    // 2. Open rtnetlink connection
+    // 2. Enable strict Reverse Path Filtering (RFC 3704 / BCP 38)
+    enable_strict_reverse_path_filtering()?;
+
+    // 3. Open rtnetlink connection
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 
-    // 3. Configure Loopback ('lo') (Link UP only, kernel auto-assigns 127.0.0.1/8)
+    // 4. Configure Loopback ('lo') (Link UP only, kernel auto-assigns 127.0.0.1/8)
     debug!("[network] Configuring loopback interface (lo)...");
     if let Err(e) = configure_interface(&handle, "lo", None).await {
         warn!("[network] Warning: Failed to configure loopback: {}", e);

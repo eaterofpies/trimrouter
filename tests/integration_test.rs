@@ -193,6 +193,8 @@ async fn main() {
                                 let _ = env.wan_cmd_tx.send("SEND_UNSOLICITED_WAN".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_INVALID_CONNTRACK_TRAFFIC") {
                                 let _ = env.wan_cmd_tx.send("SEND_INVALID_CONNTRACK_WAN".to_string()).await;
+                            } else if line.contains("[test-control] TRIGGER_SPOOFED_INTERNAL_WAN_TRAFFIC") {
+                                let _ = env.wan_cmd_tx.send("SEND_SPOOFED_INTERNAL_WAN".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE") {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_FORWARDED_NAT_TEST") {
@@ -832,6 +834,57 @@ async fn handle_invalid_conntrack_traffic(
     }
 }
 
+async fn handle_spoofed_internal_wan_traffic(
+    mock: &mut UnixStreamMock,
+    verification_tx: &tokio::sync::mpsc::Sender<String>,
+    client_mac: MacAddr,
+) {
+    println!(
+        "[isp-test] Sending spoofed internal LAN packet (src: 192.168.1.100) to router on WAN..."
+    );
+    let spoofed_src_ip = Ipv4Addr::new(192, 168, 1, 100);
+    let target_ip = Ipv4Addr::new(192, 168, 1, 1);
+    let spoofed_pkt = build_udp_packet(
+        MOCK_SERVER_MAC,
+        client_mac,
+        spoofed_src_ip,
+        target_ip,
+        12345,
+        23459,
+        b"SPOOFED_INTERNAL_TRAFFIC",
+    );
+    let _ = mock.send_frame(&spoofed_pkt).await;
+
+    // Start a 1-second monitoring window to check if any response comes back
+    let monitor_start = std::time::Instant::now();
+    let mut packet_received = false;
+    while monitor_start.elapsed() < Duration::from_secs(1) {
+        if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(50), mock.recv_frame()).await
+        {
+            if let Some((src_ip, _dest_ip, _src_port, dest_port, _)) =
+                parse_udp_packet(&f).ok().flatten()
+                && (src_ip == MOCK_CLIENT_IP || src_ip == target_ip)
+                && dest_port == 12345
+            {
+                packet_received = true;
+                break;
+            }
+            process_wan_dhcp_renewal(mock, verification_tx, client_mac, &f).await;
+        }
+    }
+
+    if packet_received {
+        println!("[isp-test] ERROR: Router responded to spoofed internal packet arriving on WAN!");
+    } else {
+        println!(
+            "[isp-test] Verified: Kernel strict reverse path filter dropped spoofed internal packet on WAN."
+        );
+        let _ = verification_tx
+            .send("ANTI_SPOOFING_WAN_DROP_VERIFIED".to_string())
+            .await;
+    }
+}
+
 async fn handle_port_forwarding_wan_traffic(mock: &mut UnixStreamMock, client_mac: MacAddr) {
     println!(
         "[isp-test] Sending Inbound WAN packet to {}:28080 for port forwarding test...",
@@ -1047,6 +1100,8 @@ async fn run_mock_wan_isp(
                         handle_unsolicited_wan_traffic(&mut mock, &verification_tx, client_mac).await;
                     } else if cmd_str == "SEND_INVALID_CONNTRACK_WAN" {
                         handle_invalid_conntrack_traffic(&mut mock, &verification_tx, client_mac).await;
+                    } else if cmd_str == "SEND_SPOOFED_INTERNAL_WAN" {
+                        handle_spoofed_internal_wan_traffic(&mut mock, &verification_tx, client_mac).await;
                     } else if cmd_str == "TRIGGER_PORT_FORWARDING_TEST" {
                         handle_port_forwarding_wan_traffic(&mut mock, client_mac).await;
                     } else if cmd_str == "SIMULATE_DNS_OUTAGE" {
