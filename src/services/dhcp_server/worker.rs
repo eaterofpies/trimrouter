@@ -406,14 +406,27 @@ async fn send_dhcp_nak(
     send_dhcp_frame(async_sock, config, dest_mac, dest_ip, &payload).await;
 }
 
-async fn trigger_arp_resolution(server_ip: Ipv4Addr, target_ip: Ipv4Addr) {
-    if let Ok(socket) = std::net::UdpSocket::bind((server_ip, 0)) {
-        let _ = socket.send_to(&[0u8], (target_ip, DISCARD_PORT));
+async fn trigger_arp_resolution(
+    async_sock: &AsyncFd<OwnedFd>,
+    config: &ServerConfig,
+    target_ip: Ipv4Addr,
+) {
+    if let Ok(frame) = build_raw_packet(
+        config.server_mac,
+        MacAddr::broadcast(),
+        config.server_ip,
+        target_ip,
+        DISCARD_PORT,
+        DISCARD_PORT,
+        &[0u8],
+    ) {
+        send_raw_packet(async_sock, &frame).await;
     }
     tokio::time::sleep(ARP_RESOLUTION_DELAY).await;
 }
 
 async fn probe_and_allocate_ip(
+    async_sock: &AsyncFd<OwnedFd>,
     config: &ServerConfig,
     client_mac: MacAddr,
     leases: &LeaseHandle,
@@ -427,7 +440,7 @@ async fn probe_and_allocate_ip(
             "[dhcp-server] Probing if IP {} is already in use on the LAN...",
             ip
         );
-        trigger_arp_resolution(config.server_ip, ip).await;
+        trigger_arp_resolution(async_sock, config, ip).await;
 
         if leases.check_conflict(ip, client_mac).await {
             warn!(
@@ -442,6 +455,7 @@ async fn probe_and_allocate_ip(
 }
 
 async fn find_or_allocate_discover_ip(
+    async_sock: &AsyncFd<OwnedFd>,
     config: &ServerConfig,
     client_mac: MacAddr,
     leases: &LeaseHandle,
@@ -451,7 +465,7 @@ async fn find_or_allocate_discover_ip(
     if let Some(ip) = existing_ip {
         Some(ip)
     } else {
-        probe_and_allocate_ip(config, client_mac, leases).await
+        probe_and_allocate_ip(async_sock, config, client_mac, leases).await
     }
 }
 
@@ -490,7 +504,9 @@ async fn handle_dhcp_discover(
         client_mac
     );
 
-    let Some(leased_ip) = find_or_allocate_discover_ip(config, client_mac, &leases).await else {
+    let Some(leased_ip) =
+        find_or_allocate_discover_ip(&async_sock, config, client_mac, &leases).await
+    else {
         error!("[dhcp-server] DHCP IP pool exhausted!");
         return;
     };
@@ -509,6 +525,7 @@ async fn handle_dhcp_discover(
 }
 
 async fn verify_arp_conflict(
+    async_sock: &AsyncFd<OwnedFd>,
     leased_ip: Ipv4Addr,
     client_mac: MacAddr,
     config: &ServerConfig,
@@ -518,7 +535,7 @@ async fn verify_arp_conflict(
         "[dhcp-server] Performing ARP verification for requested IP {}...",
         leased_ip
     );
-    trigger_arp_resolution(config.server_ip, leased_ip).await;
+    trigger_arp_resolution(async_sock, config, leased_ip).await;
 
     if leases.check_conflict(leased_ip, client_mac).await {
         warn!(
@@ -601,7 +618,7 @@ async fn handle_dhcp_request(
     };
 
     let leased_ip = confirmation.ip;
-    if verify_arp_conflict(leased_ip, client_mac, config, &leases).await {
+    if verify_arp_conflict(&async_sock, leased_ip, client_mac, config, &leases).await {
         send_dhcp_nak(&async_sock, dhcp, client_mac, config).await;
         return;
     }
@@ -903,6 +920,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_arp_conflict_detects_conflict() {
+        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let async_sock = AsyncFd::new(OwnedFd::from(s1)).unwrap();
         let config = make_config("192.168.1.1/24");
         let leases = spawn_lease_actor();
 
@@ -912,7 +931,8 @@ mod tests {
 
         leases.add_neighbor(owner_mac, target_ip).await;
 
-        let is_conflict = verify_arp_conflict(target_ip, client_mac, &config, &leases).await;
+        let is_conflict =
+            verify_arp_conflict(&async_sock, target_ip, client_mac, &config, &leases).await;
         assert!(is_conflict);
         assert!(leases.check_conflict(target_ip, client_mac).await);
     }
@@ -1406,5 +1426,68 @@ mod tests {
         let leases = spawn_lease_actor();
         let result = sync_initial_static_leases(&mut reader, &leases).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_discover_and_request_with_raw_arp_probe() {
+        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let async_sock = Arc::new(AsyncFd::new(OwnedFd::from(s1)).unwrap());
+        let config = make_config("192.168.1.1/24");
+        let leases = spawn_lease_actor();
+        let client_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x99);
+
+        // 1. Dynamic DHCPDISCOVER
+        let mut discover_msg = Message::default();
+        discover_msg.set_opcode(Opcode::BootRequest);
+        discover_msg.set_xid(12345);
+        discover_msg.set_chaddr(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x99]);
+        discover_msg
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Discover));
+
+        handle_dhcp_discover(
+            async_sock.clone(),
+            &config,
+            &discover_msg,
+            client_mac,
+            leases.clone(),
+        )
+        .await;
+
+        let allocated_ip = leases.get_existing_ip(client_mac).await;
+        assert!(allocated_ip.is_some());
+        let leased_ip = allocated_ip.unwrap();
+        assert_eq!(leased_ip, Ipv4Addr::new(192, 168, 1, 2));
+
+        // 2. Dynamic DHCPREQUEST
+        let (ipc_tx, _ipc_rx) = tokio::sync::mpsc::channel(8);
+        let mut request_msg = Message::default();
+        request_msg.set_opcode(Opcode::BootRequest);
+        request_msg.set_xid(12345);
+        request_msg.set_chaddr(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x99]);
+        request_msg
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Request));
+        request_msg
+            .opts_mut()
+            .insert(DhcpOption::RequestedIpAddress(leased_ip));
+        request_msg
+            .opts_mut()
+            .insert(DhcpOption::ServerIdentifier(config.server_ip));
+
+        handle_dhcp_request(
+            async_sock,
+            &config,
+            &request_msg,
+            client_mac,
+            leases.clone(),
+            ipc_tx,
+        )
+        .await;
+
+        let active_leases = leases.get_active_leases().await;
+        assert_eq!(active_leases.len(), 1);
+        assert_eq!(active_leases[0].mac, client_mac);
+        assert_eq!(active_leases[0].ip, leased_ip);
     }
 }

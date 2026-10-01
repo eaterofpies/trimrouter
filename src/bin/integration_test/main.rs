@@ -29,8 +29,9 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let is_modprobe = args.first().is_some_and(|arg0| arg0.contains("modprobe"))
         || args.get(1).is_some_and(|arg1| arg1 == "modprobe");
+    let is_worker = args.get(1).is_some_and(|arg1| arg1 == "worker");
 
-    if is_modprobe {
+    if is_modprobe || is_worker {
         trimrouter::modes::run(args).await;
         std::process::exit(0);
     }
