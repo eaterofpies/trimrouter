@@ -459,8 +459,8 @@ pub fn apply_seccomp() -> Result<(), std::io::Error> {
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Trap,  // mismatch triggers SIGSYS
-        SeccompAction::Allow, // match allows syscall
+        SeccompAction::Errno(libc::EPERM as u32), // mismatch returns EPERM (Operation not permitted)
+        SeccompAction::Allow,                     // match allows syscall
         std::env::consts::ARCH
             .try_into()
             .map_err(std::io::Error::other)?,
@@ -888,5 +888,34 @@ mod tests {
         assert!(!is_valid_ntp_server_ip(Ipv4Addr::new(224, 0, 1, 1))); // Multicast
         assert!(!is_valid_ntp_server_ip(Ipv4Addr::new(169, 254, 0, 1))); // Link-local
         assert!(!is_valid_ntp_server_ip(Ipv4Addr::new(192, 0, 2, 1))); // Documentation
+    }
+
+    #[test]
+    fn test_apply_seccomp_returns_eperm_on_disallowed_syscall() {
+        match unsafe { nix::unistd::fork() } {
+            Ok(nix::unistd::ForkResult::Child) => {
+                if apply_seccomp().is_err() {
+                    std::process::exit(1);
+                }
+                let res = unsafe { libc::syscall(libc::SYS_ptrace, 0, 0, 0, 0) };
+                let err = std::io::Error::last_os_error();
+                if res == -1 && err.raw_os_error() == Some(libc::EPERM) {
+                    // Also verify UdpSocket::bind fails with PermissionDenied
+                    match std::net::UdpSocket::bind("127.0.0.1:0") {
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            std::process::exit(0);
+                        }
+                        _ => std::process::exit(3),
+                    }
+                } else {
+                    std::process::exit(2);
+                }
+            }
+            Ok(nix::unistd::ForkResult::Parent { child }) => {
+                let status = nix::sys::wait::waitpid(child, None).expect("waitpid succeeds");
+                assert_eq!(status, nix::sys::wait::WaitStatus::Exited(child, 0));
+            }
+            Err(e) => panic!("Fork failed: {}", e),
+        }
     }
 }
