@@ -6,7 +6,7 @@ ARG ARCH="x86_64"
 # =========================================================================
 # Stage 1: Build & Test Environment (pinned base image & kernel package)
 # =========================================================================
-FROM rust:1.98.1-slim-trixie AS builder
+FROM rust:1.99.0-slim-trixie AS builder
 
 ARG ARCH="x86_64"
 
