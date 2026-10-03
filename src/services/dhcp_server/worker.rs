@@ -1,7 +1,7 @@
 use crate::packet::build_raw_packet;
 use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{
-    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcReceiver, recv_msg, send_msg,
+    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcEndpoint, IpcReceiver,
 };
 use crate::services::utils::{
     DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload, read_raw_packet,
@@ -17,7 +17,6 @@ use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::interval;
 
 use super::lease_table::{LeaseHandle, spawn_lease_actor};
@@ -67,9 +66,9 @@ pub async fn run_dhcp_server_worker(
         DHCP_SERVER_UID,
         DHCP_SERVER_GID,
         ipc_fd,
-        |mut ipc| async move {
+        |mut ipc: IpcEndpoint<DhcpServerParentToWorkerMsg>| async move {
             let leases = spawn_lease_actor();
-            sync_initial_static_leases(&mut ipc.reader, &leases).await?;
+            sync_initial_static_leases(&mut ipc.rx, &leases).await?;
 
             let config = Arc::new(ServerConfig {
                 server_ip,
@@ -79,8 +78,7 @@ pub async fn run_dhcp_server_worker(
             });
 
             let async_sock_shared = Arc::new(async_sock);
-            let _ =
-                run_server_loop(async_sock_shared, config, leases, ipc.reader, ipc.writer).await;
+            let _ = run_server_loop(async_sock_shared, config, leases, ipc).await;
             Ok(())
         },
     )
@@ -88,10 +86,10 @@ pub async fn run_dhcp_server_worker(
 }
 
 async fn sync_initial_static_leases(
-    ipc_reader: &mut OwnedReadHalf,
+    ipc_rx: &mut IpcReceiver<DhcpServerParentToWorkerMsg>,
     leases: &LeaseHandle,
 ) -> Result<(), std::io::Error> {
-    match recv_msg::<DhcpServerParentToWorkerMsg, _>(ipc_reader).await {
+    match ipc_rx.recv().await {
         Ok(Some(DhcpServerParentToWorkerMsg::SetStaticLeases {
             leases: static_leases,
         })) => {
@@ -131,10 +129,8 @@ async fn run_server_loop(
     async_sock: Arc<AsyncFd<OwnedFd>>,
     config: Arc<ServerConfig>,
     leases: LeaseHandle,
-    ipc_reader: OwnedReadHalf,
-    mut ipc_writer: OwnedWriteHalf,
+    mut ipc: IpcEndpoint<DhcpServerParentToWorkerMsg>,
 ) -> Result<(), std::io::Error> {
-    let mut ipc_rx = IpcReceiver::new(ipc_reader);
     let mut buf = [0u8; 2048];
     let mut heartbeat_timer = interval(SERVER_HEARTBEAT_INTERVAL);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<DhcpServerWorkerToParentMsg>(32);
@@ -143,8 +139,7 @@ async fn run_server_loop(
         tokio::select! {
             _ = heartbeat_timer.tick() => {
                 let active_leases = leases.get_active_leases().await;
-                if let Err(e) = send_msg(
-                    &mut ipc_writer,
+                if let Err(e) = ipc.send(
                     &DhcpServerWorkerToParentMsg::Heartbeat {
                         leases: active_leases,
                     },
@@ -156,17 +151,17 @@ async fn run_server_loop(
                 let expired_hostnames = leases.evict_expired().await;
                 for name in expired_hostnames {
                     let msg = DhcpServerWorkerToParentMsg::DeregisterLocalHost { name };
-                    if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+                    if let Err(e) = ipc.send(&msg).await {
                         debug!("[dhcp-server-worker] Failed to send DeregisterLocalHost: {}", e);
                     }
                 }
             }
             Some(msg) = event_rx.recv() => {
-                if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+                if let Err(e) = ipc.send(&msg).await {
                     debug!("[dhcp-server-worker] Failed to send IPC msg to parent: {}", e);
                 }
             }
-            ipc_msg = ipc_rx.recv() => {
+            ipc_msg = ipc.recv() => {
                 match ipc_msg {
                     Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
                         ip_address,
@@ -1394,7 +1389,8 @@ mod tests {
     #[tokio::test]
     async fn test_sync_initial_static_leases_success() {
         let (sock1, sock2) = tokio::net::UnixStream::pair().unwrap();
-        let (mut reader, _writer) = sock1.into_split();
+        let (reader, _writer) = sock1.into_split();
+        let mut rx = IpcReceiver::new(reader);
         let (_parent_reader, mut parent_writer) = sock2.into_split();
 
         let leases = spawn_lease_actor();
@@ -1407,7 +1403,7 @@ mod tests {
         };
         send_msg(&mut parent_writer, &msg).await.unwrap();
 
-        let result = sync_initial_static_leases(&mut reader, &leases).await;
+        let result = sync_initial_static_leases(&mut rx, &leases).await;
         assert!(result.is_ok());
 
         let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
@@ -1421,11 +1417,12 @@ mod tests {
     #[tokio::test]
     async fn test_sync_initial_static_leases_eof_fails() {
         let (sock1, sock2) = tokio::net::UnixStream::pair().unwrap();
-        let (mut reader, _writer) = sock1.into_split();
+        let (reader, _writer) = sock1.into_split();
+        let mut rx = IpcReceiver::new(reader);
         drop(sock2);
 
         let leases = spawn_lease_actor();
-        let result = sync_initial_static_leases(&mut reader, &leases).await;
+        let result = sync_initial_static_leases(&mut rx, &leases).await;
         assert!(result.is_err());
     }
 

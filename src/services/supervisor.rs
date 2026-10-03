@@ -3,7 +3,7 @@ use log::{error, info};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{self, BufRead, BufReader, Read};
-use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -127,7 +127,7 @@ impl ExternalWorker {
         self.child_pid.load(Ordering::SeqCst)
     }
 
-    async fn attempt_supervised_run<S, M>(
+    async fn attempt_supervised_run<S, M, T>(
         service_name: &'static str,
         child_pid_atomic: Arc<AtomicU32>,
         setup_attempt: &mut S,
@@ -135,14 +135,14 @@ impl ExternalWorker {
         shutdown_rx: &Receiver<bool>,
         attempt: &mut u32,
     ) where
-        S: FnMut() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError>,
-        M: FnMut(OwnedFd, u32, Receiver<bool>) -> Result<JoinHandle<()>, ServiceError>,
+        S: FnMut() -> Result<(crate::cli::WorkerService, T), ServiceError>,
+        M: FnMut(T, u32, Receiver<bool>) -> Result<JoinHandle<()>, ServiceError>,
     {
         if *shutdown_rx.borrow() {
             return;
         }
 
-        let (worker_service, parent_ipc_fd) = match setup_attempt() {
+        let (worker_service, endpoint) = match setup_attempt() {
             Ok(res) => res,
             Err(e) => {
                 error!("[{}-parent] Setup attempt failed: {:?}", service_name, e);
@@ -173,7 +173,7 @@ impl ExternalWorker {
         drop(worker_service);
 
         let child_pid = child.id();
-        let monitor_handle = match run_monitor(parent_ipc_fd, child_pid, shutdown_rx.clone()) {
+        let monitor_handle = match run_monitor(endpoint, child_pid, shutdown_rx.clone()) {
             Ok(h) => h,
             Err(e) => {
                 error!(
@@ -192,16 +192,15 @@ impl ExternalWorker {
         }
     }
 
-    pub(crate) fn start_supervised<S, M>(
+    pub(crate) fn start_supervised<S, M, T>(
         &mut self,
         mut setup_attempt: S,
         mut run_monitor: M,
     ) -> Result<(), ServiceError>
     where
-        S: FnMut() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> + Send + 'static,
-        M: FnMut(OwnedFd, u32, Receiver<bool>) -> Result<JoinHandle<()>, ServiceError>
-            + Send
-            + 'static,
+        T: Send + 'static,
+        S: FnMut() -> Result<(crate::cli::WorkerService, T), ServiceError> + Send + 'static,
+        M: FnMut(T, u32, Receiver<bool>) -> Result<JoinHandle<()>, ServiceError> + Send + 'static,
     {
         let service_name = self.service_name;
         let child_pid_atomic = self.child_pid.clone();
@@ -376,7 +375,11 @@ mod tests {
         let mut worker = ExternalWorker::new("test-worker");
 
         let res = worker.start_supervised(
-            || Err(ServiceError::FailedToStart("test failure".to_string())),
+            || {
+                Result::<(crate::cli::WorkerService, ()), _>::Err(ServiceError::FailedToStart(
+                    "test failure".to_string(),
+                ))
+            },
             |_fd, _pid, _shutdown| Ok(tokio::spawn(async {})),
         );
         assert!(res.is_ok());

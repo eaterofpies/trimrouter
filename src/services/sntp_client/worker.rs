@@ -1,5 +1,5 @@
 use crate::services::SNTP_CLIENT_SERVICE_NAME;
-use crate::services::ipc::{IpcReceiver, SntpClientToParentMsg, SntpParentToClientMsg, send_msg};
+use crate::services::ipc::{IpcEndpoint, SntpClientToParentMsg, SntpParentToClientMsg, send_msg};
 use crate::services::utils::{
     NTP_PORT, SNTP_GID, SNTP_UID, is_valid_ntp_server_ip, run_sandboxed_worker,
 };
@@ -13,7 +13,7 @@ use std::io::Error as IoError;
 use std::os::unix::io::OwnedFd;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::unix::OwnedWriteHalf;
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
 const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
@@ -58,38 +58,33 @@ pub async fn run_sntp_client_worker(
         SNTP_UID,
         SNTP_GID,
         ipc_fd,
-        |ipc| async move {
-            run_sntp_worker_loop(ipc.writer, ipc.reader, &ntp_socket).await;
+        |ipc: IpcEndpoint<SntpParentToClientMsg>| async move {
+            run_sntp_worker_loop(ipc, &ntp_socket).await;
             Ok(())
         },
     )
     .await
 }
 
-async fn run_sntp_worker_loop(
-    mut ipc_writer: OwnedWriteHalf,
-    ipc_reader: OwnedReadHalf,
-    ntp_socket: &UdpSocket,
-) {
-    let mut ipc_rx = IpcReceiver::new(ipc_reader);
+async fn run_sntp_worker_loop(mut ipc: IpcEndpoint<SntpParentToClientMsg>, ntp_socket: &UdpSocket) {
     let mut current_retry_delay = RETRY_INTERVAL;
     let mut sync_timer = tokio::time::interval(SYNC_INTERVAL);
-    let _ = send_msg(&mut ipc_writer, &SntpClientToParentMsg::ResolveTimeServer).await;
+    let _ = ipc.send(&SntpClientToParentMsg::ResolveTimeServer).await;
 
     loop {
         tokio::select! {
             _ = sync_timer.tick() => {
-                if let Err(e) = send_msg(&mut ipc_writer, &SntpClientToParentMsg::ResolveTimeServer).await {
+                if let Err(e) = ipc.send(&SntpClientToParentMsg::ResolveTimeServer).await {
                     error!("[sntp-client-worker] Failed to send ResolveTimeServer: {}", e);
                     break;
                 }
             }
-            ipc_msg = ipc_rx.recv() => {
+            ipc_msg = ipc.recv() => {
                 match ipc_msg {
                     Ok(Some(SntpParentToClientMsg::TimeServerResolved { result })) => {
                         let schedule = handle_time_server_resolved(
                             result,
-                            &mut ipc_writer,
+                            &mut ipc.tx,
                             ntp_socket,
                             current_retry_delay,
                         ).await;
@@ -100,7 +95,7 @@ async fn run_sntp_worker_loop(
                         );
                     }
                     Ok(None) | Err(_) => {
-                        info!("[sntp-client-worker] Parent closed IPC. Shutting down.");
+                        info!("[sntp-client-worker] Parent IPC closed. Shutting down.");
                         break;
                     }
                 }

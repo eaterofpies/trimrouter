@@ -15,23 +15,48 @@ pub fn async_unix_stream(fd: OwnedFd) -> Result<UnixStream, std::io::Error> {
     UnixStream::from_std(std_stream)
 }
 
-/// Represents the bidirectional Unix domain socket IPC channel for a sandboxed worker.
+/// Represents a strongly-typed bidirectional Unix domain socket IPC channel.
 ///
-/// NOTE: Both `reader` and `writer` (or the `IpcEndpoint` instance) must be kept alive in scope
-/// for the entire lifetime of the worker task. Dropping either half closes the Unix domain socket,
-/// causing the parent supervisor's EOF monitor (`read(&mut buf) -> 0`) to assume the worker has
-/// crashed or terminated and send `SIGTERM`.
-pub struct IpcEndpoint {
-    pub reader: OwnedReadHalf,
-    pub writer: OwnedWriteHalf,
+/// Wraps a cancellation-safe `IpcReceiver<InMsg>` for incoming messages and an
+/// `OwnedWriteHalf` for sending outgoing serialized frames.
+///
+/// NOTE: Both `rx` and `tx` (or the `IpcEndpoint` instance) must be kept alive in scope
+/// for the entire lifetime of the process. Dropping either half closes the Unix domain socket,
+/// causing the peer's EOF monitor to assume the process has crashed or terminated.
+pub struct IpcEndpoint<InMsg> {
+    pub rx: IpcReceiver<InMsg>,
+    pub tx: OwnedWriteHalf,
 }
 
-impl IpcEndpoint {
+impl<InMsg: for<'a> Deserialize<'a>> IpcEndpoint<InMsg> {
+    pub fn new(reader: OwnedReadHalf, tx: OwnedWriteHalf) -> Self {
+        Self {
+            rx: IpcReceiver::new(reader),
+            tx,
+        }
+    }
+
     pub fn from_owned_fd(fd: OwnedFd) -> Result<Self, std::io::Error> {
         let ipc_stream = async_unix_stream(fd)?;
-        let (reader, writer) = ipc_stream.into_split();
-        Ok(Self { reader, writer })
+        let (reader, tx) = ipc_stream.into_split();
+        Ok(Self::new(reader, tx))
     }
+
+    pub async fn recv(&mut self) -> Result<Option<InMsg>, std::io::Error> {
+        self.rx.recv().await
+    }
+
+    pub async fn send<OutMsg: Serialize>(&mut self, msg: &OutMsg) -> Result<(), std::io::Error> {
+        send_msg(&mut self.tx, msg).await
+    }
+}
+
+pub fn create_ipc_channel<InMsg: for<'a> Deserialize<'a>>()
+-> Result<(IpcEndpoint<InMsg>, OwnedFd), std::io::Error> {
+    let (parent_stream, child_stream) = tokio::net::UnixStream::pair()?;
+    let (reader, tx) = parent_stream.into_split();
+    let child_std = child_stream.into_std()?;
+    Ok((IpcEndpoint::new(reader, tx), child_std.into()))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -399,5 +424,23 @@ mod tests {
         let err = res.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("exceeds maximum limit"));
+    }
+
+    #[tokio::test]
+    async fn test_create_ipc_channel_and_endpoint() {
+        let (mut parent_ipc, child_fd) = create_ipc_channel::<DhcpClientToParentMsg>().unwrap();
+        let mut child_ipc: IpcEndpoint<DhcpClientToParentMsg> =
+            IpcEndpoint::from_owned_fd(child_fd).unwrap();
+
+        let client_msg = DhcpClientToParentMsg::ApplyWanLease {
+            ip_address: Ipv4Addr::new(10, 0, 2, 15),
+            prefix_len: 24,
+            gateway: Ipv4Addr::new(10, 0, 2, 2),
+            dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8)],
+        };
+
+        child_ipc.send(&client_msg).await.unwrap();
+        let received = parent_ipc.recv().await.unwrap().unwrap();
+        assert_eq!(received, client_msg);
     }
 }

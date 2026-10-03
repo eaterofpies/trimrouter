@@ -1,7 +1,7 @@
 use super::worker::DhcpError;
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::services::DHCP_CLIENT_SERVICE_NAME;
-use crate::services::ipc::{DhcpClientToParentMsg, IpcReceiver, async_unix_stream};
+use crate::services::ipc::{DhcpClientToParentMsg, IpcEndpoint};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{
     CleanOption, WanLease, WanLeaseSender, mask_to_prefix_len, prefix_len_to_mask,
@@ -10,8 +10,6 @@ use crate::services::utils::{
 use ipnet::Ipv4Net;
 use log::{error, info, warn};
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::unix::io::OwnedFd;
-use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
 pub struct DhcpClient {
@@ -98,16 +96,14 @@ async fn clear_parent_lease(lease_tx: &WanLeaseSender, wan_interface: &str) {
 }
 
 fn start_parent_supervisor_task(
-    parent_ipc_fd: OwnedFd,
+    parent_ipc: IpcEndpoint<DhcpClientToParentMsg>,
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
     heartbeat_tx: Option<HeartbeatSender>,
 ) -> Result<JoinHandle<()>, ServiceError> {
-    let parent_ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
-
     let handle = tokio::spawn(run_parent_dhcp_monitor(
-        parent_ipc_stream,
+        parent_ipc,
         child_pid,
         wan_interface,
         lease_tx,
@@ -118,7 +114,7 @@ fn start_parent_supervisor_task(
 }
 
 async fn run_parent_dhcp_monitor(
-    parent_ipc_stream: UnixStream,
+    mut ipc: IpcEndpoint<DhcpClientToParentMsg>,
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
@@ -128,9 +124,8 @@ async fn run_parent_dhcp_monitor(
         "[dhcp-client-parent] Supervising DHCP client worker (PID {})",
         child_pid
     );
-    let mut ipc_rx = IpcReceiver::new(parent_ipc_stream);
     loop {
-        match ipc_rx.recv().await {
+        match ipc.recv().await {
             Ok(Some(DhcpClientToParentMsg::ApplyWanLease {
                 ip_address,
                 prefix_len,
@@ -172,7 +167,13 @@ async fn run_parent_dhcp_monitor(
 
 fn setup_dhcp_client_attempt(
     wan_interface: &str,
-) -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> {
+) -> Result<
+    (
+        crate::cli::WorkerService,
+        IpcEndpoint<DhcpClientToParentMsg>,
+    ),
+    ServiceError,
+> {
     let (raw_socket_fd, parent_ipc, child_ipc) = setup_worker_sockets(wan_interface)
         .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
 
@@ -194,9 +195,9 @@ impl Service for DhcpClient {
 
         self.state.start_supervised(
             move || setup_dhcp_client_attempt(&wan_interface_setup),
-            move |parent_ipc_fd, child_pid, _shutdown_rx| {
+            move |parent_ipc, child_pid, _shutdown_rx| {
                 start_parent_supervisor_task(
-                    parent_ipc_fd,
+                    parent_ipc,
                     child_pid,
                     wan_interface.clone(),
                     lease_tx.clone(),

@@ -1,4 +1,4 @@
-use super::ipc::IpcEndpoint;
+use super::ipc::{IpcEndpoint, create_ipc_channel};
 use crate::error::RouterError;
 use dhcproto::v4::Message;
 use dhcproto::{Decodable, Decoder};
@@ -12,6 +12,7 @@ use pnet::packet::udp::UdpPacket;
 use pnet::util::MacAddr;
 use rtnetlink::packet_route::link::LinkAttribute;
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
+use serde::Deserialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::BTreeMap;
 use std::convert::TryInto;
@@ -20,7 +21,6 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 
 pub const CHROOT_JAIL_PATH: &str = "/run/empty";
 pub const NOBODY_UID: u32 = 65534;
@@ -377,15 +377,6 @@ pub fn is_valid_ntp_server_ip(ip: Ipv4Addr) -> bool {
         && !ip.is_documentation()
 }
 
-pub async fn wait_ipc_eof(reader: &mut tokio::net::unix::OwnedReadHalf) {
-    let mut buf = [0u8; 128];
-    while let Ok(n) = reader.read(&mut buf).await {
-        if n == 0 {
-            break;
-        }
-    }
-}
-
 const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_read,
     libc::SYS_write,
@@ -521,10 +512,10 @@ pub fn drop_privileges(uid: u32, gid: u32) -> Result<(), std::io::Error> {
 
 /// Runs an asynchronous worker function in an unprivileged sandboxed process environment.
 ///
-/// NOTE: The provided `IpcEndpoint` (specifically both `ipc.reader` and `ipc.writer`) must
+/// NOTE: The provided `IpcEndpoint` (specifically both `ipc.rx` and `ipc.tx`) must
 /// remain in scope for the worker's entire execution. Dropping either half closes that direction
 /// on the Unix socket, which the parent supervisor detects as EOF and terminates the worker.
-pub async fn run_sandboxed_worker<F, Fut>(
+pub async fn run_sandboxed_worker<InMsg, F, Fut>(
     service_name: &str,
     uid: u32,
     gid: u32,
@@ -532,7 +523,8 @@ pub async fn run_sandboxed_worker<F, Fut>(
     worker_fn: F,
 ) -> Result<(), std::io::Error>
 where
-    F: FnOnce(IpcEndpoint) -> Fut,
+    InMsg: for<'a> Deserialize<'a>,
+    F: FnOnce(IpcEndpoint<InMsg>) -> Fut,
     Fut: std::future::Future<Output = Result<(), std::io::Error>>,
 {
     info!("[{}-worker] Starting unprivileged worker...", service_name);
@@ -548,19 +540,12 @@ where
     worker_fn(ipc).await
 }
 
-pub fn setup_worker_sockets(interface: &str) -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
+pub fn setup_worker_sockets<InMsg: for<'a> Deserialize<'a>>(
+    interface: &str,
+) -> std::io::Result<(OwnedFd, IpcEndpoint<InMsg>, OwnedFd)> {
     let raw_socket = open_raw_socket(interface).map_err(std::io::Error::other)?;
-    let (parent_stream, child_stream) = tokio::net::UnixStream::pair()?;
-    let parent_std = parent_stream.into_std()?;
-    let child_std = child_stream.into_std()?;
-    Ok((raw_socket, parent_std.into(), child_std.into()))
-}
-
-pub fn create_ipc_fds() -> Result<(OwnedFd, OwnedFd), std::io::Error> {
-    let (parent_stream, child_stream) = tokio::net::UnixStream::pair()?;
-    let parent_std = parent_stream.into_std()?;
-    let child_std = child_stream.into_std()?;
-    Ok((parent_std.into(), child_std.into()))
+    let (endpoint, child_fd) = create_ipc_channel()?;
+    Ok((raw_socket, endpoint, child_fd))
 }
 
 pub fn async_udp_socket(fd: OwnedFd) -> Result<tokio::net::UdpSocket, std::io::Error> {

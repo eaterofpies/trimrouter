@@ -1,8 +1,8 @@
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{
-    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcReceiver, LocalHostEvent,
-    LocalHostSender, async_unix_stream, send_msg,
+    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcEndpoint, LocalHostEvent,
+    LocalHostSender,
 };
 use crate::services::observability::DhcpLeasesSender;
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
@@ -17,8 +17,6 @@ use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::os::unix::io::OwnedFd;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 
@@ -62,16 +60,10 @@ impl DhcpServer {
 }
 
 fn start_parent_arp_listener(
-    parent_ipc_fd: OwnedFd,
+    parent_ipc: IpcEndpoint<DhcpServerWorkerToParentMsg>,
     params: DhcpMonitorParams,
 ) -> Result<JoinHandle<()>, ServiceError> {
-    let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
-    let (ipc_reader, ipc_writer) = ipc_stream.into_split();
-
-    let handle = tokio::spawn(run_parent_dhcp_server_monitor(
-        ipc_writer, ipc_reader, params,
-    ));
-
+    let handle = tokio::spawn(run_parent_dhcp_server_monitor(parent_ipc, params));
     Ok(handle)
 }
 
@@ -122,16 +114,13 @@ async fn handle_worker_ipc_msg(
 }
 
 async fn run_parent_dhcp_server_monitor(
-    mut ipc_writer: OwnedWriteHalf,
-    ipc_reader: OwnedReadHalf,
+    mut ipc: IpcEndpoint<DhcpServerWorkerToParentMsg>,
     mut params: DhcpMonitorParams,
 ) {
-    let mut ipc_rx = IpcReceiver::new(ipc_reader);
-
     let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
         leases: params.static_leases.clone().into_iter().collect(),
     };
-    if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+    if let Err(e) = ipc.send(&msg).await {
         error!(
             "[dhcp-server-parent] Failed to send static leases to worker: {}",
             e
@@ -163,7 +152,7 @@ async fn run_parent_dhcp_server_monitor(
     loop {
         tokio::select! {
             _ = params.shutdown_rx.changed() => break,
-            ipc_msg = ipc_rx.recv() => {
+            ipc_msg = ipc.recv() => {
                 if !handle_worker_ipc_msg(ipc_msg, &params).await {
                     break;
                 }
@@ -179,7 +168,7 @@ async fn run_parent_dhcp_server_monitor(
                         ip_address: ip,
                         mac_address: mac,
                     };
-                    if let Err(e) = send_msg(&mut ipc_writer, &ipc_msg).await {
+                    if let Err(e) = ipc.send(&ipc_msg).await {
                         error!(
                             "[dhcp-server-parent] Failed to send neighbor update over IPC: {}",
                             e
@@ -236,7 +225,13 @@ pub fn parse_neighbor_update(
 fn setup_dhcp_server_attempt(
     lan_interface: &str,
     lan_ip: &str,
-) -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> {
+) -> Result<
+    (
+        crate::cli::WorkerService,
+        IpcEndpoint<DhcpServerWorkerToParentMsg>,
+    ),
+    ServiceError,
+> {
     let (raw_socket_fd, parent_ipc, child_ipc) = setup_worker_sockets(lan_interface)
         .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
     Ok((
@@ -263,7 +258,7 @@ impl Service for DhcpServer {
 
         self.state.start_supervised(
             move || setup_dhcp_server_attempt(&lan_interface, &lan_ip),
-            move |parent_ipc_fd, child_pid, shutdown_rx| {
+            move |parent_ipc, child_pid, shutdown_rx| {
                 let params = DhcpMonitorParams {
                     child_pid,
                     shutdown_rx,
@@ -274,7 +269,7 @@ impl Service for DhcpServer {
                     lan_interface: lan_interface_spawn.clone(),
                     lan_ip: lan_ip_spawn.clone(),
                 };
-                start_parent_arp_listener(parent_ipc_fd, params)
+                start_parent_arp_listener(parent_ipc, params)
             },
         )
     }

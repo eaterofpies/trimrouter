@@ -1,18 +1,17 @@
 use crate::cli::WorkerService;
 use crate::services::ipc::{
-    IpcReceiver, SntpClientToParentMsg, SntpParentToClientMsg, async_unix_stream, send_msg,
+    IpcEndpoint, SntpClientToParentMsg, SntpParentToClientMsg, create_ipc_channel,
 };
 use crate::services::observability::{SntpStatus, SntpStatusSender};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceController, ServiceError};
 use crate::services::utils::{
-    NTP_PORT, WanLeaseReceiver, create_ipc_fds, is_valid_ntp_server_ip, terminate_worker,
+    NTP_PORT, WanLeaseReceiver, is_valid_ntp_server_ip, terminate_worker,
 };
 use log::{error, info, warn};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_settime};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch::Receiver;
 
 const MIN_SANE_EPOCH_SECS: i64 = 1_700_000_000; // ~Nov 2023
@@ -65,11 +64,7 @@ async fn resolve_time_server_ip() -> Result<Ipv4Addr, String> {
     }
 }
 
-type ActiveSntpWorker = (
-    u32,
-    IpcReceiver<SntpClientToParentMsg, OwnedReadHalf>,
-    OwnedWriteHalf,
-);
+type ActiveSntpWorker = (u32, IpcEndpoint<SntpClientToParentMsg>);
 
 async fn handle_sntp_ipc_msg(
     msg: Result<Option<SntpClientToParentMsg>, std::io::Error>,
@@ -84,7 +79,7 @@ async fn handle_sntp_ipc_msg(
             set_system_clock(seconds, nanoseconds, status_tx);
         }
         Ok(Some(SntpClientToParentMsg::ResolveTimeServer)) => {
-            if let Some((_, _, writer)) = active_child.as_mut() {
+            if let Some((_, ipc)) = active_child.as_mut() {
                 let result = resolve_time_server_ip().await;
                 if let Err(err_msg) = &result {
                     error!(
@@ -93,7 +88,7 @@ async fn handle_sntp_ipc_msg(
                     );
                 }
                 let response = SntpParentToClientMsg::TimeServerResolved { result };
-                if let Err(e) = send_msg(writer, &response).await {
+                if let Err(e) = ipc.send(&response).await {
                     error!(
                         "[sntp-client-parent] Failed to send TimeServerResolved IPC msg: {}",
                         e
@@ -102,7 +97,7 @@ async fn handle_sntp_ipc_msg(
             }
         }
         _ => {
-            if let Some((pid, _, _)) = active_child.take() {
+            if let Some((pid, _)) = active_child.take() {
                 terminate_worker(pid).await;
             }
         }
@@ -135,7 +130,7 @@ async fn run_sntp_manager_loop(
                 if has_wan && active_child.is_none() {
                     info!("[sntp-client-parent] WAN lease acquired. Spawning worker.");
                     active_child = spawn_sntp_worker().ok();
-                } else if !has_wan && let Some((pid, _, _)) = active_child.take() {
+                } else if !has_wan && let Some((pid, _)) = active_child.take() {
                     info!("[sntp-client-parent] WAN lease lost. Stopping worker.");
                     terminate_worker(pid).await;
                 }
@@ -144,7 +139,7 @@ async fn run_sntp_manager_loop(
             // Branch B: Process IPC messages from child
             msg = async {
                 match active_child.as_mut() {
-                    Some((_, rx, _)) => rx.recv().await,
+                    Some((_, ipc)) => ipc.recv().await,
                     None => futures_util::future::pending().await,
                 }
             } => {
@@ -153,16 +148,13 @@ async fn run_sntp_manager_loop(
         }
     }
 
-    if let Some((pid, _, _)) = active_child.take() {
+    if let Some((pid, _)) = active_child.take() {
         terminate_worker(pid).await;
     }
 }
 
 fn spawn_sntp_worker() -> Result<ActiveSntpWorker, ServiceError> {
-    let (parent_ipc, child_ipc) = create_ipc_fds()?;
-    let ipc_stream = async_unix_stream(parent_ipc).map_err(ServiceError::Io)?;
-    let (ipc_reader, ipc_writer) = ipc_stream.into_split();
-
+    let (parent_ipc, child_ipc) = create_ipc_channel()?;
     let ntp_socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(ServiceError::Io)?;
 
     let worker_service = WorkerService::SntpClient {
@@ -181,7 +173,7 @@ fn spawn_sntp_worker() -> Result<ActiveSntpWorker, ServiceError> {
         "[sntp-client-parent] Spawned SNTP worker process PID {}",
         child_pid
     );
-    Ok((child_pid, IpcReceiver::new(ipc_reader), ipc_writer))
+    Ok((child_pid, parent_ipc))
 }
 
 fn set_system_clock(seconds: i64, nanoseconds: i64, status_tx: &SntpStatusSender) {

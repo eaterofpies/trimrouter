@@ -1,8 +1,6 @@
 use crate::services::DNS_FORWARDER_SERVICE_NAME;
 use crate::services::dns_forwarder::rate_limiter::DnsRateLimiter;
-use crate::services::ipc::{
-    DnsParentToWorkerMsg, DnsStatsInfo, DnsWorkerToParentMsg, IpcReceiver, send_msg,
-};
+use crate::services::ipc::{DnsParentToWorkerMsg, DnsStatsInfo, DnsWorkerToParentMsg, IpcEndpoint};
 use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_tcp_listener, async_udp_socket,
     run_sandboxed_worker,
@@ -18,7 +16,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::OwnedFd;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc::{Sender as MpscSender, channel as mpsc_channel};
 use tokio::sync::oneshot::{Sender as OneshotSender, channel as oneshot_channel};
@@ -140,15 +137,8 @@ pub async fn run_dns_forwarder_worker(
         DNS_FORWARDER_UID,
         DNS_FORWARDER_GID,
         ipc_fd,
-        |ipc| async move {
-            run_forwarder_loop(
-                dns_socket,
-                upstream_socket,
-                dns_tcp_listener,
-                ipc.reader,
-                ipc.writer,
-            )
-            .await;
+        |ipc: IpcEndpoint<DnsParentToWorkerMsg>| async move {
+            run_forwarder_loop(dns_socket, upstream_socket, dns_tcp_listener, ipc).await;
             Ok(())
         },
     )
@@ -159,10 +149,8 @@ async fn run_forwarder_loop(
     dns_socket: UdpSocket,
     upstream_socket: UdpSocket,
     dns_tcp_listener: TcpListener,
-    ipc_reader: OwnedReadHalf,
-    mut ipc_writer: OwnedWriteHalf,
+    mut ipc: IpcEndpoint<DnsParentToWorkerMsg>,
 ) {
-    let mut ipc_rx = IpcReceiver::new(ipc_reader);
     let mut cache = HashMap::<Vec<u8>, CacheEntry>::new();
     let mut pending_queries = HashMap::<u16, PendingQuery>::new();
     let mut upstream_servers = Vec::<Ipv4Addr>::new();
@@ -183,8 +171,7 @@ async fn run_forwarder_loop(
         tokio::select! {
             _ = cleanup_timer.tick() => {
                 dns_stats.cached_entries_count = cache.len();
-                if let Err(e) = send_msg(
-                    &mut ipc_writer,
+                if let Err(e) = ipc.send(
                     &DnsWorkerToParentMsg::Heartbeat {
                         stats: dns_stats.clone(),
                     },
@@ -197,7 +184,7 @@ async fn run_forwarder_loop(
                 rate_limiter.retain_recent();
                 check_pending_timeouts(&mut pending_queries, &upstream_socket).await;
             }
-            ipc_msg = ipc_rx.recv() => {
+            ipc_msg = ipc.recv() => {
                 match ipc_msg {
                     Ok(Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })) => {
                         upstream_servers = servers;
