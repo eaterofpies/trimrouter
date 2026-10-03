@@ -53,10 +53,13 @@ async fn dispatch_worker(service: WorkerService) -> Result<(), (&'static str, st
 }
 
 pub async fn run_worker(service: WorkerService) {
+    crate::logging::init_early_logging();
     if let Err((name, e)) = dispatch_worker(service).await {
         error!("[{}-worker] ERROR: {}", name, e);
+        crate::logging::flush();
         exit(1);
     }
+    crate::logging::flush();
     exit(0);
 }
 
@@ -111,5 +114,17 @@ mod tests {
         };
         assert_eq!(dhcp_srv.child_fds().len(), 2);
         assert_eq!(dhcp_srv.to_args().len(), 4);
+    }
+
+    #[test]
+    fn test_worker_early_logging_initialization() {
+        crate::logging::init_early_logging();
+        let unique_msg = format!("worker-early-log-test-{}", rand::random::<u64>());
+        log::info!("{}", unique_msg);
+        let recent = crate::logging::get_recent_logs(50, None);
+        assert!(
+            recent.iter().any(|line| line.contains(&unique_msg)),
+            "Early logging must capture log messages in the ring buffer"
+        );
     }
 }
