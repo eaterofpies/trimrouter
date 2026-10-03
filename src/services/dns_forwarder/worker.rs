@@ -1,7 +1,7 @@
 use crate::services::DNS_FORWARDER_SERVICE_NAME;
 use crate::services::dns_forwarder::rate_limiter::DnsRateLimiter;
 use crate::services::ipc::{
-    DnsParentToWorkerMsg, DnsStatsInfo, DnsWorkerToParentMsg, recv_msg, send_msg,
+    DnsParentToWorkerMsg, DnsStatsInfo, DnsWorkerToParentMsg, IpcReceiver, send_msg,
 };
 use crate::services::utils::{
     DNS_FORWARDER_GID, DNS_FORWARDER_UID, DNS_PORT, async_tcp_listener, async_udp_socket,
@@ -159,9 +159,10 @@ async fn run_forwarder_loop(
     dns_socket: UdpSocket,
     upstream_socket: UdpSocket,
     dns_tcp_listener: TcpListener,
-    mut ipc_reader: OwnedReadHalf,
+    ipc_reader: OwnedReadHalf,
     mut ipc_writer: OwnedWriteHalf,
 ) {
+    let mut ipc_rx = IpcReceiver::new(ipc_reader);
     let mut cache = HashMap::<Vec<u8>, CacheEntry>::new();
     let mut pending_queries = HashMap::<u16, PendingQuery>::new();
     let mut upstream_servers = Vec::<Ipv4Addr>::new();
@@ -196,7 +197,7 @@ async fn run_forwarder_loop(
                 rate_limiter.retain_recent();
                 check_pending_timeouts(&mut pending_queries, &upstream_socket).await;
             }
-            ipc_msg = recv_msg::<DnsParentToWorkerMsg, _>(&mut ipc_reader) => {
+            ipc_msg = ipc_rx.recv() => {
                 match ipc_msg {
                     Ok(Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })) => {
                         upstream_servers = servers;

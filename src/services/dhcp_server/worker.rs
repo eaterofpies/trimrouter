@@ -1,7 +1,7 @@
 use crate::packet::build_raw_packet;
 use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{
-    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, recv_msg, send_msg,
+    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcReceiver, recv_msg, send_msg,
 };
 use crate::services::utils::{
     DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload, read_raw_packet,
@@ -131,12 +131,13 @@ async fn run_server_loop(
     async_sock: Arc<AsyncFd<OwnedFd>>,
     config: Arc<ServerConfig>,
     leases: LeaseHandle,
-    mut ipc_reader: OwnedReadHalf,
+    ipc_reader: OwnedReadHalf,
     mut ipc_writer: OwnedWriteHalf,
 ) -> Result<(), std::io::Error> {
+    let mut ipc_rx = IpcReceiver::new(ipc_reader);
     let mut buf = [0u8; 2048];
     let mut heartbeat_timer = interval(SERVER_HEARTBEAT_INTERVAL);
-    let (ipc_tx, mut ipc_rx) = tokio::sync::mpsc::channel::<DhcpServerWorkerToParentMsg>(32);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<DhcpServerWorkerToParentMsg>(32);
 
     loop {
         tokio::select! {
@@ -160,12 +161,12 @@ async fn run_server_loop(
                     }
                 }
             }
-            Some(msg) = ipc_rx.recv() => {
+            Some(msg) = event_rx.recv() => {
                 if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
                     debug!("[dhcp-server-worker] Failed to send IPC msg to parent: {}", e);
                 }
             }
-            ipc_msg = recv_msg::<DhcpServerParentToWorkerMsg, _>(&mut ipc_reader) => {
+            ipc_msg = ipc_rx.recv() => {
                 match ipc_msg {
                     Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
                         ip_address,
@@ -195,7 +196,7 @@ async fn run_server_loop(
                         let async_sock_clone = Arc::clone(&async_sock);
                         let config_clone = Arc::clone(&config);
                         let leases_clone = leases.clone();
-                        let ipc_tx_clone = ipc_tx.clone();
+                        let event_tx_clone = event_tx.clone();
 
                         tokio::spawn(async move {
                             process_incoming_packet(
@@ -203,14 +204,13 @@ async fn run_server_loop(
                                 async_sock_clone,
                                 config_clone,
                                 leases_clone,
-                                ipc_tx_clone,
+                                event_tx_clone,
                             )
                             .await;
                         });
                     }
                     Err(e) => {
-                        error!("[dhcp-server] Socket read error: {}. Recreating socket.", e);
-                        return Err(e);
+                        warn!("[dhcp-server] Socket read error: {}. Continuing.", e);
                     }
                 }
             }
@@ -686,6 +686,7 @@ fn get_dest_mac_ip(
 mod tests {
     use super::*;
     use crate::services::dhcp_server::{ClientLease, LeaseConfirmation, LeaseTable};
+    use crate::services::ipc::send_msg;
     use dhcproto::{Decodable, Decoder};
     use std::time::Instant;
 

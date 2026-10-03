@@ -1,5 +1,5 @@
 use crate::services::SNTP_CLIENT_SERVICE_NAME;
-use crate::services::ipc::{SntpClientToParentMsg, SntpParentToClientMsg, recv_msg, send_msg};
+use crate::services::ipc::{IpcReceiver, SntpClientToParentMsg, SntpParentToClientMsg, send_msg};
 use crate::services::utils::{
     NTP_PORT, SNTP_GID, SNTP_UID, is_valid_ntp_server_ip, run_sandboxed_worker,
 };
@@ -68,9 +68,10 @@ pub async fn run_sntp_client_worker(
 
 async fn run_sntp_worker_loop(
     mut ipc_writer: OwnedWriteHalf,
-    mut ipc_reader: OwnedReadHalf,
+    ipc_reader: OwnedReadHalf,
     ntp_socket: &UdpSocket,
 ) {
+    let mut ipc_rx = IpcReceiver::new(ipc_reader);
     let mut current_retry_delay = RETRY_INTERVAL;
     let mut sync_timer = tokio::time::interval(SYNC_INTERVAL);
     let _ = send_msg(&mut ipc_writer, &SntpClientToParentMsg::ResolveTimeServer).await;
@@ -83,7 +84,7 @@ async fn run_sntp_worker_loop(
                     break;
                 }
             }
-            ipc_msg = recv_msg::<SntpParentToClientMsg, _>(&mut ipc_reader) => {
+            ipc_msg = ipc_rx.recv() => {
                 match ipc_msg {
                     Ok(Some(SntpParentToClientMsg::TimeServerResolved { result })) => {
                         let schedule = handle_time_server_resolved(

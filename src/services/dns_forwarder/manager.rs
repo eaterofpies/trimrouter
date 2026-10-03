@@ -1,8 +1,8 @@
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::services::DNS_FORWARDER_SERVICE_NAME;
 use crate::services::ipc::{
-    DnsParentToWorkerMsg, DnsWorkerToParentMsg, LocalHostEvent, LocalHostReceiver,
-    async_unix_stream, recv_msg, send_msg,
+    DnsParentToWorkerMsg, DnsWorkerToParentMsg, IpcReceiver, LocalHostEvent, LocalHostReceiver,
+    async_unix_stream, send_msg,
 };
 use crate::services::observability::{DnsStatsSender, null_dns_stats_sender};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
@@ -109,7 +109,7 @@ struct DnsMonitorParams {
 }
 
 async fn run_parent_dns_monitor(
-    mut ipc_reader: OwnedReadHalf,
+    ipc_reader: OwnedReadHalf,
     mut ipc_writer: OwnedWriteHalf,
     mut params: DnsMonitorParams,
 ) {
@@ -118,6 +118,7 @@ async fn run_parent_dns_monitor(
         params.child_pid
     );
 
+    let mut ipc_rx = IpcReceiver::new(ipc_reader);
     let mut last_dns_servers: Vec<Ipv4Addr> = Vec::new();
 
     // 1. Initial sync of upstream resolvers on startup (custom DNS takes priority)
@@ -157,7 +158,7 @@ async fn run_parent_dns_monitor(
     while !*params.shutdown_rx.borrow() {
         tokio::select! {
             _ = params.shutdown_rx.changed() => break,
-            ipc_msg = recv_msg::<DnsWorkerToParentMsg, _>(&mut ipc_reader) => {
+            ipc_msg = ipc_rx.recv() => {
                 match ipc_msg {
                     Ok(Some(DnsWorkerToParentMsg::Heartbeat { stats })) => {
                         send_service_heartbeat(
@@ -325,13 +326,14 @@ mod tests {
     async fn test_update_upstream_resolvers_ipc_message() {
         let (s1, s2) = UnixStream::pair().unwrap();
         let (_r1, mut w1) = s1.into_split();
-        let (mut r2, _w2) = s2.into_split();
+        let (r2, _w2) = s2.into_split();
+        let mut rx = IpcReceiver::new(r2);
 
         let servers = vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)];
         let res = update_upstream_resolvers(&mut w1, &servers).await;
         assert!(res.is_ok());
 
-        let received: Option<DnsParentToWorkerMsg> = recv_msg(&mut r2).await.unwrap();
+        let received: Option<DnsParentToWorkerMsg> = rx.recv().await.unwrap();
         assert_eq!(
             received,
             Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })

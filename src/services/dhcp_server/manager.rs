@@ -1,8 +1,8 @@
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{
-    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, LocalHostEvent, LocalHostSender,
-    async_unix_stream, recv_msg, send_msg,
+    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcReceiver, LocalHostEvent,
+    LocalHostSender, async_unix_stream, send_msg,
 };
 use crate::services::observability::DhcpLeasesSender;
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
@@ -123,9 +123,11 @@ async fn handle_worker_ipc_msg(
 
 async fn run_parent_dhcp_server_monitor(
     mut ipc_writer: OwnedWriteHalf,
-    mut ipc_reader: OwnedReadHalf,
+    ipc_reader: OwnedReadHalf,
     mut params: DhcpMonitorParams,
 ) {
+    let mut ipc_rx = IpcReceiver::new(ipc_reader);
+
     let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
         leases: params.static_leases.clone().into_iter().collect(),
     };
@@ -161,7 +163,7 @@ async fn run_parent_dhcp_server_monitor(
     loop {
         tokio::select! {
             _ = params.shutdown_rx.changed() => break,
-            ipc_msg = recv_msg::<DhcpServerWorkerToParentMsg, _>(&mut ipc_reader) => {
+            ipc_msg = ipc_rx.recv() => {
                 if !handle_worker_ipc_msg(ipc_msg, &params).await {
                     break;
                 }

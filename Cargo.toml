@@ -33,6 +33,7 @@ tokio-stream = { version = "0.1.19", features = ["sync"] }
 tower = { version = "0.5.3", features = ["limit"] }
 toml = "1.1.6"
 postcard = { version = "1.1.3", features = ["use-std"] }
+tokio-util = { version = "0.7.19", features = ["codec"] }
 caps = "0.5.6"
 clap = { version = "4.6.6", features = ["derive"] }
 seccompiler = "0.5.0"

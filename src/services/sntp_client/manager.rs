@@ -1,6 +1,6 @@
 use crate::cli::WorkerService;
 use crate::services::ipc::{
-    SntpClientToParentMsg, SntpParentToClientMsg, async_unix_stream, recv_msg, send_msg,
+    IpcReceiver, SntpClientToParentMsg, SntpParentToClientMsg, async_unix_stream, send_msg,
 };
 use crate::services::observability::{SntpStatus, SntpStatusSender};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceController, ServiceError};
@@ -65,9 +65,15 @@ async fn resolve_time_server_ip() -> Result<Ipv4Addr, String> {
     }
 }
 
+type ActiveSntpWorker = (
+    u32,
+    IpcReceiver<SntpClientToParentMsg, OwnedReadHalf>,
+    OwnedWriteHalf,
+);
+
 async fn handle_sntp_ipc_msg(
     msg: Result<Option<SntpClientToParentMsg>, std::io::Error>,
-    active_child: &mut Option<(u32, OwnedReadHalf, OwnedWriteHalf)>,
+    active_child: &mut Option<ActiveSntpWorker>,
     status_tx: &SntpStatusSender,
 ) {
     match msg {
@@ -108,7 +114,7 @@ async fn run_sntp_manager_loop(
     mut shutdown_rx: Receiver<bool>,
     status_tx: SntpStatusSender,
 ) {
-    let mut active_child: Option<(u32, OwnedReadHalf, OwnedWriteHalf)> = None;
+    let mut active_child: Option<ActiveSntpWorker> = None;
 
     // 1. Initial check on startup
     if lease_rx.borrow_and_update().ip.is_some() {
@@ -138,8 +144,8 @@ async fn run_sntp_manager_loop(
             // Branch B: Process IPC messages from child
             msg = async {
                 match active_child.as_mut() {
-                    Some((_, reader, _)) => recv_msg::<SntpClientToParentMsg, _>(reader).await,
-                    None => std::future::pending().await,
+                    Some((_, rx, _)) => rx.recv().await,
+                    None => futures_util::future::pending().await,
                 }
             } => {
                 handle_sntp_ipc_msg(msg, &mut active_child, &status_tx).await;
@@ -152,7 +158,7 @@ async fn run_sntp_manager_loop(
     }
 }
 
-fn spawn_sntp_worker() -> Result<(u32, OwnedReadHalf, OwnedWriteHalf), ServiceError> {
+fn spawn_sntp_worker() -> Result<ActiveSntpWorker, ServiceError> {
     let (parent_ipc, child_ipc) = create_ipc_fds()?;
     let ipc_stream = async_unix_stream(parent_ipc).map_err(ServiceError::Io)?;
     let (ipc_reader, ipc_writer) = ipc_stream.into_split();
@@ -175,7 +181,7 @@ fn spawn_sntp_worker() -> Result<(u32, OwnedReadHalf, OwnedWriteHalf), ServiceEr
         "[sntp-client-parent] Spawned SNTP worker process PID {}",
         child_pid
     );
-    Ok((child_pid, ipc_reader, ipc_writer))
+    Ok((child_pid, IpcReceiver::new(ipc_reader), ipc_writer))
 }
 
 fn set_system_clock(seconds: i64, nanoseconds: i64, status_tx: &SntpStatusSender) {

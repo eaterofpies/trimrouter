@@ -244,7 +244,13 @@ pub fn try_read_raw(
             )
         };
         if res < 0 {
-            Err(std::io::Error::last_os_error())
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted
+                || err.raw_os_error() == Some(libc::ENOBUFS)
+            {
+                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, err));
+            }
+            Err(err)
         } else {
             Ok(res as usize)
         }
@@ -280,7 +286,13 @@ pub fn try_write_raw(
             )
         };
         if res < 0 {
-            Err(std::io::Error::last_os_error())
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted
+                || err.raw_os_error() == Some(libc::ENOBUFS)
+            {
+                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, err));
+            }
+            Err(err)
         } else {
             Ok(res)
         }

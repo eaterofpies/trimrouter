@@ -1,7 +1,7 @@
 use super::worker::DhcpError;
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::services::DHCP_CLIENT_SERVICE_NAME;
-use crate::services::ipc::{DhcpClientToParentMsg, async_unix_stream, recv_msg};
+use crate::services::ipc::{DhcpClientToParentMsg, IpcReceiver, async_unix_stream};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{
     CleanOption, WanLease, WanLeaseSender, mask_to_prefix_len, prefix_len_to_mask,
@@ -118,7 +118,7 @@ fn start_parent_supervisor_task(
 }
 
 async fn run_parent_dhcp_monitor(
-    mut parent_ipc_stream: UnixStream,
+    parent_ipc_stream: UnixStream,
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
@@ -128,8 +128,9 @@ async fn run_parent_dhcp_monitor(
         "[dhcp-client-parent] Supervising DHCP client worker (PID {})",
         child_pid
     );
+    let mut ipc_rx = IpcReceiver::new(parent_ipc_stream);
     loop {
-        match recv_msg::<DhcpClientToParentMsg, _>(&mut parent_ipc_stream).await {
+        match ipc_rx.recv().await {
             Ok(Some(DhcpClientToParentMsg::ApplyWanLease {
                 ip_address,
                 prefix_len,

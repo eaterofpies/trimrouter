@@ -1,10 +1,13 @@
+use futures_util::StreamExt;
 use pnet::util::MacAddr;
 use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
 pub fn async_unix_stream(fd: OwnedFd) -> Result<UnixStream, std::io::Error> {
     let std_stream = std::os::unix::net::UnixStream::from(fd);
@@ -112,7 +115,44 @@ pub enum SntpParentToClientMsg {
 
 pub const MAX_IPC_MSG_LEN: usize = 65536; // 64 KB maximum message size
 
-pub async fn send_msg<T: Serialize, W: AsyncWriteExt + Unpin>(
+fn create_length_delimited_codec() -> LengthDelimitedCodec {
+    LengthDelimitedCodec::builder()
+        .length_field_length(4)
+        .max_frame_length(MAX_IPC_MSG_LEN)
+        .new_codec()
+}
+
+/// Cancellation-safe structured message receiver over an asynchronous byte stream.
+///
+/// Buffers incoming frame fragments across `tokio::select!` branch cancellations,
+/// guaranteeing that no partial stream bytes are discarded or corrupted.
+pub struct IpcReceiver<T, R = OwnedReadHalf> {
+    framed: FramedRead<R, LengthDelimitedCodec>,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<T: for<'a> Deserialize<'a>, R: AsyncRead + Unpin> IpcReceiver<T, R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            framed: FramedRead::new(reader, create_length_delimited_codec()),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Result<Option<T>, std::io::Error> {
+        match self.framed.next().await {
+            Some(Ok(bytes)) => {
+                let msg = postcard::from_bytes(&bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Ok(Some(msg))
+            }
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+}
+
+pub async fn send_msg<T: Serialize, W: AsyncWrite + Unpin>(
     writer: &mut W,
     msg: &T,
 ) -> Result<(), std::io::Error> {
@@ -135,30 +175,11 @@ pub async fn send_msg<T: Serialize, W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-pub async fn recv_msg<T: for<'a> Deserialize<'a>, R: AsyncReadExt + Unpin>(
+pub async fn recv_msg<T: for<'a> Deserialize<'a>, R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<T>, std::io::Error> {
-    let mut len_bytes = [0u8; 4];
-    match reader.read_exact(&mut len_bytes).await {
-        Ok(_) => {}
-        Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_IPC_MSG_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "IPC message length {} exceeds maximum limit of {}",
-                len, MAX_IPC_MSG_LEN
-            ),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
-    let msg = postcard::from_bytes(&buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(Some(msg))
+    let mut rx = IpcReceiver::new(reader);
+    rx.recv().await
 }
 
 #[cfg(test)]
@@ -274,6 +295,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ipc_receiver_cancellation_safety() {
+        let (sock1, sock2) = UnixStream::pair().unwrap();
+        let (r1, _w1) = sock1.into_split();
+        let (_r2, mut w2) = sock2.into_split();
+        let mut rx: IpcReceiver<DhcpClientToParentMsg> = IpcReceiver::new(r1);
+
+        let msg = DhcpClientToParentMsg::ApplyWanLease {
+            ip_address: Ipv4Addr::new(192, 168, 1, 100),
+            prefix_len: 24,
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+            dns_servers: vec![Ipv4Addr::new(1, 1, 1, 1)],
+        };
+        let serialized = postcard::to_stdvec(&msg).unwrap();
+        let len = (serialized.len() as u32).to_be_bytes();
+
+        let mut full_frame = Vec::new();
+        full_frame.extend_from_slice(&len);
+        full_frame.extend_from_slice(&serialized);
+
+        // 1. Send only partial bytes (first 3 bytes of the 4-byte length prefix)
+        w2.write_all(&full_frame[..3]).await.unwrap();
+        w2.flush().await.unwrap();
+
+        // 2. Poll recv() inside select with immediate timeout: must cancel cleanly
+        tokio::select! {
+            _ = rx.recv() => panic!("Should not complete on partial prefix"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        // 3. Send the rest of the frame
+        w2.write_all(&full_frame[3..]).await.unwrap();
+        w2.flush().await.unwrap();
+
+        // 4. Next recv() must successfully reconstruct the buffered frame without data corruption
+        let received = rx.recv().await.unwrap().unwrap();
+        assert_eq!(received, msg);
+
+        // 5. Send a subsequent message to verify the stream remains synchronized
+        let clear_msg = DhcpClientToParentMsg::ClearWanLease;
+        send_msg(&mut w2, &clear_msg).await.unwrap();
+        let second_received = rx.recv().await.unwrap().unwrap();
+        assert_eq!(second_received, clear_msg);
+    }
+
+    #[tokio::test]
     async fn test_ipc_recv_eof_returns_none() {
         let (sock1, sock2) = UnixStream::pair().unwrap();
         let (mut r1, _w1) = sock1.into_split();
@@ -313,9 +379,7 @@ mod tests {
 
         let res: Result<Option<DhcpClientToParentMsg>, std::io::Error> = recv_msg(&mut r1).await;
         assert!(res.is_err());
-        let err = res.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("exceeds maximum limit"));
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
