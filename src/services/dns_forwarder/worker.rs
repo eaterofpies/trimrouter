@@ -149,7 +149,7 @@ async fn run_forwarder_loop(
     dns_socket: UdpSocket,
     upstream_socket: UdpSocket,
     dns_tcp_listener: TcpListener,
-    mut ipc: IpcEndpoint<DnsParentToWorkerMsg>,
+    ipc: IpcEndpoint<DnsParentToWorkerMsg>,
 ) {
     let mut cache = HashMap::<Vec<u8>, CacheEntry>::new();
     let mut pending_queries = HashMap::<u16, PendingQuery>::new();

@@ -1,6 +1,6 @@
 use crate::packet::build_raw_packet;
 use crate::services::DHCP_CLIENT_SERVICE_NAME;
-use crate::services::ipc::{DhcpClientToParentMsg, IpcEndpoint, IpcReceiver, send_msg};
+use crate::services::ipc::{DhcpClientToParentMsg, IpcEndpoint};
 use crate::services::utils::{
     CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, get_interface_mac,
     mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload, run_sandboxed_worker,
@@ -12,7 +12,6 @@ use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
 use std::time::{Duration, Instant};
-use tokio::net::unix::OwnedWriteHalf;
 use tokio::time::sleep;
 
 const DEFAULT_LEASE_SECS: u32 = 3600;
@@ -160,21 +159,21 @@ impl DhcpClientSocket {
 struct DhcpClientInternal {
     socket: DhcpClientSocket,
     mac: MacAddr,
-    ipc_tx: OwnedWriteHalf,
+    ipc: IpcEndpoint<DhcpClientToParentMsg>,
 }
 
 impl DhcpClientInternal {
-    async fn run(&mut self, mut ipc_rx: IpcReceiver<DhcpClientToParentMsg>) {
+    async fn run(&self) {
         loop {
             tokio::select! {
-                _ = ipc_rx.recv() => {
+                _ = self.ipc.recv() => {
                     info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
                     self.deconfigure().await;
                     break;
                 }
                 phase_res = self.execute_phases() => {
                     if let Err(e) = phase_res
-                        && !self.handle_phase_failure(e, &mut ipc_rx).await
+                        && !self.handle_phase_failure(e).await
                     {
                         break;
                     }
@@ -183,25 +182,21 @@ impl DhcpClientInternal {
         }
     }
 
-    async fn execute_phases(&mut self) -> Result<(), DhcpError> {
+    async fn execute_phases(&self) -> Result<(), DhcpError> {
         let (xid, offer) = self.discover_phase().await?;
         let ack = self.request_phase(xid, offer).await?;
         self.bound_phase(ack).await?;
         Ok(())
     }
 
-    async fn handle_phase_failure(
-        &mut self,
-        e: DhcpError,
-        ipc_rx: &mut IpcReceiver<DhcpClientToParentMsg>,
-    ) -> bool {
+    async fn handle_phase_failure(&self, e: DhcpError) -> bool {
         warn!(
             "[dhcp-client] Phase failed: {}. Retrying in {}s...",
             e, SOCKET_RESTART_DELAY_SECS
         );
         self.deconfigure().await;
         tokio::select! {
-            _ = ipc_rx.recv() => {
+            _ = self.ipc.recv() => {
                 info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
                 false
             }
@@ -209,13 +204,13 @@ impl DhcpClientInternal {
         }
     }
 
-    async fn send_heartbeat(&mut self) {
-        if let Err(e) = send_msg(&mut self.ipc_tx, &DhcpClientToParentMsg::Heartbeat).await {
+    async fn send_heartbeat(&self) {
+        if let Err(e) = self.ipc.send(&DhcpClientToParentMsg::Heartbeat).await {
             debug!("[dhcp-client] Failed to send heartbeat to parent: {}", e);
         }
     }
 
-    async fn discover_phase(&mut self) -> Result<(u32, DhcpOffer), DhcpError> {
+    async fn discover_phase(&self) -> Result<(u32, DhcpOffer), DhcpError> {
         let xid = rand::random::<u32>();
         let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
 
@@ -253,7 +248,7 @@ fn handle_ack_result(ack_res: ParseAckResult) -> Option<Result<DhcpAck, DhcpErro
 }
 
 impl DhcpClientInternal {
-    async fn request_phase(&mut self, xid: u32, offer: DhcpOffer) -> Result<DhcpAck, DhcpError> {
+    async fn request_phase(&self, xid: u32, offer: DhcpOffer) -> Result<DhcpAck, DhcpError> {
         let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
 
         loop {
@@ -280,7 +275,7 @@ impl DhcpClientInternal {
         }
     }
 
-    async fn bound_phase(&mut self, mut ack: DhcpAck) -> Result<(), DhcpError> {
+    async fn bound_phase(&self, mut ack: DhcpAck) -> Result<(), DhcpError> {
         self.apply_lease_config(ack.ip, ack.mask, ack.gateway, &ack.dns_servers)
             .await?;
         let mut bound_at = Instant::now();
@@ -328,7 +323,7 @@ impl DhcpClientInternal {
     }
 
     async fn renew_lease(
-        &mut self,
+        &self,
         ip: Ipv4Addr,
         t2_secs: u32,
         lease_secs: u32,
@@ -440,7 +435,7 @@ impl DhcpClientInternal {
     }
 
     async fn apply_lease_config(
-        &mut self,
+        &self,
         ip: Ipv4Addr,
         mask: Ipv4Addr,
         gateway: Option<Ipv4Addr>,
@@ -453,15 +448,13 @@ impl DhcpClientInternal {
             gateway: gateway.unwrap_or(Ipv4Addr::UNSPECIFIED),
             dns_servers: dns_servers.to_vec(),
         };
-        send_msg(&mut self.ipc_tx, &msg)
-            .await
-            .map_err(DhcpError::Io)?;
+        self.ipc.send(&msg).await.map_err(DhcpError::Io)?;
         Ok(())
     }
 
-    async fn deconfigure(&mut self) {
+    async fn deconfigure(&self) {
         let msg = DhcpClientToParentMsg::ClearWanLease;
-        if let Err(e) = send_msg(&mut self.ipc_tx, &msg).await {
+        if let Err(e) = self.ipc.send(&msg).await {
             debug!(
                 "[dhcp-client] Failed to send ClearWanLease to parent: {}",
                 e
@@ -570,13 +563,13 @@ pub async fn run_dhcp_client_worker(
         DHCP_CLIENT_GID,
         ipc_fd,
         |ipc: IpcEndpoint<DhcpClientToParentMsg>| async move {
-            let mut client = DhcpClientInternal {
+            let client = DhcpClientInternal {
                 socket: client_socket,
                 mac,
-                ipc_tx: ipc.tx,
+                ipc,
             };
 
-            client.run(ipc.rx).await;
+            client.run().await;
             Ok(())
         },
     )

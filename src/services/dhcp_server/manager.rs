@@ -114,7 +114,7 @@ async fn handle_worker_ipc_msg(
 }
 
 async fn run_parent_dhcp_server_monitor(
-    mut ipc: IpcEndpoint<DhcpServerWorkerToParentMsg>,
+    ipc: IpcEndpoint<DhcpServerWorkerToParentMsg>,
     mut params: DhcpMonitorParams,
 ) {
     let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {

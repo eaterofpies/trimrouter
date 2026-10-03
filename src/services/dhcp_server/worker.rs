@@ -1,8 +1,6 @@
 use crate::packet::build_raw_packet;
 use crate::services::DHCP_SERVER_SERVICE_NAME;
-use crate::services::ipc::{
-    DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcEndpoint, IpcReceiver,
-};
+use crate::services::ipc::{DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcEndpoint};
 use crate::services::utils::{
     DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload, read_raw_packet,
     run_sandboxed_worker, send_raw_packet,
@@ -66,9 +64,9 @@ pub async fn run_dhcp_server_worker(
         DHCP_SERVER_UID,
         DHCP_SERVER_GID,
         ipc_fd,
-        |mut ipc: IpcEndpoint<DhcpServerParentToWorkerMsg>| async move {
+        |ipc: IpcEndpoint<DhcpServerParentToWorkerMsg>| async move {
             let leases = spawn_lease_actor();
-            sync_initial_static_leases(&mut ipc.rx, &leases).await?;
+            sync_initial_static_leases(&ipc, &leases).await?;
 
             let config = Arc::new(ServerConfig {
                 server_ip,
@@ -86,10 +84,10 @@ pub async fn run_dhcp_server_worker(
 }
 
 async fn sync_initial_static_leases(
-    ipc_rx: &mut IpcReceiver<DhcpServerParentToWorkerMsg>,
+    ipc: &IpcEndpoint<DhcpServerParentToWorkerMsg>,
     leases: &LeaseHandle,
 ) -> Result<(), std::io::Error> {
-    match ipc_rx.recv().await {
+    match ipc.recv().await {
         Ok(Some(DhcpServerParentToWorkerMsg::SetStaticLeases {
             leases: static_leases,
         })) => {
@@ -129,7 +127,7 @@ async fn run_server_loop(
     async_sock: Arc<AsyncFd<OwnedFd>>,
     config: Arc<ServerConfig>,
     leases: LeaseHandle,
-    mut ipc: IpcEndpoint<DhcpServerParentToWorkerMsg>,
+    ipc: IpcEndpoint<DhcpServerParentToWorkerMsg>,
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 2048];
     let mut heartbeat_timer = interval(SERVER_HEARTBEAT_INTERVAL);
@@ -681,7 +679,6 @@ fn get_dest_mac_ip(
 mod tests {
     use super::*;
     use crate::services::dhcp_server::{ClientLease, LeaseConfirmation, LeaseTable};
-    use crate::services::ipc::send_msg;
     use dhcproto::{Decodable, Decoder};
     use std::time::Instant;
 
@@ -1388,10 +1385,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_initial_static_leases_success() {
-        let (sock1, sock2) = tokio::net::UnixStream::pair().unwrap();
-        let (reader, _writer) = sock1.into_split();
-        let mut rx = IpcReceiver::new(reader);
-        let (_parent_reader, mut parent_writer) = sock2.into_split();
+        let (parent_ipc, child_fd) =
+            crate::services::ipc::create_ipc_channel::<DhcpServerWorkerToParentMsg>().unwrap();
+        let child_ipc: IpcEndpoint<DhcpServerParentToWorkerMsg> =
+            IpcEndpoint::from_owned_fd(child_fd).unwrap();
 
         let leases = spawn_lease_actor();
 
@@ -1401,9 +1398,9 @@ mod tests {
                 Ipv4Addr::new(192, 168, 1, 50),
             )],
         };
-        send_msg(&mut parent_writer, &msg).await.unwrap();
+        parent_ipc.send(&msg).await.unwrap();
 
-        let result = sync_initial_static_leases(&mut rx, &leases).await;
+        let result = sync_initial_static_leases(&child_ipc, &leases).await;
         assert!(result.is_ok());
 
         let mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
@@ -1416,13 +1413,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_initial_static_leases_eof_fails() {
-        let (sock1, sock2) = tokio::net::UnixStream::pair().unwrap();
-        let (reader, _writer) = sock1.into_split();
-        let mut rx = IpcReceiver::new(reader);
-        drop(sock2);
+        let (parent_ipc, child_fd) =
+            crate::services::ipc::create_ipc_channel::<DhcpServerWorkerToParentMsg>().unwrap();
+        let child_ipc: IpcEndpoint<DhcpServerParentToWorkerMsg> =
+            IpcEndpoint::from_owned_fd(child_fd).unwrap();
+        drop(parent_ipc);
 
         let leases = spawn_lease_actor();
-        let result = sync_initial_static_leases(&mut rx, &leases).await;
+        let result = sync_initial_static_leases(&child_ipc, &leases).await;
         assert!(result.is_err());
     }
 

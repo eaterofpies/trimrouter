@@ -107,7 +107,7 @@ struct DnsMonitorParams {
 }
 
 async fn run_parent_dns_monitor(
-    mut ipc: IpcEndpoint<DnsWorkerToParentMsg>,
+    ipc: IpcEndpoint<DnsWorkerToParentMsg>,
     mut params: DnsMonitorParams,
 ) {
     info!(
@@ -126,7 +126,7 @@ async fn run_parent_dns_monitor(
         };
 
         if !initial_servers.is_empty() {
-            if let Err(e) = update_upstream_resolvers(&mut ipc, &initial_servers).await {
+            if let Err(e) = update_upstream_resolvers(&ipc, &initial_servers).await {
                 error!(
                     "[dns-forwarder-parent] Failed to send initial upstream resolvers: {}",
                     e
@@ -176,7 +176,7 @@ async fn run_parent_dns_monitor(
                 if params.custom_dns.is_empty() {
                     let current_servers = params.lease_rx.borrow_and_update().dns_servers.clone();
                     if current_servers != last_dns_servers {
-                        if update_upstream_resolvers(&mut ipc, &current_servers).await.is_err() {
+                        if update_upstream_resolvers(&ipc, &current_servers).await.is_err() {
                             break;
                         }
                         last_dns_servers = current_servers;
@@ -215,7 +215,7 @@ async fn run_parent_dns_monitor(
 }
 
 async fn update_upstream_resolvers(
-    ipc: &mut IpcEndpoint<DnsWorkerToParentMsg>,
+    ipc: &IpcEndpoint<DnsWorkerToParentMsg>,
     servers: &[Ipv4Addr],
 ) -> Result<(), IoError> {
     info!(
@@ -316,12 +316,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_upstream_resolvers_ipc_message() {
-        let (mut parent_ipc, child_fd) = create_ipc_channel::<DnsWorkerToParentMsg>().unwrap();
-        let mut child_ipc: IpcEndpoint<DnsParentToWorkerMsg> =
+        let (parent_ipc, child_fd) = create_ipc_channel::<DnsWorkerToParentMsg>().unwrap();
+        let child_ipc: IpcEndpoint<DnsParentToWorkerMsg> =
             IpcEndpoint::from_owned_fd(child_fd).unwrap();
 
         let servers = vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)];
-        let res = update_upstream_resolvers(&mut parent_ipc, &servers).await;
+        let res = update_upstream_resolvers(&parent_ipc, &servers).await;
         assert!(res.is_ok());
 
         let received: Option<DnsParentToWorkerMsg> = child_ipc.recv().await.unwrap();

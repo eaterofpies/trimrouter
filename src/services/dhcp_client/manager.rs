@@ -114,7 +114,7 @@ fn start_parent_supervisor_task(
 }
 
 async fn run_parent_dhcp_monitor(
-    mut ipc: IpcEndpoint<DhcpClientToParentMsg>,
+    ipc: IpcEndpoint<DhcpClientToParentMsg>,
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
