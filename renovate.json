@@ -5,6 +5,12 @@
     ":automergeAll"
   ],
   "platformAutomerge": true,
+  "postUpdateOptions": [
+    "cargoUpdate"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true
+  },
   "packageRules": [
     {
       "groupName": "all dependencies",
