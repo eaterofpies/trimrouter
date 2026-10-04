@@ -17,25 +17,18 @@ This specification describes the built-in observability subsystem of `trimrouter
 
 ## 2. Architecture & Service Topology
 
-```
-                  [ Web Browser / curl on LAN ]
-                                │
-                 HTTP / SSE (Port 80) on LAN IP
-                                │
-                                ▼
-                   [ Observability Service ]
-                  (Tokio Async HTTP Listener)
-                   ├── GET /                 (Static Web Dashboard)
-                   ├── GET /api/status       (JSON Subsystem Health)
-                   ├── GET /api/logs         (Snapshot of Recent Logs)
-                   └── GET /api/logs/stream  (Server-Sent Events Stream)
-                                │
-            ┌───────────────────┼───────────────────┐
-            ▼                   ▼                   ▼
-    [ System & Network ]  [ Subsystem State ]  [ Log Ring Buffer ]
-    • Uptime / CPU / RAM  • DHCP WAN Lease     • 500-line memory cap
-    • Interface RX/TX     • DHCP LAN Leases    • Broadcast channel
-    • Watchdog Heartbeat  • DNS Cache Stats    • Feeds SSE subscribers
+```mermaid
+flowchart TD
+    Client["Web Browser / curl on LAN"] -->|"HTTP / SSE (Port 80) on LAN IP"| Svc["Observability Service (Axum / Tokio)"]
+    Svc -->|"GET /"| Dash["Static Web Dashboard"]
+    Svc -->|"GET /api/status"| Status["JSON Subsystem Health"]
+    Svc -->|"GET /api/logs"| Recent["Snapshot of Recent Logs"]
+    Svc -->|"GET /api/logs/stream"| SSE["Server-Sent Events Stream"]
+
+    Status -->|"Inspects"| Sys["System and Network (Uptime, CPU, RAM, Interfaces)"]
+    Status -->|"Inspects"| State["Subsystem State (WAN/LAN Leases, DNS Stats, SNTP)"]
+    Recent -->|"Queries"| Ring["Log Ring Buffer (500-line memory cap)"]
+    SSE -->|"Subscribes"| Bcast["Broadcast Channel (Real-time dispatch)"]
 ```
 
 ---
