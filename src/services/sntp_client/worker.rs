@@ -1,5 +1,5 @@
 use crate::services::SNTP_CLIENT_SERVICE_NAME;
-use crate::services::ipc::{SntpClientToParentMsg, SntpParentToClientMsg, recv_msg, send_msg};
+use crate::services::ipc::{IpcEndpoint, SntpClientToParentMsg, SntpParentToClientMsg};
 use crate::services::utils::{
     NTP_PORT, SNTP_GID, SNTP_UID, is_valid_ntp_server_ip, run_sandboxed_worker,
 };
@@ -13,7 +13,6 @@ use std::io::Error as IoError;
 use std::os::unix::io::OwnedFd;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
 const RETRY_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds
@@ -58,37 +57,33 @@ pub async fn run_sntp_client_worker(
         SNTP_UID,
         SNTP_GID,
         ipc_fd,
-        |ipc| async move {
-            run_sntp_worker_loop(ipc.writer, ipc.reader, &ntp_socket).await;
+        |ipc: IpcEndpoint<SntpParentToClientMsg>| async move {
+            run_sntp_worker_loop(ipc, &ntp_socket).await;
             Ok(())
         },
     )
     .await
 }
 
-async fn run_sntp_worker_loop(
-    mut ipc_writer: OwnedWriteHalf,
-    mut ipc_reader: OwnedReadHalf,
-    ntp_socket: &UdpSocket,
-) {
+async fn run_sntp_worker_loop(ipc: IpcEndpoint<SntpParentToClientMsg>, ntp_socket: &UdpSocket) {
     let mut current_retry_delay = RETRY_INTERVAL;
     let mut sync_timer = tokio::time::interval(SYNC_INTERVAL);
-    let _ = send_msg(&mut ipc_writer, &SntpClientToParentMsg::ResolveTimeServer).await;
+    let _ = ipc.send(&SntpClientToParentMsg::ResolveTimeServer).await;
 
     loop {
         tokio::select! {
             _ = sync_timer.tick() => {
-                if let Err(e) = send_msg(&mut ipc_writer, &SntpClientToParentMsg::ResolveTimeServer).await {
+                if let Err(e) = ipc.send(&SntpClientToParentMsg::ResolveTimeServer).await {
                     error!("[sntp-client-worker] Failed to send ResolveTimeServer: {}", e);
                     break;
                 }
             }
-            ipc_msg = recv_msg::<SntpParentToClientMsg, _>(&mut ipc_reader) => {
+            ipc_msg = ipc.recv() => {
                 match ipc_msg {
                     Ok(Some(SntpParentToClientMsg::TimeServerResolved { result })) => {
                         let schedule = handle_time_server_resolved(
                             result,
-                            &mut ipc_writer,
+                            &ipc,
                             ntp_socket,
                             current_retry_delay,
                         ).await;
@@ -99,7 +94,7 @@ async fn run_sntp_worker_loop(
                         );
                     }
                     Ok(None) | Err(_) => {
-                        info!("[sntp-client-worker] Parent closed IPC. Shutting down.");
+                        info!("[sntp-client-worker] Parent IPC closed. Shutting down.");
                         break;
                     }
                 }
@@ -110,7 +105,7 @@ async fn run_sntp_worker_loop(
 
 async fn handle_time_server_resolved(
     result: Result<std::net::Ipv4Addr, String>,
-    ipc_writer: &mut OwnedWriteHalf,
+    ipc: &IpcEndpoint<SntpParentToClientMsg>,
     ntp_socket: &UdpSocket,
     current_retry_delay: Duration,
 ) -> SyncScheduleResult {
@@ -123,7 +118,7 @@ async fn handle_time_server_resolved(
                         "[sntp-client-worker] Successfully fetched NTP time: {}",
                         chrono_dt
                     );
-                    send_time_to_parent(ipc_writer, chrono_dt).await;
+                    send_time_to_parent(ipc, chrono_dt).await;
                     SyncScheduleResult {
                         next_sync_delay: SYNC_INTERVAL,
                         next_retry_delay: RETRY_INTERVAL,
@@ -180,13 +175,13 @@ fn datetime_to_time_components(chrono_dt: DateTime<Utc>) -> Option<TimeComponent
     })
 }
 
-async fn send_time_to_parent(ipc_writer: &mut OwnedWriteHalf, chrono_dt: DateTime<Utc>) {
+async fn send_time_to_parent(ipc: &IpcEndpoint<SntpParentToClientMsg>, chrono_dt: DateTime<Utc>) {
     if let Some(components) = datetime_to_time_components(chrono_dt) {
         let msg = SntpClientToParentMsg::SetSystemTime {
             seconds: components.seconds,
             nanoseconds: components.nanoseconds,
         };
-        if let Err(e) = send_msg(ipc_writer, &msg).await {
+        if let Err(e) = ipc.send(&msg).await {
             error!("[sntp-client] Failed to send SetSystemTime IPC msg: {}", e);
         }
     }
@@ -222,7 +217,6 @@ async fn query_ntp_time(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::UnixStream;
 
     #[tokio::test]
     async fn test_tokio_udp_socket_ref_send_recv() {
@@ -245,15 +239,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_time_server_resolved_error_schedules_retry() {
-        let (sock1, _sock2) = UnixStream::pair().unwrap();
-        let (_reader, mut writer) = sock1.into_split();
+        let (_parent_ipc, child_fd) =
+            crate::services::ipc::create_ipc_channel::<SntpClientToParentMsg>().unwrap();
+        let child_ipc: IpcEndpoint<SntpParentToClientMsg> =
+            IpcEndpoint::from_owned_fd(child_fd).unwrap();
         let udp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let retry_delay = Duration::from_secs(60);
 
         let schedule = handle_time_server_resolved(
             Err("DNS query failed".to_string()),
-            &mut writer,
+            &child_ipc,
             &udp_sock,
             retry_delay,
         )
@@ -310,14 +306,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_time_server_resolved_invalid_ip() {
-        let (s1, _s2) = tokio::net::UnixStream::pair().unwrap();
-        let (_r1, mut w1) = s1.into_split();
+        let (_parent_ipc, child_fd) =
+            crate::services::ipc::create_ipc_channel::<SntpClientToParentMsg>().unwrap();
+        let child_ipc: IpcEndpoint<SntpParentToClientMsg> =
+            IpcEndpoint::from_owned_fd(child_fd).unwrap();
         let udp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // 127.0.0.1 is rejected as invalid NTP server IP
         let res = handle_time_server_resolved(
             Ok(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-            &mut w1,
+            &child_ipc,
             &udp_sock,
             Duration::from_secs(60),
         )

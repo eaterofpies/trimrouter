@@ -9,6 +9,7 @@ pub mod modprobe;
 pub mod worker;
 
 pub async fn run(args: Vec<String>) {
+    crate::logging::init_early_logging();
     // Parse using the multicall-enabled Cli
     let cli = match Cli::try_parse_from(&args) {
         Ok(c) => c,

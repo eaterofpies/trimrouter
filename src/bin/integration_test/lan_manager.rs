@@ -166,7 +166,7 @@ pub async fn test_lan_dhcp_handshake(lease_rx: WanLeaseReceiver) -> Result<LanMa
     // Await server startup and IP configuration
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // 2. Tell the host coordinator to trigger the mock LAN client DHCP handshake
+    // 2. Tell the host coordinator to trigger the mock LAN client DHCP handshake (client 1)
     std::println!("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE");
 
     // 3. Ping the dynamically leased client IP (192.168.1.2)
@@ -184,7 +184,26 @@ pub async fn test_lan_dhcp_handshake(lease_rx: WanLeaseReceiver) -> Result<LanMa
         ));
     }
 
-    std::println!("[test] LAN DHCP Server Handshake verified successfully.");
+    // 4. Trigger second dynamic client (client 2 with distinct MAC) to verify multi-client dynamic pool allocation and ARP probing
+    std::println!("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE_CLIENT2");
+
+    let target_ip2 = Ipv4Addr::new(192, 168, 1, 3);
+    if let Err(e) = ping_ip(target_ip2, Duration::from_secs(10)).await {
+        if let Err(stop_err) = lan_manager.stop().await {
+            std::eprintln!(
+                "[test] Warning: Failed to stop LanManager during cleanup: {}",
+                stop_err
+            );
+        }
+        return Err(format!(
+            "LAN dynamic client 2 DHCP handshake failed: did not receive ICMP reply from {}: {}",
+            target_ip2, e
+        ));
+    }
+
+    std::println!(
+        "[test] LAN DHCP Server Handshake verified successfully (multiple dynamic clients leased)."
+    );
     Ok(lan_manager)
 }
 

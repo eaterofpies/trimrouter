@@ -1,19 +1,17 @@
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::services::DNS_FORWARDER_SERVICE_NAME;
 use crate::services::ipc::{
-    DnsParentToWorkerMsg, DnsWorkerToParentMsg, LocalHostEvent, LocalHostReceiver,
-    async_unix_stream, recv_msg, send_msg,
+    DnsParentToWorkerMsg, DnsWorkerToParentMsg, IpcEndpoint, LocalHostEvent, LocalHostReceiver,
+    create_ipc_channel,
 };
 use crate::services::observability::{DnsStatsSender, null_dns_stats_sender};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
-use crate::services::utils::{DNS_PORT, WanLeaseReceiver, create_ipc_fds, terminate_worker};
+use crate::services::utils::{DNS_PORT, WanLeaseReceiver, terminate_worker};
 use log::{error, info};
 use std::collections::HashMap;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
-use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
@@ -109,8 +107,7 @@ struct DnsMonitorParams {
 }
 
 async fn run_parent_dns_monitor(
-    mut ipc_reader: OwnedReadHalf,
-    mut ipc_writer: OwnedWriteHalf,
+    ipc: IpcEndpoint<DnsWorkerToParentMsg>,
     mut params: DnsMonitorParams,
 ) {
     info!(
@@ -129,7 +126,7 @@ async fn run_parent_dns_monitor(
         };
 
         if !initial_servers.is_empty() {
-            if let Err(e) = update_upstream_resolvers(&mut ipc_writer, &initial_servers).await {
+            if let Err(e) = update_upstream_resolvers(&ipc, &initial_servers).await {
                 error!(
                     "[dns-forwarder-parent] Failed to send initial upstream resolvers: {}",
                     e
@@ -144,7 +141,7 @@ async fn run_parent_dns_monitor(
         let cached = params.local_hosts.cache.lock().await.clone();
         for (name, ip) in cached {
             let msg = DnsParentToWorkerMsg::RegisterLocalHost { name, ip };
-            if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+            if let Err(e) = ipc.send(&msg).await {
                 error!(
                     "[dns-forwarder-parent] Failed to send cached host to worker: {}",
                     e
@@ -157,7 +154,7 @@ async fn run_parent_dns_monitor(
     while !*params.shutdown_rx.borrow() {
         tokio::select! {
             _ = params.shutdown_rx.changed() => break,
-            ipc_msg = recv_msg::<DnsWorkerToParentMsg, _>(&mut ipc_reader) => {
+            ipc_msg = ipc.recv() => {
                 match ipc_msg {
                     Ok(Some(DnsWorkerToParentMsg::Heartbeat { stats })) => {
                         send_service_heartbeat(
@@ -179,7 +176,7 @@ async fn run_parent_dns_monitor(
                 if params.custom_dns.is_empty() {
                     let current_servers = params.lease_rx.borrow_and_update().dns_servers.clone();
                     if current_servers != last_dns_servers {
-                        if update_upstream_resolvers(&mut ipc_writer, &current_servers).await.is_err() {
+                        if update_upstream_resolvers(&ipc, &current_servers).await.is_err() {
                             break;
                         }
                         last_dns_servers = current_servers;
@@ -198,14 +195,14 @@ async fn run_parent_dns_monitor(
                     LocalHostEvent::Register { name, ip } => {
                         params.local_hosts.cache.lock().await.insert(name.clone(), ip);
                         let msg = DnsParentToWorkerMsg::RegisterLocalHost { name, ip };
-                        if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+                        if let Err(e) = ipc.send(&msg).await {
                             error!("[dns-forwarder-parent] Failed to send RegisterLocalHost: {}", e);
                         }
                     }
                     LocalHostEvent::Deregister { name } => {
                         params.local_hosts.cache.lock().await.remove(&name);
                         let msg = DnsParentToWorkerMsg::DeregisterLocalHost { name };
-                        if let Err(e) = send_msg(&mut ipc_writer, &msg).await {
+                        if let Err(e) = ipc.send(&msg).await {
                             error!("[dns-forwarder-parent] Failed to send DeregisterLocalHost: {}", e);
                         }
                     }
@@ -218,7 +215,7 @@ async fn run_parent_dns_monitor(
 }
 
 async fn update_upstream_resolvers(
-    ipc_writer: &mut OwnedWriteHalf,
+    ipc: &IpcEndpoint<DnsWorkerToParentMsg>,
     servers: &[Ipv4Addr],
 ) -> Result<(), IoError> {
     info!(
@@ -228,23 +225,20 @@ async fn update_upstream_resolvers(
     let msg = DnsParentToWorkerMsg::SetUpstreamResolvers {
         servers: servers.to_vec(),
     };
-    send_msg(ipc_writer, &msg).await
+    ipc.send(&msg).await
 }
 
 fn start_parent_dns_monitor(
-    parent_ipc_fd: OwnedFd,
+    parent_ipc: IpcEndpoint<DnsWorkerToParentMsg>,
     params: DnsMonitorParams,
 ) -> Result<JoinHandle<()>, ServiceError> {
-    let ipc_stream = async_unix_stream(parent_ipc_fd).map_err(ServiceError::Io)?;
-    let (ipc_reader, ipc_writer) = ipc_stream.into_split();
-
-    let handle = tokio::spawn(run_parent_dns_monitor(ipc_reader, ipc_writer, params));
-
+    let handle = tokio::spawn(run_parent_dns_monitor(parent_ipc, params));
     Ok(handle)
 }
 
-fn setup_dns_forwarder_attempt() -> Result<(crate::cli::WorkerService, OwnedFd), ServiceError> {
-    let (parent_ipc, child_ipc) = create_ipc_fds()?;
+fn setup_dns_forwarder_attempt()
+-> Result<(crate::cli::WorkerService, IpcEndpoint<DnsWorkerToParentMsg>), ServiceError> {
+    let (parent_ipc, child_ipc) = create_ipc_channel()?;
     let dns_socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DNS_PORT))?;
     let dns_tcp_listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, DNS_PORT))?;
     let upstream_socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
@@ -270,7 +264,7 @@ impl Service for DnsForwarder {
 
         self.state.start_supervised(
             setup_dns_forwarder_attempt,
-            move |parent_ipc_fd, child_pid, shutdown_rx| {
+            move |parent_ipc, child_pid, shutdown_rx| {
                 let params = DnsMonitorParams {
                     child_pid,
                     lease_rx: lease_rx.clone(),
@@ -280,7 +274,7 @@ impl Service for DnsForwarder {
                     local_hosts: local_hosts.clone(),
                     stats_tx: stats_tx.clone(),
                 };
-                start_parent_dns_monitor(parent_ipc_fd, params)
+                start_parent_dns_monitor(parent_ipc, params)
             },
         )
     }
@@ -294,7 +288,6 @@ impl Service for DnsForwarder {
 mod tests {
     use super::*;
     use crate::services::WanLease;
-    use tokio::net::UnixStream;
 
     #[test]
     fn test_dns_forwarder_constructors_and_pid() {
@@ -323,15 +316,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_upstream_resolvers_ipc_message() {
-        let (s1, s2) = UnixStream::pair().unwrap();
-        let (_r1, mut w1) = s1.into_split();
-        let (mut r2, _w2) = s2.into_split();
+        let (parent_ipc, child_fd) = create_ipc_channel::<DnsWorkerToParentMsg>().unwrap();
+        let child_ipc: IpcEndpoint<DnsParentToWorkerMsg> =
+            IpcEndpoint::from_owned_fd(child_fd).unwrap();
 
         let servers = vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)];
-        let res = update_upstream_resolvers(&mut w1, &servers).await;
+        let res = update_upstream_resolvers(&parent_ipc, &servers).await;
         assert!(res.is_ok());
 
-        let received: Option<DnsParentToWorkerMsg> = recv_msg(&mut r2).await.unwrap();
+        let received: Option<DnsParentToWorkerMsg> = child_ipc.recv().await.unwrap();
         assert_eq!(
             received,
             Some(DnsParentToWorkerMsg::SetUpstreamResolvers { servers })

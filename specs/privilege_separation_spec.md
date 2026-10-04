@@ -104,14 +104,14 @@ Starting, stopping, and reconfiguring services corresponds directly to executing
 
 ## 4. Inter-Process Communication (IPC) Protocol
 
-Workers communicate with the Privileged Parent over standard bidirectional **Unix Domain Sockets** (`AF_UNIX` / `SOCK_STREAM` or `SOCK_SEQPACKET`) created via `socketpair` before fork.
+Workers communicate with the Privileged Parent over standard bidirectional **Unix Domain Sequenced-Packet Sockets** (`AF_UNIX` / `SOCK_SEQPACKET`) created via `UnixSeqpacket::pair` before fork.
 
-### 4.1 Serialization & Framing
+### 4.1 Serialization & Message Boundaries
 Rather than parsing complex and potentially vulnerable JSON strings, IPC relies on a **strongly-typed binary serialization** format:
 1.  **Format**: Messages are serialized using **`postcard`**, a safe, zero-copy, `no_std` compatible binary format.
-2.  **Framing**: Sockets are wrapped in a **length-prefixed framing** layer. Each payload is preceded by a `u32` value in network byte order representing the message length, preventing message fragmentation/coalescing issues.
-3.  **Payload Length Cap**: IPC messages are strictly limited to a maximum length of 64 KB (`MAX_IPC_MSG_LEN = 65536`). Incoming length headers exceeding this bound are rejected immediately with `io::ErrorKind::InvalidData` prior to memory allocation, preventing memory exhaustion (OOM) attacks against the privileged supervisor.
-4.  **Security Benefit**: Since the parent and child are instances of the same compiled Rust binary, they share the exact same enum memory schemas. Postcard deserialization is linear and does not allocate memory or parse nested string structures, eliminating parser-level vulnerability surfaces in PID 1.
+2.  **Kernel Datagram Framing**: Sockets use Linux `SOCK_SEQPACKET`, which preserves discrete message boundaries in the kernel. Each atomic `recv` returns an exact complete datagram, eliminating manual length-prefix framing while retaining connection-oriented EOF lifecycle detection when a peer closes or crashes.
+3.  **Payload Length Cap**: IPC messages are strictly limited to a maximum length of 64 KB (`MAX_IPC_MSG_LEN = 65536`). Outgoing or incoming payloads exceeding this bound are rejected immediately with `io::ErrorKind::InvalidData`, preventing memory exhaustion (OOM) attacks against the privileged supervisor.
+4.  **Security Benefit**: Since the parent and child are instances of the same compiled Rust binary, they share the exact same enum memory schemas. Postcard deserialization is linear and does not allocate arbitrary memory or parse nested string structures, eliminating parser-level vulnerability surfaces in PID 1.
 
 ### 4.2 Parent-to-Worker Protocol
 The parent routes events to children using the following Rust enum structure:

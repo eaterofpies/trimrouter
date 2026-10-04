@@ -43,10 +43,24 @@ pub async fn start_orphan_reaper<S: ProcessOps>(sys: Arc<S>, shutdown_flag: Arc<
 
 fn try_reap_zombie<S: ProcessOps>(sys: &S) -> bool {
     match sys.waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::Exited(pid, code)) => {
+        Ok(WaitStatus::Exited(pid, 0)) => {
             debug!(
-                "[reaper] Reaped child process (PID {}) which exited with status {}",
+                "[reaper] Reaped child process (PID {}) which exited with status 0",
+                pid
+            );
+            true
+        }
+        Ok(WaitStatus::Exited(pid, code)) => {
+            warn!(
+                "[reaper] Reaped child process (PID {}) which exited abnormally with status {}",
                 pid, code
+            );
+            true
+        }
+        Ok(WaitStatus::Signaled(pid, nix::sys::signal::Signal::SIGSYS, _)) => {
+            error!(
+                "[reaper] CRITICAL: Reaped child process (PID {}) terminated with signal SIGSYS (Seccomp Sandbox Violation)! A disallowed syscall was blocked.",
+                pid
             );
             true
         }
@@ -128,6 +142,24 @@ mod tests {
                 nix::sys::signal::Signal::SIGSTOP,
             )));
         assert!(!try_reap_zombie(&sys));
+
+        // Abnormal exit code (e.g. 1) returns true and logs warning
+        sys.waitpid_results
+            .lock()
+            .unwrap()
+            .push(Ok(WaitStatus::Exited(Pid::from_raw(101), 1)));
+        assert!(try_reap_zombie(&sys));
+
+        // SIGSYS termination returns true and logs critical error
+        sys.waitpid_results
+            .lock()
+            .unwrap()
+            .push(Ok(WaitStatus::Signaled(
+                Pid::from_raw(102),
+                nix::sys::signal::Signal::SIGSYS,
+                false,
+            )));
+        assert!(try_reap_zombie(&sys));
     }
 
     #[tokio::test]

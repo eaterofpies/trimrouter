@@ -78,30 +78,60 @@ pub fn test_seccomp_sandbox_enforcement() -> Result<(), String> {
                 std::eprintln!("[test-seccomp] Failed to apply seccomp in child: {}", e);
                 std::process::exit(1);
             }
-            // Execute unauthorized syscall (SYS_ptrace)
-            unsafe {
-                libc::syscall(libc::SYS_ptrace, 0, 0, 0, 0);
+
+            // 1. Verify unauthorized syscall (SYS_ptrace) is blocked with EPERM
+            let res = unsafe { libc::syscall(libc::SYS_ptrace, 0, 0, 0, 0) };
+            let err = std::io::Error::last_os_error();
+            if res != -1 || err.raw_os_error() != Some(libc::EPERM) {
+                std::eprintln!(
+                    "[test-seccomp] SYS_ptrace did not return EPERM: res={}, err={}",
+                    res,
+                    err
+                );
+                std::process::exit(2);
             }
-            std::process::exit(2);
+
+            // 2. Verify unauthorized socket syscall (SYS_socket) is blocked with EPERM
+            let sock_res =
+                unsafe { libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_DGRAM, 0) };
+            let sock_err = std::io::Error::last_os_error();
+            if sock_res != -1 || sock_err.raw_os_error() != Some(libc::EPERM) {
+                std::eprintln!(
+                    "[test-seccomp] SYS_socket did not return EPERM: res={}, err={}",
+                    sock_res,
+                    sock_err
+                );
+                std::process::exit(3);
+            }
+
+            // 3. Verify std::net::UdpSocket::bind fails with PermissionDenied (EPERM)
+            match std::net::UdpSocket::bind("127.0.0.1:0") {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    std::process::exit(0);
+                }
+                other => {
+                    std::eprintln!(
+                        "[test-seccomp] UdpSocket::bind did not fail with PermissionDenied: {:?}",
+                        other
+                    );
+                    std::process::exit(4);
+                }
+            }
         }
         Ok(nix::unistd::ForkResult::Parent { child }) => {
             let status = nix::sys::wait::waitpid(child, None)
                 .map_err(|e| format!("Failed to wait for child: {}", e))?;
             match status {
-                nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
-                    if sig == nix::sys::signal::Signal::SIGSYS {
-                        std::println!(
-                            "[test] Child was successfully terminated with SIGSYS by kernel seccomp BPF filter."
-                        );
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "Child terminated with unexpected signal: {:?}",
-                            sig
-                        ))
-                    }
+                nix::sys::wait::WaitStatus::Exited(_, 0) => {
+                    std::println!(
+                        "[test] Child unauthorized syscalls (SYS_ptrace, SYS_socket, UdpSocket::bind) were successfully blocked with EPERM by kernel seccomp BPF filter."
+                    );
+                    Ok(())
                 }
-                _ => Err(format!("Child exited without SIGSYS: {:?}", status)),
+                _ => Err(format!(
+                    "Child did not exit cleanly after EPERM enforcement: {:?}",
+                    status
+                )),
             }
         }
         Err(e) => Err(format!("Fork failed: {}", e)),

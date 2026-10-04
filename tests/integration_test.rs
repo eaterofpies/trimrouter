@@ -195,6 +195,8 @@ async fn main() {
                                 let _ = env.wan_cmd_tx.send("SEND_INVALID_CONNTRACK_WAN".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_SPOOFED_INTERNAL_WAN_TRAFFIC") {
                                 let _ = env.wan_cmd_tx.send("SEND_SPOOFED_INTERNAL_WAN".to_string()).await;
+                            } else if line.contains("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE_CLIENT2") {
+                                let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE_CLIENT2".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE") {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_FORWARDED_NAT_TEST") {
@@ -1586,8 +1588,11 @@ async fn handle_lan_command(
     client_mac: MacAddr,
     dns_test_phase: &mut i32,
 ) {
-    if cmd == "TRIGGER_LAN_DHCP_HANDSHAKE" {
-        println!("[lan-client] Starting DHCP Handshake...");
+    if cmd == "TRIGGER_LAN_DHCP_HANDSHAKE" || cmd == "TRIGGER_LAN_DHCP_HANDSHAKE_CLIENT2" {
+        println!(
+            "[lan-client] Starting DHCP Handshake for MAC {}...",
+            client_mac
+        );
         let xid = rand::random::<u32>();
         let discover_payload = build_dhcp_discover_lan(xid, client_mac);
         let discover_pkt = packet::build_raw_packet(
@@ -1603,7 +1608,10 @@ async fn handle_lan_command(
         if let Err(e) = mock.send_frame(&discover_pkt).await {
             println!("[lan-client] ERROR sending DHCPDISCOVER: {}", e);
         } else {
-            println!("[lan-client] Sent DHCPDISCOVER (xid: {})", xid);
+            println!(
+                "[lan-client] Sent DHCPDISCOVER (xid: {}) for MAC {}",
+                xid, client_mac
+            );
         }
     } else if cmd == "TRIGGER_FORWARDED_NAT_TEST" {
         println!("[lan-client] Starting Forwarded NAT test...");
@@ -1647,59 +1655,62 @@ async fn handle_lan_command(
 async fn process_lan_arp(
     mock: &mut UnixStreamMock,
     frame: &[u8],
-    client_mac: MacAddr,
-    assigned_ip: Option<Ipv4Addr>,
+    assigned_ips: &std::collections::HashMap<MacAddr, Ipv4Addr>,
 ) {
-    if let Some(target_ip) = handle_arp_request_for_ip(frame, client_mac, assigned_ip)
-        && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(frame)
-        && let Some(arp) = pnet::packet::arp::ArpPacket::new(eth.payload())
-    {
-        println!(
-            "[lan-client] Received ARP request for target IP: {}. Replying...",
-            target_ip
-        );
-        let reply = build_arp_reply(
-            client_mac,
-            eth.get_source(),
-            target_ip,
-            arp.get_sender_proto_addr(),
-        );
-        let _ = mock.send_frame(&reply).await;
+    for (&client_mac, &assigned_ip) in assigned_ips {
+        if let Some(target_ip) = handle_arp_request_for_ip(frame, client_mac, Some(assigned_ip))
+            && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(frame)
+            && let Some(arp) = pnet::packet::arp::ArpPacket::new(eth.payload())
+        {
+            println!(
+                "[lan-client] Received ARP request for target IP: {} (MAC {}). Replying...",
+                target_ip, client_mac
+            );
+            let reply = build_arp_reply(
+                client_mac,
+                eth.get_source(),
+                target_ip,
+                arp.get_sender_proto_addr(),
+            );
+            let _ = mock.send_frame(&reply).await;
+        }
     }
 }
 
 async fn process_lan_icmp(
     mock: &mut UnixStreamMock,
     frame: &[u8],
-    client_mac: MacAddr,
-    assigned_ip: Option<Ipv4Addr>,
+    assigned_ips: &std::collections::HashMap<MacAddr, Ipv4Addr>,
 ) {
     if let Some((src_ip, dest_ip)) = parse_icmp_request(frame).ok().flatten()
-        && Some(dest_ip) == assigned_ip
         && let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(frame)
     {
-        println!(
-            "[lan-client] Received ICMP request from {} to {}. Replying...",
-            src_ip, dest_ip
-        );
-        let mut icmp_id = 0x4321;
-        let mut icmp_seq = 1;
-        if let Some(ip) = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())
-            && let Some(icmp) =
-                pnet::packet::icmp::echo_request::EchoRequestPacket::new(ip.payload())
-        {
-            icmp_id = icmp.get_identifier();
-            icmp_seq = icmp.get_sequence_number();
+        for (&client_mac, &assigned_ip) in assigned_ips {
+            if dest_ip == assigned_ip {
+                println!(
+                    "[lan-client] Received ICMP request from {} to {} (MAC {}). Replying...",
+                    src_ip, dest_ip, client_mac
+                );
+                let mut icmp_id = 0x4321;
+                let mut icmp_seq = 1;
+                if let Some(ip) = pnet::packet::ipv4::Ipv4Packet::new(eth.payload())
+                    && let Some(icmp) =
+                        pnet::packet::icmp::echo_request::EchoRequestPacket::new(ip.payload())
+                {
+                    icmp_id = icmp.get_identifier();
+                    icmp_seq = icmp.get_sequence_number();
+                }
+                let reply = build_icmp_echo_reply(
+                    client_mac,
+                    eth.get_source(),
+                    dest_ip,
+                    src_ip,
+                    icmp_id,
+                    icmp_seq,
+                );
+                let _ = mock.send_frame(&reply).await;
+            }
         }
-        let reply = build_icmp_echo_reply(
-            client_mac,
-            eth.get_source(),
-            dest_ip,
-            src_ip,
-            icmp_id,
-            icmp_seq,
-        );
-        let _ = mock.send_frame(&reply).await;
     }
 }
 
@@ -1845,18 +1856,27 @@ async fn process_lan_udp_dns(
 async fn process_lan_dhcp(
     mock: &mut UnixStreamMock,
     verification_tx: &tokio::sync::mpsc::Sender<String>,
-    client_mac: MacAddr,
     frame: &[u8],
-    assigned_ip: &mut Option<Ipv4Addr>,
+    assigned_ips: &mut std::collections::HashMap<MacAddr, Ipv4Addr>,
 ) {
     if let Ok(dhcp_msg) = parse_dhcp_message(frame) {
         let xid = dhcp_msg.xid();
+        let chaddr = dhcp_msg.chaddr();
+        if chaddr.len() < 6 {
+            return;
+        }
+        let client_mac = MacAddr::new(
+            chaddr[0], chaddr[1], chaddr[2], chaddr[3], chaddr[4], chaddr[5],
+        );
         let msg_type = dhcp_msg.opts().get(dhcproto::v4::OptionCode::MessageType);
 
         match msg_type {
             Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Offer)) => {
                 let offered_ip = dhcp_msg.yiaddr();
-                println!("[lan-client] Received DHCPOFFER for IP: {}", offered_ip);
+                println!(
+                    "[lan-client] Received DHCPOFFER for MAC {} with IP: {}",
+                    client_mac, offered_ip
+                );
                 let request_payload = build_dhcp_request_lan(
                     xid,
                     client_mac,
@@ -1874,12 +1894,18 @@ async fn process_lan_dhcp(
                 )
                 .expect("valid req pkt");
                 let _ = mock.send_frame(&request_pkt).await;
-                println!("[lan-client] Sent DHCPREQUEST for IP: {}", offered_ip);
+                println!(
+                    "[lan-client] Sent DHCPREQUEST for MAC {} with IP: {}",
+                    client_mac, offered_ip
+                );
             }
             Some(dhcproto::v4::DhcpOption::MessageType(dhcproto::v4::MessageType::Ack)) => {
                 let acked_ip = dhcp_msg.yiaddr();
-                println!("[lan-client] Received DHCPACK! IP: {} assigned.", acked_ip);
-                *assigned_ip = Some(acked_ip);
+                println!(
+                    "[lan-client] Received DHCPACK for MAC {}! IP: {} assigned.",
+                    client_mac, acked_ip
+                );
+                assigned_ips.insert(client_mac, acked_ip);
                 let _ = verification_tx.send("LAN_DHCP_VERIFIED".to_string()).await;
             }
             _ => {}
@@ -1892,14 +1918,20 @@ async fn run_mock_lan_client(
     mut cmd_rx: tokio::sync::mpsc::Receiver<String>,
     verification_tx: tokio::sync::mpsc::Sender<String>,
 ) {
-    let client_mac = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
-    let mut assigned_ip = None;
+    let client_mac1 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
+    let client_mac2 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x66);
+    let mut assigned_ips: std::collections::HashMap<MacAddr, Ipv4Addr> =
+        std::collections::HashMap::new();
     let mut dns_test_phase = 0;
 
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
-                handle_lan_command(&mut mock, &cmd, client_mac, &mut dns_test_phase).await;
+                if cmd == "TRIGGER_LAN_DHCP_HANDSHAKE_CLIENT2" {
+                    handle_lan_command(&mut mock, &cmd, client_mac2, &mut dns_test_phase).await;
+                } else {
+                    handle_lan_command(&mut mock, &cmd, client_mac1, &mut dns_test_phase).await;
+                }
             }
             frame_res = mock.recv_frame() => {
                 let frame = match frame_res {
@@ -1907,14 +1939,14 @@ async fn run_mock_lan_client(
                     Err(_) => break, // Socket closed
                 };
 
-                process_lan_arp(&mut mock, &frame, client_mac, assigned_ip).await;
-                process_lan_icmp(&mut mock, &frame, client_mac, assigned_ip).await;
+                process_lan_arp(&mut mock, &frame, &assigned_ips).await;
+                process_lan_icmp(&mut mock, &frame, &assigned_ips).await;
 
                 if let Some((src_ip, src_port, dest_port, payload)) = parse_udp_payload(&frame) {
-                    process_lan_udp_nat(&mut mock, client_mac, src_ip, src_port, dest_port, &payload).await;
-                    process_lan_udp_dnat(&mut mock, client_mac, dest_port, &payload).await;
+                    process_lan_udp_nat(&mut mock, client_mac1, src_ip, src_port, dest_port, &payload).await;
+                    process_lan_udp_dnat(&mut mock, client_mac1, dest_port, &payload).await;
                     let lan_pkt = LanUdpPacket {
-                        client_mac,
+                        client_mac: client_mac1,
                         src_ip,
                         src_port,
                         dest_port,
@@ -1923,7 +1955,7 @@ async fn run_mock_lan_client(
                     process_lan_udp_dns(&mut mock, &verification_tx, &lan_pkt, &mut dns_test_phase).await;
                 }
 
-                process_lan_dhcp(&mut mock, &verification_tx, client_mac, &frame, &mut assigned_ip).await;
+                process_lan_dhcp(&mut mock, &verification_tx, &frame, &mut assigned_ips).await;
             }
         }
     }
