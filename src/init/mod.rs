@@ -1,5 +1,6 @@
 pub mod firewall;
 pub mod kmod;
+pub mod kmsg;
 pub mod power;
 pub mod reaper;
 pub mod storage;
@@ -221,10 +222,15 @@ fn start_system_services(
 
     // Spawn system signal monitor
     let sig_sys = sys.clone();
-    let sig_shutdown = shutdown_flag;
-    tokio::spawn(async move {
+    let sig_shutdown = shutdown_flag.clone();
+    let sig_handle = tokio::spawn(async move {
         power::start_signal_monitor(sig_sys, sig_shutdown).await;
-    })
+    });
+
+    // Spawn kernel message stream reader
+    kmsg::start_kmsg_logger(shutdown_flag);
+
+    sig_handle
 }
 
 async fn configure_networking_and_services(

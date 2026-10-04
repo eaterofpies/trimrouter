@@ -171,3 +171,13 @@ These values ensure dirty log pages are flushed to flash within at most 35 secon
 > [!NOTE]
 > On an unclean power-off, up to 35 seconds of log output may be lost. This is an accepted trade-off for a router where SD card longevity outweighs log completeness.
 
+---
+
+## 8. Kernel Log Ingestion (`/dev/kmsg`)
+
+PID 1 continuously streams kernel log ring buffer records from `/dev/kmsg` into the unified router logging pipeline:
+1. **Source & Format**: Reads records from `/dev/kmsg` containing kernel syslog priority prefixes, timestamps, and message payloads.
+2. **Tagging & Severity**: Messages are mapped to standard severity levels (`ERROR`, `WARN`, `INFO`, `DEBUG`) and prefixed with the `[kernel]` service identifier.
+3. **Unified Sinks**: Ingested kernel messages are dispatched through the logger engine to `/var/log/system.log`, the in-memory ring buffer, and active Server-Sent Events subscribers on the web dashboard.
+
+
