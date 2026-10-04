@@ -84,10 +84,16 @@ fn find_module_file(name: &str) -> Option<PathBuf> {
     find_module_recursive(&modules_dir, &base_name)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadModuleResult {
+    Loaded,
+    NoDevice,
+}
+
 /// Flag to finit_module indicating that the file is compressed and the kernel should decompress it.
 const MODULE_INIT_COMPRESSED_FILE: u32 = 0x0004;
 
-fn load_module(path: &Path) -> Result<(), io::Error> {
+fn load_module(path: &Path) -> Result<LoadModuleResult, io::Error> {
     debug!("[init] Loading kernel module: {:?}", path);
     let file = fs::File::open(path)?;
     let param = CString::default();
@@ -98,15 +104,24 @@ fn load_module(path: &Path) -> Result<(), io::Error> {
         flags = nix::kmod::ModuleInitFlags::from_bits_retain(MODULE_INIT_COMPRESSED_FILE);
     }
 
-    if let Err(e) = nix::kmod::finit_module(&file, &param, flags)
-        && e != nix::errno::Errno::EEXIST
-    {
-        return Err(io::Error::other(e.to_string()));
+    if let Err(e) = nix::kmod::finit_module(&file, &param, flags) {
+        match e {
+            nix::errno::Errno::EEXIST => Ok(LoadModuleResult::Loaded),
+            nix::errno::Errno::ENODEV | nix::errno::Errno::ENXIO => {
+                debug!(
+                    "[init] Module {:?} probe returned {}: hardware not present",
+                    path, e
+                );
+                Ok(LoadModuleResult::NoDevice)
+            }
+            _ => Err(io::Error::other(e.to_string())),
+        }
+    } else {
+        Ok(LoadModuleResult::Loaded)
     }
-    Ok(())
 }
 
-fn load_single_module(mod_name: &str) -> Result<(), io::Error> {
+fn load_single_module(mod_name: &str) -> Result<LoadModuleResult, io::Error> {
     let path = match find_module_file(mod_name) {
         Some(p) => p,
         None => {
@@ -114,16 +129,20 @@ fn load_single_module(mod_name: &str) -> Result<(), io::Error> {
                 "[init] Module {} not found in /lib/modules, assuming built-in or not needed.",
                 mod_name
             );
-            return Ok(());
+            return Ok(LoadModuleResult::Loaded);
         }
     };
 
-    if let Err(e) = load_module(&path) {
-        error!("[init] Failed to load module {}: {}", mod_name, e);
-        Err(e)
-    } else {
-        info!("[init] Successfully loaded module {}", mod_name);
-        Ok(())
+    match load_module(&path) {
+        Ok(LoadModuleResult::Loaded) => {
+            info!("[init] Successfully loaded module {}", mod_name);
+            Ok(LoadModuleResult::Loaded)
+        }
+        Ok(LoadModuleResult::NoDevice) => Ok(LoadModuleResult::NoDevice),
+        Err(e) => {
+            error!("[init] Failed to load module {}: {}", mod_name, e);
+            Err(e)
+        }
     }
 }
 
@@ -228,12 +247,18 @@ fn load_resolved_module_paths(resolved: &[PathBuf]) -> bool {
         let loaded = get_loaded_modules().lock().unwrap();
         if !loaded.contains(&stem) {
             drop(loaded);
-            if let Err(e) = load_module(path) {
-                error!("[init] Failed to load module {} ({:?}): {}", stem, path, e);
-                all_loaded = false;
-            } else {
-                info!("[init] Successfully loaded module {}", stem);
-                get_loaded_modules().lock().unwrap().insert(stem.clone());
+            match load_module(path) {
+                Ok(LoadModuleResult::Loaded) => {
+                    info!("[init] Successfully loaded module {}", stem);
+                    get_loaded_modules().lock().unwrap().insert(stem.clone());
+                }
+                Ok(LoadModuleResult::NoDevice) => {
+                    // Hardware not present; skip without logging an error
+                }
+                Err(e) => {
+                    error!("[init] Failed to load module {} ({:?}): {}", stem, path, e);
+                    all_loaded = false;
+                }
             }
         }
     }
@@ -355,19 +380,24 @@ pub fn invalidate_module_caches() {
 pub fn activate_boot_modules() {
     let kdir = get_kernel_release();
     if kdir.is_empty() {
-        eprintln!("[init] Skipping boot module activation: unknown kernel release");
+        warn!("[init] Skipping boot module activation: unknown kernel release");
         return;
     }
     let boot_img = Path::new("/boot/modules.erofs");
     let lib_mods = Path::new("/lib/modules");
     if !boot_img.exists() {
-        eprintln!(
+        warn!(
             "[init] No module image {} found on boot partition",
             boot_img.display()
         );
         return;
     }
 
+    load_module_with_dependencies("crc32_generic");
+    load_module_with_dependencies("crc32-pclmul");
+    load_module_with_dependencies("crc32c_generic");
+    load_module_with_dependencies("crc32c-intel");
+    load_module_with_dependencies("libcrc32c");
     load_module_with_dependencies("erofs");
 
     if let Err(e) = nix::mount::mount(
@@ -377,11 +407,11 @@ pub fn activate_boot_modules() {
         MsFlags::MS_RDONLY,
         None::<&Path>,
     ) {
-        eprintln!("[init] WARNING: failed to mount EROFS module image: {}", e);
+        warn!("[init] Warning: failed to mount EROFS module image: {}", e);
         return;
     }
 
-    println!(
+    info!(
         "[init] Mounted {} over /lib/modules (full module set)",
         boot_img.display()
     );
@@ -390,8 +420,13 @@ pub fn activate_boot_modules() {
 }
 
 pub fn load_required_modules() {
-    // Only load essential filesystem and netfilter modules needed during early boot:
+    // Only load essential crypto, filesystem, and netfilter modules needed during early boot:
     let modules = [
+        "crc32_generic",
+        "crc32-pclmul",
+        "crc32c_generic",
+        "crc32c-intel",
+        "libcrc32c",
         "fat",
         "vfat",
         "erofs",
@@ -830,5 +865,29 @@ alias usb:v045Ep* usbnet\n\
             seq: 2,
         };
         handle_uevent(uevent_remove);
+    }
+
+    #[test]
+    fn test_activate_boot_modules_logs_warning_on_missing_image() {
+        crate::logging::init_early_logging();
+        activate_boot_modules();
+        let logs = crate::logging::get_recent_logs(20, None);
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("boot module activation") || l.contains("No module image")),
+            "Expected warning log message captured in ring buffer when modules image is missing"
+        );
+    }
+
+    #[test]
+    fn test_load_single_module_missing_file_assumes_builtin() {
+        let res = load_single_module("nonexistent_test_module_xyz");
+        assert_eq!(res.unwrap(), LoadModuleResult::Loaded);
+    }
+
+    #[test]
+    fn test_load_module_result_enum_variants() {
+        assert_eq!(LoadModuleResult::Loaded, LoadModuleResult::Loaded);
+        assert_ne!(LoadModuleResult::Loaded, LoadModuleResult::NoDevice);
     }
 }

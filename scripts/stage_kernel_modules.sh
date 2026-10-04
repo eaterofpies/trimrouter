@@ -14,7 +14,7 @@ CURDIR=$(pwd)
 TEST_BOOT="target/${ARCH}/test_boot"
 STAGED_MODULES="target/${ARCH}/staged_modules"
 STAMP_FILE="target/${ARCH}/.modules_staged"
-DIRECT_DEPS="virtio_net virtio_pci virtio_mmio virtio_blk virtio_scsi usb_storage uas xhci_pci xhci_pci_renesas xhci_hcd ehci_pci ehci_hcd uhci_hcd ohci_pci ohci_hcd sd_mod scsi_mod mmc_block sdhci sdhci_pci sdhci_acpi rtsx_pci_sdmmc rtsx_usb_sdmmc ahci libahci ata_piix ata_generic sata_nv sata_via sata_sis sata_sil sata_sil24 pata_acpi pata_amd nvme nvme_core erofs nft_masq nft_chain_nat nft_ct fat vfat nls_cp437 nls_ascii nls_utf8 nls_iso8859_1"
+DIRECT_DEPS="virtio_net virtio_pci virtio_mmio virtio_blk virtio_scsi usb_storage uas xhci_pci xhci_pci_renesas xhci_hcd ehci_pci ehci_hcd uhci_hcd ohci_pci ohci_hcd sd_mod scsi_mod mmc_block sdhci sdhci_pci sdhci_acpi rtsx_pci_sdmmc rtsx_usb_sdmmc ahci libahci ata_piix ata_generic sata_nv sata_via sata_sis sata_sil sata_sil24 pata_acpi pata_amd nvme nvme_core crc32_generic crc32-pclmul crc32c_generic crc32c-intel libcrc32c erofs nft_masq nft_chain_nat nft_ct fat vfat nls_cp437 nls_ascii nls_utf8 nls_iso8859_1"
 
 if [ ! -d "${TEST_BOOT}/lib/modules" ]; then
     echo "[build] ERROR: Kernel modules directory '${TEST_BOOT}/lib/modules' not found. Run './scripts/extract_kernel.sh $ARCH' or 'make'."

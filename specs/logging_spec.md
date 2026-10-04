@@ -4,7 +4,52 @@ This specification describes how `trimrouter` captures, formats, persists, and r
 
 ---
 
-## 1. Log File
+## 1. Logging Pipeline Architecture
+
+```mermaid
+flowchart TD
+    subgraph Producers ["Log Producers"]
+        P1["PID 1 Init Daemon (log::info!, log::warn!, log::error!)"]
+        P2["Unprivileged Worker Processes (dhcp-client, dhcp-server, dns-forwarder, sntp)"]
+        P3["Linux Kernel Ring Buffer (/dev/kmsg reader)"]
+    end
+
+    subgraph Piping ["Capture and Formatting"]
+        P2 -->|"Piped stdout / stderr"| Stream["Supervisor stream_to_logger()"]
+        Stream -->|"log_raw()"| Formatter["RouterLogger Formatter ([timestamp] [level] [service] message)"]
+        P1 -->|"log::Record"| Formatter
+        P3 -->|"log_raw_with_level()"| Formatter
+    end
+
+    subgraph Core ["Logging Engine (write_entry)"]
+        Formatter --> WriteEntry["write_entry()"]
+    end
+
+    subgraph Sinks ["Log Sinks and Distribution"]
+        WriteEntry --> Console["System Console (/dev/console / stdout)"]
+        WriteEntry --> RingBuf["In-Memory Ring Buffer (500 lines capacity)"]
+        WriteEntry --> Broadcaster["Tokio Broadcast Channel (128 message queue)"]
+        WriteEntry -->|"When /var/log mounted"| DiskLog["Persistent Storage (/var/log/system.log)"]
+    end
+
+    subgraph Observability ["Observability API and Web Dashboard"]
+        RingBuf -->|"Snapshot (up to 500 lines)"| ApiLogs["GET /api/logs"]
+        Broadcaster -->|"Real-time stream (SSE)"| ApiStream["GET /api/logs/stream"]
+        ApiLogs --> Dashboard["Web Dashboard (Port 80)"]
+        ApiStream --> Dashboard
+    end
+
+    subgraph Rotation ["Storage Lifecycle"]
+        DiskLog -->|"Size limit (100MB) OR Daily rollover"| Rotated["Rotated Files (system.YYYY-MM-DDTHHMMSSZ.log)"]
+        Rotated -->|"Low disk space (< max_size)"| Reclaim["Space Reclamation (Delete oldest rotated logs)"]
+    end
+
+    RingBuf -.->|"Early logs replayed on attach"| DiskLog
+```
+
+---
+
+## 2. Log File
 
 All log output is written to a **single unified log file** on the log partition:
 
@@ -16,7 +61,7 @@ The file is opened in **append mode** so that output accumulates across worker r
 
 ---
 
-## 2. Log Line Format
+## 3. Log Line Format
 
 Each line written to `system.log` is stamped, prioritized by log level, and tagged with the service name:
 
@@ -46,11 +91,11 @@ grep '\[ERROR\]' system.log
 
 ---
 
-## 3. Log Rotation
+## 4. Log Rotation
 
 PID 1 manages log rotation entirely in-process. No external tools or cron daemon are required.
 
-### 3.1 Rotation Triggers
+### 4.1 Rotation Triggers
 
 `system.log` is rotated when **either** of the following conditions is met:
 
@@ -61,13 +106,13 @@ PID 1 manages log rotation entirely in-process. No external tools or cron daemon
 
 PID 1 evaluates the size trigger on every write. The daily trigger is evaluated by comparing the current UTC date against the date recorded at the last rotation (or boot). Both triggers are checked independently; whichever fires first causes the rotation.
 
-### 3.2 Rotation Procedure
+### 4.2 Rotation Procedure
 
-1. **Check free space**: Query the log partition's available bytes (`statvfs`). If available space is less than `max_log_size`, run the **space reclamation** step (§3.3) before proceeding.
+1. **Check free space**: Query the log partition's available bytes (`statvfs`). If available space is less than `max_log_size`, run the **space reclamation** step (§4.3) before proceeding.
 2. **Rename active log**: Rename `system.log` → `system.<timestamp>.log`, where `<timestamp>` is the ISO 8601 UTC datetime at the moment of rotation (e.g. `system.2026-08-14T143000Z.log`). A timestamp suffix is used instead of a counter to allow multiple size-triggered rotations within the same calendar day.
 3. **Open new active log**: Create a fresh `system.log` in append mode and continue writing.
 
-### 3.3 Space Reclamation
+### 4.3 Space Reclamation
 
 Before creating a new rotated log file, if available space on the log partition is below `max_log_size`, PID 1 deletes rotated `system.<timestamp>.log` files in order from **oldest to newest** until sufficient space is freed or no more rotated files remain.
 
@@ -80,7 +125,7 @@ If reclamation cannot free enough space (all rotated files have already been del
 
 ---
 
-## 4. Configuration
+## 5. Configuration
 
 Logging configuration is specified in `trimrouter.toml` under the `[logging]` section:
 
@@ -94,17 +139,17 @@ If the `[logging]` section or any key is absent, defaults are used (`max_log_siz
 
 ---
 
-## 5. Early Boot Logging & Console Fallback
+## 6. Early Boot Logging & Console Fallback
 
 PID 1 initializes early logging (`init_early_logging`) at the start of early boot:
-1. **Early Boot**: Prior to mounting storage, log messages stream directly to the system console (`/dev/console`).
-2. **Log File Attachment**: As soon as the log partition is formatted/mounted to `/var/log`, `attach_log_file` opens `/var/log/system.log` in append mode. All subsequent init events, configuration parsing warnings, and fatal errors stream concurrently to both `/dev/console` and `/var/log/system.log`.
+1. **Early Boot**: Prior to mounting storage, log messages stream directly to the system console (`/dev/console`) and accumulate in the in-memory ring buffer.
+2. **Log File Attachment**: As soon as the log partition is formatted/mounted to `/var/log`, `open_log_file` opens `/var/log/system.log` in append mode and flushes all buffered early boot log lines into the persistent file. All subsequent init events, configuration parsing warnings, and fatal errors stream concurrently to both `/dev/console` and `/var/log/system.log`.
 3. **Panic Logging**: The custom panic hook formats the critical panic trace, writes it via the logging subsystem, and explicitly calls `flush` to sync the error to `/var/log/system.log` prior to system halt or reboot.
 4. **Console Fallback**: If the log partition fails to mount, logging continues seamlessly in console-only mode without crashing PID 1. Log rotation and reclamation are disabled in console-only mode.
 
 ---
 
-## 6. Write Buffering & SD Card Wear
+## 7. Write Buffering & SD Card Wear
 
 PID 1 does **not** implement application-level write buffering and does **not** call `fsync` on every log line. All write coalescing is delegated to the **Linux kernel page cache**, which batches multiple writes to the same page into a single flash write before flushing — more efficiently than any userspace buffer can achieve.
 
@@ -125,4 +170,14 @@ These values ensure dirty log pages are flushed to flash within at most 35 secon
 
 > [!NOTE]
 > On an unclean power-off, up to 35 seconds of log output may be lost. This is an accepted trade-off for a router where SD card longevity outweighs log completeness.
+
+---
+
+## 8. Kernel Log Ingestion (`/dev/kmsg`)
+
+PID 1 continuously streams kernel log ring buffer records from `/dev/kmsg` into the unified router logging pipeline:
+1. **Source & Format**: Reads records from `/dev/kmsg` containing kernel syslog priority prefixes, timestamps, and message payloads.
+2. **Tagging & Severity**: Messages are mapped to standard severity levels (`ERROR`, `WARN`, `INFO`, `DEBUG`) and prefixed with the `[kernel]` service identifier.
+3. **Unified Sinks**: Ingested kernel messages are dispatched through the logger engine to `/var/log/system.log`, the in-memory ring buffer, and active Server-Sent Events subscribers on the web dashboard.
+
 

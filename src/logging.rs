@@ -357,14 +357,18 @@ impl Logger {
             self.max_size_bytes = (total / 2).max(1024 * 1024);
         }
 
+        let was_unattached = self.log_file.is_none();
         match OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.active_log_path)
         {
-            Ok(file) => {
+            Ok(mut file) => {
                 let size = file.metadata().map(|m| m.len()).unwrap_or(0);
                 self.current_size = size;
+                if was_unattached {
+                    self.flush_ring_buffer_to_file(&mut file);
+                }
                 self.log_file = Some(file);
                 self.log_disabled = false;
             }
@@ -377,6 +381,24 @@ impl Logger {
                 self.log_file = None;
             }
         }
+    }
+
+    fn flush_ring_buffer_to_file(&mut self, file: &mut File) {
+        let Ok(buf) = get_ring_buffer().lock() else {
+            return;
+        };
+        for line in buf.iter() {
+            if let Err(e) = file.write_all(line.as_bytes()) {
+                std::eprintln!(
+                    "[logging] ERROR: Failed to flush early log to {}: {}",
+                    self.active_log_path.display(),
+                    e
+                );
+                return;
+            }
+            self.current_size = self.current_size.saturating_add(line.len() as u64);
+        }
+        let _ = file.flush();
     }
 
     fn check_free_space(&self) -> io::Result<u64> {
@@ -784,5 +806,34 @@ mod tests {
         let errors_only = get_recent_logs(50, Some(LevelFilter::Error));
         assert!(errors_only.iter().any(|l| l == err_line));
         assert!(!errors_only.iter().any(|l| l == info_line));
+    }
+
+    #[test]
+    fn test_early_ring_buffer_flushed_on_open_log_file() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("trimrouter_flush_test_{}", rand::random::<u64>()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let unique_early_msg = format!(
+            "[2026-10-04T12:00:00Z] [INFO] [init] Early boot event {}\n",
+            rand::random::<u64>()
+        );
+        push_to_ring_buffer_and_broadcast(&unique_early_msg);
+
+        let active_path = temp_dir.join("system.log");
+        let mut logger = Logger::new(&temp_dir, &active_path, 1, LevelFilter::Info);
+        assert!(logger.log_file.is_none());
+
+        logger.open_log_file();
+        assert!(logger.log_file.is_some());
+
+        let content = fs::read_to_string(&active_path).unwrap();
+        assert!(
+            content.contains(&unique_early_msg),
+            "system.log must contain early ring buffer messages replayed upon file attach"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
