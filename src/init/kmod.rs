@@ -355,13 +355,13 @@ pub fn invalidate_module_caches() {
 pub fn activate_boot_modules() {
     let kdir = get_kernel_release();
     if kdir.is_empty() {
-        eprintln!("[init] Skipping boot module activation: unknown kernel release");
+        warn!("[init] Skipping boot module activation: unknown kernel release");
         return;
     }
     let boot_img = Path::new("/boot/modules.erofs");
     let lib_mods = Path::new("/lib/modules");
     if !boot_img.exists() {
-        eprintln!(
+        warn!(
             "[init] No module image {} found on boot partition",
             boot_img.display()
         );
@@ -377,11 +377,11 @@ pub fn activate_boot_modules() {
         MsFlags::MS_RDONLY,
         None::<&Path>,
     ) {
-        eprintln!("[init] WARNING: failed to mount EROFS module image: {}", e);
+        warn!("[init] Warning: failed to mount EROFS module image: {}", e);
         return;
     }
 
-    println!(
+    info!(
         "[init] Mounted {} over /lib/modules (full module set)",
         boot_img.display()
     );
@@ -830,5 +830,17 @@ alias usb:v045Ep* usbnet\n\
             seq: 2,
         };
         handle_uevent(uevent_remove);
+    }
+
+    #[test]
+    fn test_activate_boot_modules_logs_warning_on_missing_image() {
+        crate::logging::init_early_logging();
+        activate_boot_modules();
+        let logs = crate::logging::get_recent_logs(20, None);
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("boot module activation") || l.contains("No module image")),
+            "Expected warning log message captured in ring buffer when modules image is missing"
+        );
     }
 }

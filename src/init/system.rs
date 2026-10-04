@@ -1,5 +1,5 @@
 use crate::error::RouterError;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use nix::mount::MsFlags;
 use nix::sys::reboot::RebootMode;
 use nix::sys::signal::Signal;
@@ -59,7 +59,7 @@ impl MountOps for RealSystem {
         data: Option<&str>,
     ) -> Result<(), nix::Error> {
         if self.getpid() != Pid::from_raw(1) {
-            println!(
+            debug!(
                 "[sys] Skipping mount of {} -> {} (not PID 1)",
                 fstype, target
             );
