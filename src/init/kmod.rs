@@ -393,6 +393,11 @@ pub fn activate_boot_modules() {
         return;
     }
 
+    load_module_with_dependencies("crc32_generic");
+    load_module_with_dependencies("crc32-pclmul");
+    load_module_with_dependencies("crc32c_generic");
+    load_module_with_dependencies("crc32c-intel");
+    load_module_with_dependencies("libcrc32c");
     load_module_with_dependencies("erofs");
 
     if let Err(e) = nix::mount::mount(
@@ -415,8 +420,13 @@ pub fn activate_boot_modules() {
 }
 
 pub fn load_required_modules() {
-    // Only load essential filesystem and netfilter modules needed during early boot:
+    // Only load essential crypto, filesystem, and netfilter modules needed during early boot:
     let modules = [
+        "crc32_generic",
+        "crc32-pclmul",
+        "crc32c_generic",
+        "crc32c-intel",
+        "libcrc32c",
         "fat",
         "vfat",
         "erofs",

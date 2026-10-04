@@ -190,7 +190,7 @@ Both partitions are mounted as part of the ordered PID 1 startup sequence, after
 ```
 1. mount_virtual_filesystems()          → /proc, /sys, /dev (devtmpfs), /run (tmpfs)
 2. trigger_uevents()                    → early hardware coldplug discovery
-3. load_required_modules()              → early filesystem & netfilter modules
+3. load_required_modules()              → early crypto, filesystem & netfilter modules
 4. wait_for_boot_partition()            → scans labels and returns when TRIMROUTER is found
 5. ensure_log_partition_in_mbr()        → updates MBR and re-reads partition table if needed
 6. mount_boot_partition()               → mounts /boot (vfat, read-only)
