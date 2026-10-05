@@ -5,6 +5,8 @@
     ":automergeAll"
   ],
   "platformAutomerge": true,
+  "semanticCommitType": "fix",
+  "semanticCommitScope": "deps",
   "postUpdateOptions": [
     "cargoUpdate"
   ],
