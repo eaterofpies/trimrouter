@@ -48,13 +48,13 @@ When the server receives a message from a client, it processes it according to t
 4.  Returns a `DHCPOFFER` to the client.
 
 ### 3.2 REQUEST Processing
-1.  **Request Type Validation**: Inspects the requested IP address and the Server Identifier (Option 54). If Option 54 is present and points to a different DHCP server, the request is ignored per RFC 2131 Section 4.3.2.
+1.  **Request Type Validation**: Inspects the requested IP address (from DHCP Option 50 `RequestedIpAddress`, or from the header `ciaddr` field if the client is in `RENEWING`/`REBINDING` state) and the Server Identifier (Option 54). If Option 54 is present and points to a different DHCP server, the request is ignored per RFC 2131 Section 4.3.2.
 2.  **Conflict Validation**:
     *   Verifies the requested IP is within the LAN subnet scope.
     *   Verifies the requested IP does not conflict with the server's own gateway IP address.
     *   Verifies the requested IP is not already leased to another client MAC.
     *   **Active Verification**: Triggers an active kernel-assisted ARP probe (sending a dummy UDP packet and sleeping for 100ms). If the background Netlink watcher resolves a different MAC address for this IP, a conflict is registered.
-3.  **Conflict Response**: If any validation check or active Netlink/ARP verification fails, the server responds with a `DHCPNAK` to force the client to restart the negotiation.
+3.  **Conflict Response**: If any validation check or active Netlink/ARP verification fails, the server broadcasts a `DHCPNAK` to the local subnet (`255.255.255.255`, L2 broadcast `ff:ff:ff:ff:ff:ff`) per RFC 2131 Section 4.3.1 to force the client to restart the negotiation.
 4.  **Successful Lease**: If valid, the server inserts/updates the lease in the `LeaseTable` (applying a default duration of 3600 seconds), and returns a `DHCPACK`.
 
 ---

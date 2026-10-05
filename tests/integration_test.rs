@@ -188,6 +188,8 @@ async fn main() {
                                 let _ = env.wan_cmd_tx.send("SEND_SPOOFED_INTERNAL_WAN".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE_CLIENT2") {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE_CLIENT2".to_string()).await;
+                            } else if line.contains("[test-control] TRIGGER_LAN_DHCP_RENEWAL") {
+                                let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_RENEWAL".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_LAN_DHCP_HANDSHAKE") {
                                 let _ = env.lan_cmd_tx.send("TRIGGER_LAN_DHCP_HANDSHAKE".to_string()).await;
                             } else if line.contains("[test-control] TRIGGER_FORWARDED_NAT_TEST") {
@@ -1573,6 +1575,28 @@ fn build_dhcp_request_lan(
     payload
 }
 
+fn build_dhcp_renewal_lan(xid: u32, client_mac: MacAddr, ciaddr: Ipv4Addr) -> Vec<u8> {
+    let mut req = Message::default();
+    req.set_opcode(Opcode::BootRequest);
+    req.set_xid(xid);
+    req.set_ciaddr(ciaddr);
+    req.set_chaddr(&[
+        client_mac.0,
+        client_mac.1,
+        client_mac.2,
+        client_mac.3,
+        client_mac.4,
+        client_mac.5,
+    ]);
+
+    let opts = req.opts_mut();
+    opts.insert(DhcpOption::MessageType(MessageType::Request));
+
+    let mut payload = Vec::new();
+    req.encode(&mut Encoder::new(&mut payload)).unwrap();
+    payload
+}
+
 async fn handle_lan_command(
     mock: &mut UnixStreamMock,
     cmd: &str,
@@ -1602,6 +1626,32 @@ async fn handle_lan_command(
             println!(
                 "[lan-client] Sent DHCPDISCOVER (xid: {}) for MAC {}",
                 xid, client_mac
+            );
+        }
+    } else if cmd == "TRIGGER_LAN_DHCP_RENEWAL" {
+        println!(
+            "[lan-client] Starting DHCP Renewal for MAC {}...",
+            client_mac
+        );
+        let xid = rand::random::<u32>();
+        let renewal_payload =
+            build_dhcp_renewal_lan(xid, client_mac, Ipv4Addr::new(192, 168, 1, 50));
+        let renewal_pkt = packet::build_raw_packet(
+            client_mac,
+            MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x57), // router's LAN MAC
+            Ipv4Addr::new(192, 168, 1, 50),
+            Ipv4Addr::new(192, 168, 1, 1),
+            68,
+            67,
+            &renewal_payload,
+        )
+        .expect("valid renewal pkt");
+        if let Err(e) = mock.send_frame(&renewal_pkt).await {
+            println!("[lan-client] ERROR sending DHCP renewal: {}", e);
+        } else {
+            println!(
+                "[lan-client] Sent DHCP renewal (ciaddr: 192.168.1.50) for MAC {}",
+                client_mac
             );
         }
     } else if cmd == "TRIGGER_FORWARDED_NAT_TEST" {

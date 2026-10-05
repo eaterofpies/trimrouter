@@ -2,8 +2,8 @@ use crate::packet::build_raw_packet;
 use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcEndpoint};
 use crate::services::utils::{
-    DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload, read_raw_packet,
-    run_sandboxed_worker, sanitize_hostname, send_raw_packet,
+    CleanOption, DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload,
+    read_raw_packet, run_sandboxed_worker, sanitize_hostname, send_raw_packet,
 };
 use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode, OptionCode};
 use dhcproto::{Encodable, Encoder};
@@ -373,12 +373,7 @@ async fn send_dhcp_frame(
     send_raw_packet(async_sock, &frame).await;
 }
 
-async fn send_dhcp_nak(
-    async_sock: &AsyncFd<OwnedFd>,
-    dhcp: &Message,
-    client_mac: MacAddr,
-    config: &ServerConfig,
-) {
+async fn send_dhcp_nak(async_sock: &AsyncFd<OwnedFd>, dhcp: &Message, config: &ServerConfig) {
     let mut nak = Message::default();
     nak.set_opcode(Opcode::BootReply);
     nak.set_xid(dhcp.xid());
@@ -394,9 +389,14 @@ async fn send_dhcp_nak(
         return;
     }
 
-    let (dest_mac, dest_ip) =
-        get_dest_mac_ip(dhcp.flags().broadcast(), client_mac, Ipv4Addr::BROADCAST);
-    send_dhcp_frame(async_sock, config, dest_mac, dest_ip, &payload).await;
+    send_dhcp_frame(
+        async_sock,
+        config,
+        MacAddr::broadcast(),
+        Ipv4Addr::BROADCAST,
+        &payload,
+    )
+    .await;
 }
 
 async fn trigger_arp_resolution(
@@ -586,6 +586,7 @@ async fn handle_dhcp_request(
 
     let requested_ip_opt = match dhcp.opts().get(OptionCode::RequestedIpAddress) {
         Some(DhcpOption::RequestedIpAddress(ip)) => Some(*ip),
+        _ if !dhcp.ciaddr().is_unspecified() => Some(dhcp.ciaddr()),
         _ => None,
     };
 
@@ -603,16 +604,17 @@ async fn handle_dhcp_request(
         .await
     else {
         warn!(
-            "[dhcp-server] WARNING: Client {} requested invalid or conflicting IP. Sending NAK.",
-            client_mac
+            "[dhcp-server] WARNING: Client {} requested invalid or conflicting IP {}. Sending NAK.",
+            client_mac,
+            CleanOption(&requested_ip_opt)
         );
-        send_dhcp_nak(&async_sock, dhcp, client_mac, config).await;
+        send_dhcp_nak(&async_sock, dhcp, config).await;
         return;
     };
 
     let leased_ip = confirmation.ip;
     if verify_arp_conflict(&async_sock, leased_ip, client_mac, config, &leases).await {
-        send_dhcp_nak(&async_sock, dhcp, client_mac, config).await;
+        send_dhcp_nak(&async_sock, dhcp, config).await;
         return;
     }
 
@@ -1473,5 +1475,42 @@ mod tests {
         assert_eq!(active_leases.len(), 1);
         assert_eq!(active_leases[0].mac, client_mac);
         assert_eq!(active_leases[0].ip, leased_ip);
+    }
+
+    #[tokio::test]
+    async fn test_dhcp_request_renewing_state_with_ciaddr() {
+        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let async_sock = Arc::new(AsyncFd::new(OwnedFd::from(s1)).unwrap());
+        let config = make_config("192.168.1.1/24");
+        let leases = spawn_lease_actor();
+
+        let client_mac = MacAddr::new(0xd8, 0xf2, 0xca, 0xa0, 0x46, 0x00);
+        let renewing_ip = Ipv4Addr::new(192, 168, 1, 105);
+
+        // Client sends DHCPREQUEST in RENEWING state: ciaddr is set, Option 50 is omitted
+        let (ipc_tx, _ipc_rx) = tokio::sync::mpsc::channel(8);
+        let mut request_msg = Message::default();
+        request_msg.set_opcode(Opcode::BootRequest);
+        request_msg.set_xid(54321);
+        request_msg.set_ciaddr(renewing_ip);
+        request_msg.set_chaddr(&[0xd8, 0xf2, 0xca, 0xa0, 0x46, 0x00]);
+        request_msg
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Request));
+
+        handle_dhcp_request(
+            async_sock,
+            &config,
+            &request_msg,
+            client_mac,
+            leases.clone(),
+            ipc_tx,
+        )
+        .await;
+
+        let active_leases = leases.get_active_leases().await;
+        assert_eq!(active_leases.len(), 1);
+        assert_eq!(active_leases[0].mac, client_mac);
+        assert_eq!(active_leases[0].ip, renewing_ip);
     }
 }
