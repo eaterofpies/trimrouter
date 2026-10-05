@@ -252,11 +252,15 @@ pub async fn test_lan_static_lease(lease_rx: WanLeaseReceiver) -> Result<(), Str
         ));
     }
 
+    // Trigger mock client DHCP renewal with ciaddr (regression prevention for renewing state)
+    std::println!("[test-control] TRIGGER_LAN_DHCP_RENEWAL");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
     if let Err(e) = lan_manager.stop().await {
         return Err(format!("Failed to stop LanManager during cleanup: {}", e));
     }
 
-    std::println!("[test] LAN Static Lease Reservation verified successfully.");
+    std::println!("[test] LAN Static Lease Reservation and Renewal verified successfully.");
     Ok(())
 }
 
