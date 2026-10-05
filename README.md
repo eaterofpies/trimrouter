@@ -74,11 +74,11 @@ max_log_size_mb = 100
 # Optional log level filter: "error", "warn", "info", "debug", "trace" (default: "info")
 level = "info"
 
-# [dhcp]
 # Optional static DHCP lease reservations by MAC address
-# reservations = [
-#     { mac = "52:54:00:12:34:58", ip = "192.168.1.50" },
-# ]
+# [[dhcp.reservations]]
+# mac = "52:54:00:12:34:58"
+# ip = "192.168.1.50"
+# hostname = "printer"                # Optional single-label hostname for local DNS (.lan)
 
 # Optional inbound port forwarding rules (DNAT)
 # [[port_forwarding]]

@@ -15,6 +15,7 @@ use crate::services::observability::{
     DhcpLeasesSender, ObservabilityReceivers, SntpStatus, SntpStatusSender, WatchdogActiveReceiver,
     WatchdogActiveSender,
 };
+use crate::services::utils::ROUTER_HOSTNAME;
 use crate::services::{self, CHROOT_JAIL_PATH, Service};
 use log::{error, info, warn};
 use nix::unistd::Pid;
@@ -258,9 +259,18 @@ async fn configure_networking_and_services(
 
     if let Ok(lan_net) = config.lan_ip.parse::<ipnet::Ipv4Net>() {
         let _ = local_hosts_tx.try_send(services::LocalHostEvent::Register {
-            name: services::utils::ROUTER_HOSTNAME.to_string(),
+            name: ROUTER_HOSTNAME.to_string(),
             ip: lan_net.addr(),
         });
+    }
+
+    for lease in &config.static_leases {
+        if let Some(ref name) = lease.hostname {
+            let _ = local_hosts_tx.try_send(services::LocalHostEvent::Register {
+                name: name.clone(),
+                ip: lease.ip,
+            });
+        }
     }
 
     let mut dns_forwarder = services::DnsForwarder::new(
@@ -365,7 +375,6 @@ fn build_managed_interfaces(
 mod tests {
     use super::*;
     use pnet::util::MacAddr;
-    use std::collections::HashMap;
 
     #[test]
     fn test_build_managed_interfaces_structure() {
@@ -382,7 +391,7 @@ mod tests {
             logging: Default::default(),
             watchdog: true,
             dns_servers: Vec::new(),
-            static_leases: HashMap::new(),
+            static_leases: Vec::new(),
             port_forwards: Vec::new(),
         };
 

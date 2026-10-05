@@ -3,9 +3,9 @@ use pnet::util::MacAddr;
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::address::AddressAttribute;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
+use trimrouter::config::StaticLease;
 use trimrouter::network;
 use trimrouter::services::observability::{ObservabilityReceivers, null_dhcp_leases_sender};
 use trimrouter::services::utils::{WanLease, WanLeaseReceiver, WanLeaseSender};
@@ -28,7 +28,7 @@ pub async fn test_lan_wan_conflict(
         None,
         None,
         null_dhcp_leases_sender(),
-        HashMap::new(),
+        Vec::new(),
         Vec::new(),
     );
 
@@ -156,7 +156,7 @@ pub async fn test_lan_dhcp_handshake(lease_rx: WanLeaseReceiver) -> Result<LanMa
         None,
         None,
         null_dhcp_leases_sender(),
-        HashMap::new(),
+        Vec::new(),
         Vec::new(),
     );
     if let Err(e) = lan_manager.start().await {
@@ -212,8 +212,11 @@ pub async fn test_lan_static_lease(lease_rx: WanLeaseReceiver) -> Result<(), Str
 
     let client_mac = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
     let static_ip = Ipv4Addr::new(192, 168, 1, 50);
-    let mut static_leases = HashMap::new();
-    static_leases.insert(client_mac, static_ip);
+    let static_leases = vec![StaticLease {
+        mac: client_mac,
+        ip: static_ip,
+        hostname: Some("printer".to_string()),
+    }];
 
     let mut lan_manager = LanManager::new(
         "lan".to_string(),

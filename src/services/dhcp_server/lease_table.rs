@@ -1,8 +1,8 @@
+use crate::config::StaticLease;
+use pnet::util::MacAddr;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
-
-use pnet::util::MacAddr;
 use tokio::sync::{mpsc, oneshot};
 
 const LEASE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
@@ -29,8 +29,8 @@ pub struct LeaseTable {
     allocated_ips: HashSet<Ipv4Addr>,
     /// Active temporary conflict holds on IPs.
     conflicts: HashMap<Ipv4Addr, Instant>,
-    /// Statically configured reservations (MAC -> reserved IP).
-    static_leases: HashMap<MacAddr, Ipv4Addr>,
+    /// Statically configured reservations (MAC -> StaticLease).
+    static_leases: HashMap<MacAddr, StaticLease>,
     /// O(1) index of statically reserved IPs.
     reserved_ips: HashSet<Ipv4Addr>,
 }
@@ -41,28 +41,37 @@ impl LeaseTable {
     }
 
     /// Creates a new `LeaseTable` pre-populated with static lease reservations.
-    pub fn with_static_leases(static_leases: HashMap<MacAddr, Ipv4Addr>) -> Self {
-        let reserved_ips = static_leases.values().copied().collect();
+    pub fn with_static_leases(static_leases: Vec<StaticLease>) -> Self {
+        let mut map = HashMap::new();
+        let mut reserved_ips = HashSet::new();
+        for lease in static_leases {
+            reserved_ips.insert(lease.ip);
+            map.insert(lease.mac, lease);
+        }
         Self {
             by_mac: HashMap::new(),
             allocated_ips: HashSet::new(),
             conflicts: HashMap::new(),
-            static_leases,
+            static_leases: map,
             reserved_ips,
         }
     }
 
     /// Updates the static lease reservations mapping.
-    pub fn set_static_leases(&mut self, static_leases: HashMap<MacAddr, Ipv4Addr>) {
-        for (&mac, &reserved_ip) in &static_leases {
-            if let Some(existing) = self.by_mac.get(&mac)
-                && existing.ip != reserved_ip
+    pub fn set_static_leases(&mut self, static_leases: Vec<StaticLease>) {
+        let mut map = HashMap::new();
+        let mut reserved_ips = HashSet::new();
+        for lease in static_leases {
+            if let Some(existing) = self.by_mac.get(&lease.mac)
+                && existing.ip != lease.ip
             {
-                self.remove(&mac);
+                self.remove(&lease.mac);
             }
+            reserved_ips.insert(lease.ip);
+            map.insert(lease.mac, lease);
         }
-        self.reserved_ips = static_leases.values().copied().collect();
-        self.static_leases = static_leases;
+        self.reserved_ips = reserved_ips;
+        self.static_leases = map;
     }
 
     /// Returns the active lease for this MAC address, if one exists.
@@ -171,7 +180,8 @@ impl LeaseTable {
         net: ipnet::Ipv4Net,
         server_ip: Ipv4Addr,
     ) -> Option<Ipv4Addr> {
-        if let Some(&reserved_ip) = self.static_leases.get(&client_mac) {
+        if let Some(static_lease) = self.static_leases.get(&client_mac) {
+            let reserved_ip = static_lease.ip;
             if net.contains(&reserved_ip)
                 && reserved_ip != server_ip
                 && !self.is_ip_taken_by_other(reserved_ip, client_mac)
@@ -181,7 +191,7 @@ impl LeaseTable {
                     ClientLease {
                         ip: reserved_ip,
                         expiry: Instant::now() + CANDIDATE_HOLD_DURATION,
-                        hostname: None,
+                        hostname: static_lease.hostname.clone(),
                     },
                 );
                 return Some(reserved_ip);
@@ -223,8 +233,9 @@ impl LeaseTable {
         }
 
         // Static reservation validation
-        if let Some(&reserved_ip) = self.static_leases.get(&client_mac) {
-            if target_ip != reserved_ip {
+        let static_lease_opt = self.static_leases.get(&client_mac);
+        if let Some(static_lease) = static_lease_opt {
+            if target_ip != static_lease.ip {
                 return None;
             }
         } else if self.reserved_ips.contains(&target_ip) {
@@ -232,8 +243,12 @@ impl LeaseTable {
         }
 
         let old_hostname = self.get(&client_mac).and_then(|l| l.hostname.clone());
+        let target_hostname = static_lease_opt
+            .and_then(|s| s.hostname.clone())
+            .or(requested_hostname);
+
         let effective_hostname =
-            requested_hostname.filter(|base| !self.is_hostname_taken_by_other(base, client_mac));
+            target_hostname.filter(|base| !self.is_hostname_taken_by_other(base, client_mac));
 
         let old_hostname_to_deregister = match (&old_hostname, &effective_hostname) {
             (Some(old), Some(new)) if old != new => Some(old.clone()),
@@ -261,20 +276,24 @@ impl LeaseTable {
         if mac == MacAddr::zero() || mac == MacAddr::broadcast() {
             return;
         }
-        if let Some(&reserved_ip) = self.static_leases.get(&mac)
-            && ip != reserved_ip
+        if let Some(static_lease) = self.static_leases.get(&mac)
+            && ip != static_lease.ip
         {
             return;
         }
         if self.get(&mac).is_some_and(|existing| existing.ip == ip) {
             return;
         }
+        let static_hostname = self
+            .static_leases
+            .get(&mac)
+            .and_then(|s| s.hostname.clone());
         self.insert(
             mac,
             ClientLease {
                 ip,
                 expiry: Instant::now() + NEIGHBOR_HOLD_DURATION,
-                hostname: None,
+                hostname: static_hostname,
             },
         );
     }
@@ -283,8 +302,10 @@ impl LeaseTable {
     pub fn get_active_leases(&self) -> Vec<crate::services::ipc::DhcpLeaseInfo> {
         let now = Instant::now();
         let mut result = Vec::new();
+        let mut active_macs = HashSet::new();
         for (&mac, lease) in &self.by_mac {
             if lease.expiry > now {
+                active_macs.insert(mac);
                 let remaining_secs = (lease.expiry - now).as_secs();
                 let is_static = self.static_leases.contains_key(&mac);
                 result.push(crate::services::ipc::DhcpLeaseInfo {
@@ -293,6 +314,17 @@ impl LeaseTable {
                     hostname: lease.hostname.clone(),
                     expires_in_seconds: remaining_secs,
                     is_static,
+                });
+            }
+        }
+        for (&mac, static_lease) in &self.static_leases {
+            if !active_macs.contains(&mac) {
+                result.push(crate::services::ipc::DhcpLeaseInfo {
+                    mac,
+                    ip: static_lease.ip,
+                    hostname: static_lease.hostname.clone(),
+                    expires_in_seconds: 0,
+                    is_static: true,
                 });
             }
         }
@@ -366,7 +398,7 @@ pub enum LeaseCommand {
         ip: Ipv4Addr,
     },
     SetStaticLeases {
-        static_leases: HashMap<MacAddr, Ipv4Addr>,
+        static_leases: Vec<StaticLease>,
         reply_tx: oneshot::Sender<()>,
     },
     GetActiveLeases {
@@ -522,7 +554,7 @@ impl LeaseHandle {
             .await;
     }
 
-    pub async fn set_static_leases(&self, static_leases: HashMap<MacAddr, Ipv4Addr>) {
+    pub async fn set_static_leases(&self, static_leases: Vec<StaticLease>) {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .sender
@@ -573,8 +605,8 @@ fn handle_lease_command(cmd: LeaseCommand, leases: &mut LeaseTable) {
             client_mac,
             reply_tx,
         } => {
-            let ip = if let Some(&reserved_ip) = leases.static_leases.get(&client_mac) {
-                Some(reserved_ip)
+            let ip = if let Some(static_lease) = leases.static_leases.get(&client_mac) {
+                Some(static_lease.ip)
             } else {
                 leases.get(&client_mac).map(|l| l.ip)
             };
@@ -806,8 +838,11 @@ mod tests {
         let reserved_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
         let reserved_ip = Ipv4Addr::new(192, 168, 1, 2);
 
-        let mut static_leases = HashMap::new();
-        static_leases.insert(reserved_mac, reserved_ip);
+        let static_leases = vec![StaticLease {
+            mac: reserved_mac,
+            ip: reserved_ip,
+            hostname: Some("printer".to_string()),
+        }];
 
         let mut table = LeaseTable::with_static_leases(static_leases);
 
@@ -846,16 +881,27 @@ mod tests {
         );
         assert_eq!(wrong_ip_confirm, None);
 
-        // 5. Reserved client confirming its reserved IP succeeds
+        // 5. Reserved client confirming its reserved IP succeeds with configured hostname
         let valid_confirm = table.validate_and_confirm(
             reserved_mac,
             Some(reserved_ip),
             server_ip,
             net,
             Duration::from_secs(3600),
-            None,
+            Some("client-custom".to_string()),
         );
         assert!(valid_confirm.is_some());
-        assert_eq!(valid_confirm.unwrap().ip, reserved_ip);
+        let conf = valid_confirm.unwrap();
+        assert_eq!(conf.ip, reserved_ip);
+        assert_eq!(conf.hostname, Some("printer".to_string()));
+
+        // Active leases list reflects static reservation
+        let active = table.get_active_leases();
+        let static_entry = active.iter().find(|e| e.mac == reserved_mac);
+        assert!(static_entry.is_some());
+        let entry = static_entry.unwrap();
+        assert_eq!(entry.ip, reserved_ip);
+        assert_eq!(entry.hostname.as_deref(), Some("printer"));
+        assert!(entry.is_static);
     }
 }

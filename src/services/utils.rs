@@ -56,6 +56,20 @@ pub fn is_valid_upstream_resolver(ip: Ipv4Addr) -> bool {
         && !ip.is_documentation()
 }
 
+pub fn sanitize_hostname(raw: &str) -> Option<String> {
+    let label = raw.split('.').next()?.trim();
+    if label.is_empty() || label.len() > 63 {
+        return None;
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return None;
+    }
+    if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    Some(label.to_ascii_lowercase())
+}
+
 // =========================================================================
 // Shared WAN Lease Info
 // =========================================================================

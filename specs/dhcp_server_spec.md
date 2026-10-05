@@ -115,9 +115,9 @@ The `LanManager` service manages the LAN interface configuration and encapsulate
 
 ---
 
-## 7. Static DHCP Lease Reservations (MAC-to-IP Mappings)
+## 7. Static DHCP Lease Reservations (MAC-to-IP & Hostname Mappings)
 
-Static DHCP lease reservations allow network administrators to pin specific IPv4 addresses to client MAC addresses via `trimrouter.toml`:
+Static DHCP lease reservations allow network administrators to pin specific IPv4 addresses and optional authoritative hostnames to client MAC addresses via `trimrouter.toml`:
 
 ### 7.1 Configuration Format
 Static reservations are configured in the `[dhcp]` section:
@@ -126,6 +126,7 @@ Static reservations are configured in the `[dhcp]` section:
 [[dhcp.reservations]]
 mac = "52:54:00:12:34:58"
 ip = "192.168.1.50"
+hostname = "printer"            # Optional — authoritative single-label hostname for DNS (.lan)
 
 [[dhcp.reservations]]
 mac = "52:54:00:12:34:59"
@@ -135,13 +136,21 @@ ip = "192.168.1.60"
 ### 7.2 Validation & Fallback Subnet Translation Rules
 1. **Unicast MAC**: The MAC address must be a valid, non-zero, non-multicast unicast MAC address.
 2. **Subnet Scope**: The reserved IP must be a valid IPv4 host address within the configured primary LAN subnet and fallback subnet (via host-offset translation), and must not match the router's gateway IP, network address, or broadcast address on either subnet.
-3. **No Duplicates**: Each reservation must specify a unique MAC address and a unique IP address.
-4. **Subnet Migration**: When migrating to the fallback subnet upon WAN conflict detection, the DHCP server dynamically translates reservation IPs to the fallback subnet by preserving the host offset from the network base address.
+3. **No Duplicates**: Each reservation must specify a unique MAC address, a unique IP address, and a unique hostname (if specified).
+4. **Hostname Validation**: If a `hostname` is specified:
+   - Must conform to single-label RFC 1123 standards (1–63 ASCII alphanumeric characters `a-z`, `0-9`, and hyphens `-`, no leading or trailing hyphens).
+   - Automatically normalized to lowercase during configuration parsing.
+   - Must not equal `"router"` (which is reserved for the router's gateway IP).
+5. **Subnet Migration**: When migrating to the fallback subnet upon WAN conflict detection:
+   - The DHCP server dynamically translates reservation IPs to the fallback subnet by preserving the host offset from the network base address.
+   - If a static reservation includes a `hostname`, `LanManager` re-registers the hostname in the DNS forwarder with its translated fallback IP.
 
-### 7.3 Allocation & Dynamic Pool Isolation
-1. **Reserved Client Allocation**: When a client whose MAC matches a reservation sends `DHCPDISCOVER`, the server immediately offers its assigned static IP address.
-2. **Dynamic Pool Isolation**: When dynamic clients without reservations request IP addresses, the allocation algorithm (`is_ip_available_for_dynamic`) skips all statically reserved IP addresses.
-3. **Request Enforcement**: If a non-reserved client attempts to request a statically reserved IP, or if a reserved client attempts to request an IP other than its assigned reservation, the server rejects the request with `DHCPNAK`.
+### 7.3 Allocation, DNS Pre-Registration & Observability
+1. **Immediate DNS Pre-Registration**: On system startup, all static reservations configured with a `hostname` are immediately pre-registered into the local `.lan` DNS lookup table (`LocalHostEvent::Register`), allowing other LAN clients to resolve the hostname without waiting for the reserved client to perform a DHCP handshake.
+2. **Reserved Client Allocation**: When a client whose MAC matches a reservation sends `DHCPDISCOVER`, the server immediately offers its assigned static IP address and associates its configured static hostname.
+3. **Dynamic Pool Isolation**: When dynamic clients without reservations request IP addresses, the allocation algorithm skips all statically reserved IP addresses.
+4. **Request Enforcement**: If a non-reserved client attempts to request a statically reserved IP, or if a reserved client attempts to request an IP other than its assigned reservation, the server rejects the request with `DHCPNAK`.
+5. **Observability**: Static lease reservations and their configured hostnames appear in the active lease table and `/api/status` observability telemetry with `is_static = true`.
 
 ### 7.4 Startup Synchronization (Race-Free Initialization)
 Upon worker process launch, the DHCP server supervisor immediately transmits the configured static reservations over IPC (`SetStaticLeases`). The sandboxed worker process explicitly awaits and applies this initial synchronization message before binding or polling the raw packet socket for incoming client requests. This guarantees that static reservations and dynamic pool isolation are active before any `DHCPDISCOVER` packet is processed.
