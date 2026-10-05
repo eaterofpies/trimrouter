@@ -1,8 +1,9 @@
 use crate::error::RouterError;
 use crate::init::system::ConfigReaderOps;
+use crate::services::utils::{ROUTER_HOSTNAME, sanitize_hostname};
 use pnet::util::MacAddr;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
@@ -64,6 +65,13 @@ impl Default for LoggingConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticLease {
+    pub mac: MacAddr,
+    pub ip: Ipv4Addr,
+    pub hostname: Option<String>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct RouterConfig {
     pub lan_ip: String,
@@ -73,7 +81,7 @@ pub struct RouterConfig {
     pub logging: LoggingConfig,
     pub watchdog: bool,
     pub dns_servers: Vec<Ipv4Addr>,
-    pub static_leases: HashMap<MacAddr, Ipv4Addr>,
+    pub static_leases: Vec<StaticLease>,
     pub port_forwards: Vec<PortForwardRule>,
 }
 
@@ -142,6 +150,7 @@ struct DhcpSection {
 struct DhcpReservationToml {
     mac: String,
     ip: Option<String>,
+    hostname: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -388,9 +397,11 @@ fn parse_dhcp_reservations(
     dhcp: Option<&DhcpSection>,
     lan_net: &ipnet::Ipv4Net,
     backup_net: &ipnet::Ipv4Net,
-) -> Result<HashMap<MacAddr, Ipv4Addr>, RouterError> {
-    let mut static_leases = HashMap::new();
+) -> Result<Vec<StaticLease>, RouterError> {
+    let mut static_leases = Vec::new();
+    let mut seen_macs = HashSet::new();
     let mut seen_ips = HashSet::new();
+    let mut seen_hostnames = HashSet::new();
 
     let Some(dhcp_sec) = dhcp else {
         return Ok(static_leases);
@@ -427,7 +438,31 @@ fn parse_dhcp_reservations(
         })?;
         validate_target_ip(ip, lan_net, backup_net, "DHCP reservation")?;
 
-        if static_leases.insert(mac, ip).is_some() {
+        let hostname = if let Some(ref raw_host) = res.hostname {
+            let sanitized = sanitize_hostname(raw_host).ok_or_else(|| {
+                RouterError::Generic(format!(
+                    "DHCP reservation MAC '{}' hostname '{}' is not a valid RFC 1123 hostname",
+                    res.mac, raw_host
+                ))
+            })?;
+            if sanitized == ROUTER_HOSTNAME {
+                return Err(RouterError::Generic(format!(
+                    "DHCP reservation MAC '{}' hostname '{}' is reserved for the router",
+                    res.mac, sanitized
+                )));
+            }
+            if !seen_hostnames.insert(sanitized.clone()) {
+                return Err(RouterError::Generic(format!(
+                    "Duplicate hostname '{}' in DHCP reservations",
+                    sanitized
+                )));
+            }
+            Some(sanitized)
+        } else {
+            None
+        };
+
+        if !seen_macs.insert(mac) {
             return Err(RouterError::Generic(format!(
                 "Duplicate MAC address '{}' in DHCP reservations",
                 mac
@@ -440,6 +475,8 @@ fn parse_dhcp_reservations(
                 ip
             )));
         }
+
+        static_leases.push(StaticLease { mac, ip, hostname });
     }
 
     Ok(static_leases)
@@ -1044,6 +1081,7 @@ mod tests {
             [[dhcp.reservations]]
             mac = "52:54:00:12:34:58"
             ip = "192.168.1.50"
+            hostname = "Printer-Main"
 
             [[dhcp.reservations]]
             mac = "52:54:00:12:34:59"
@@ -1053,14 +1091,90 @@ mod tests {
         let cfg = RouterConfig::parse(&sys).unwrap();
         assert_eq!(cfg.static_leases.len(), 2);
         assert_eq!(
-            cfg.static_leases
-                .get(&MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x58)),
-            Some(&Ipv4Addr::new(192, 168, 1, 50))
+            cfg.static_leases[0],
+            StaticLease {
+                mac: MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x58),
+                ip: Ipv4Addr::new(192, 168, 1, 50),
+                hostname: Some("printer-main".to_string()),
+            }
         );
         assert_eq!(
-            cfg.static_leases
-                .get(&MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x59)),
-            Some(&Ipv4Addr::new(192, 168, 1, 60))
+            cfg.static_leases[1],
+            StaticLease {
+                mac: MacAddr(0x52, 0x54, 0x00, 0x12, 0x34, 0x59),
+                ip: Ipv4Addr::new(192, 168, 1, 60),
+                hostname: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_dhcp_reservations_rejects_duplicate_hostname() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.50"
+            hostname = "printer"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:59"
+            ip = "192.168.1.60"
+            hostname = "Printer"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Duplicate hostname"));
+    }
+
+    #[test]
+    fn test_config_parsing_dhcp_reservations_rejects_router_hostname() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.50"
+            hostname = "router"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("reserved for the router")
+        );
+    }
+
+    #[test]
+    fn test_config_parsing_dhcp_reservations_rejects_invalid_hostname() {
+        let mut sys = MockSystem::new();
+        sys.config_content = r#"
+            [network]
+            wan_mac = "52:54:00:12:34:56"
+            lan_mac = "52:54:00:12:34:57"
+
+            [[dhcp.reservations]]
+            mac = "52:54:00:12:34:58"
+            ip = "192.168.1.50"
+            hostname = "-invalid-dash"
+        "#
+        .to_string();
+        let res = RouterConfig::parse(&sys);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("not a valid RFC 1123 hostname")
         );
     }
 
@@ -1347,9 +1461,14 @@ mod tests {
         "#
         .to_string();
         let cfg = RouterConfig::parse(&sys).unwrap();
+        assert_eq!(cfg.static_leases.len(), 1);
         assert_eq!(
-            cfg.static_leases.get(&client_mac),
-            Some(&Ipv4Addr::new(192, 168, 1, 50))
+            cfg.static_leases[0],
+            StaticLease {
+                mac: client_mac,
+                ip: Ipv4Addr::new(192, 168, 1, 50),
+                hostname: None,
+            }
         );
         assert_eq!(cfg.port_forwards.len(), 1);
         assert_eq!(

@@ -164,11 +164,11 @@ level = "info"                       # Optional — log filter level (default: "
 [system]
 watchdog = true                      # Optional — enable /dev/watchdog hardware supervisor (default: true)
 
-[dhcp]
 # Optional static DHCP lease reservations by MAC address
-# reservations = [
-#     { mac = "52:54:00:12:34:58", ip = "192.168.1.50" },
-# ]
+# [[dhcp.reservations]]
+# mac = "52:54:00:12:34:58"
+# ip = "192.168.1.50"
+# hostname = "printer"                # Optional — authoritative single-label hostname for DNS (.lan)
 
 [[port_forwarding]]
 proto = "tcp"                   # Optional — "tcp", "udp", or "both" (default: "tcp")

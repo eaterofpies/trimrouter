@@ -117,7 +117,8 @@ To allow LAN devices to discover and address each other using human-readable nam
 
 ### 4.1 Local Domain & Host Registration
 *   **Designated Local Domain**: `.lan` (e.g., `printer.lan`, `router.lan`).
-*   **Dynamic IPC Registration**: Receives dynamic host registrations (`AddLocalHost { name, ip }` and `RemoveLocalHost { name }`) from the parent supervisor as LAN DHCP leases are allocated or released.
+*   **Static Pre-Registration**: Pre-registers static DHCP lease reservations with configured `hostname` fields into the lookup table on startup and updates their IP mappings if `LanManager` shifts to a fallback subnet.
+*   **Dynamic IPC Registration**: Receives dynamic host registrations (`LocalHostEvent::Register { name, ip }` and `LocalHostEvent::Deregister { name }`) from the parent supervisor as dynamic LAN DHCP leases are allocated or released.
 *   **Router Gateway Hostname**: Automatically registers the router's own LAN gateway IP under `router` and `router.lan`.
 
 ### 4.2 Query Interception & Authoritative Response

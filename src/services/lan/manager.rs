@@ -1,4 +1,4 @@
-use crate::config::PortForwardRule;
+use crate::config::{PortForwardRule, StaticLease};
 use crate::init::firewall;
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::network;
@@ -10,11 +10,9 @@ use crate::services::{DhcpServer, ObservabilityService, Service, ServiceError};
 use futures_util::StreamExt;
 use ipnet::Ipv4Net;
 use log::{debug, error, info, warn};
-use pnet::util::MacAddr;
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use tokio::sync::watch::Receiver;
@@ -32,7 +30,7 @@ pub struct LanManager {
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
     dhcp_leases_tx: DhcpLeasesSender,
-    static_leases: HashMap<MacAddr, Ipv4Addr>,
+    static_leases: Vec<StaticLease>,
     port_forwards: Vec<PortForwardRule>,
 }
 
@@ -47,7 +45,7 @@ impl LanManager {
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_tx: Option<LocalHostSender>,
         dhcp_leases_tx: DhcpLeasesSender,
-        static_leases: HashMap<MacAddr, Ipv4Addr>,
+        static_leases: Vec<StaticLease>,
         port_forwards: Vec<PortForwardRule>,
     ) -> Self {
         Self {
@@ -101,7 +99,7 @@ struct LanRunner {
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
     dhcp_leases_tx: DhcpLeasesSender,
-    static_leases: HashMap<MacAddr, Ipv4Addr>,
+    static_leases: Vec<StaticLease>,
     port_forwards: Vec<PortForwardRule>,
     dhcp_server: DhcpServer,
     observability_service: ObservabilityService,
@@ -118,7 +116,7 @@ impl LanRunner {
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_tx: Option<LocalHostSender>,
         dhcp_leases_tx: DhcpLeasesSender,
-        static_leases: HashMap<MacAddr, Ipv4Addr>,
+        static_leases: Vec<StaticLease>,
         port_forwards: Vec<PortForwardRule>,
     ) -> Self {
         let dhcp_server = DhcpServer::new(
@@ -234,6 +232,7 @@ impl LanRunner {
         self.notify_router_dns_host(&new_ip);
 
         let (remapped_leases, remapped_forwards) = self.compute_remapped_rules(&new_ip);
+        self.notify_static_lease_dns_hosts(&remapped_leases);
         self.update_firewall_for_subnet(&remapped_forwards);
         self.restart_dhcp_server_on_subnet(remapped_leases).await;
         self.restart_observability_on_subnet().await;
@@ -277,10 +276,20 @@ impl LanRunner {
         }
     }
 
-    fn compute_remapped_rules(
-        &self,
-        new_ip: &str,
-    ) -> (HashMap<MacAddr, Ipv4Addr>, Vec<PortForwardRule>) {
+    fn notify_static_lease_dns_hosts(&self, remapped_leases: &[StaticLease]) {
+        if let Some(ref tx) = self.local_hosts_tx {
+            for lease in remapped_leases {
+                if let Some(ref name) = lease.hostname {
+                    let _ = tx.try_send(crate::services::LocalHostEvent::Register {
+                        name: name.clone(),
+                        ip: lease.ip,
+                    });
+                }
+            }
+        }
+    }
+
+    fn compute_remapped_rules(&self, new_ip: &str) -> (Vec<StaticLease>, Vec<PortForwardRule>) {
         let Ok(primary_net) = self.initial_ip.parse::<Ipv4Net>() else {
             error!("[lan-manager] Invalid initial IP: {}", self.initial_ip);
             return (self.static_leases.clone(), self.port_forwards.clone());
@@ -310,7 +319,7 @@ impl LanRunner {
         }
     }
 
-    async fn restart_dhcp_server_on_subnet(&mut self, remapped_leases: HashMap<MacAddr, Ipv4Addr>) {
+    async fn restart_dhcp_server_on_subnet(&mut self, remapped_leases: Vec<StaticLease>) {
         info!("[lan-manager] Restarting LAN DHCP server on new subnet...");
         self.dhcp_server = DhcpServer::new(
             self.lan_interface.clone(),
@@ -456,21 +465,25 @@ pub fn translate_ip_to_subnet(
 }
 
 pub fn remap_static_leases_for_subnet(
-    static_leases: &HashMap<MacAddr, Ipv4Addr>,
+    static_leases: &[StaticLease],
     primary_net: &Ipv4Net,
     target_net: &Ipv4Net,
-) -> HashMap<MacAddr, Ipv4Addr> {
+) -> Vec<StaticLease> {
     if primary_net == target_net {
-        return static_leases.clone();
+        return static_leases.to_vec();
     }
-    let mut remapped = HashMap::new();
-    for (&mac, &ip) in static_leases {
-        if let Some(mapped_ip) = translate_ip_to_subnet(ip, primary_net, target_net) {
-            remapped.insert(mac, mapped_ip);
+    let mut remapped = Vec::new();
+    for lease in static_leases {
+        if let Some(mapped_ip) = translate_ip_to_subnet(lease.ip, primary_net, target_net) {
+            remapped.push(StaticLease {
+                mac: lease.mac,
+                ip: mapped_ip,
+                hostname: lease.hostname.clone(),
+            });
         } else {
             warn!(
                 "[lan-manager] Static lease for MAC {} ({}) cannot be mapped to fallback subnet {}. Falling back to dynamic allocation.",
-                mac, ip, target_net
+                lease.mac, lease.ip, target_net
             );
         }
     }
@@ -506,6 +519,7 @@ mod tests {
     use super::*;
     use crate::config::ForwardProtocol;
     use crate::services::utils::{WanLease, WanLeaseReceiver};
+    use pnet::util::MacAddr;
     use rtnetlink::packet_core::NetlinkPayload;
     use rtnetlink::packet_route::RouteNetlinkMessage;
     use rtnetlink::packet_route::address::AddressMessage;
@@ -527,7 +541,7 @@ mod tests {
             None,
             None,
             crate::services::observability::null_dhcp_leases_sender(),
-            HashMap::new(),
+            Vec::new(),
             Vec::new(),
         )
     }
@@ -701,7 +715,7 @@ mod tests {
             Some(hb_tx),
             Some(lh_tx),
             crate::services::observability::null_dhcp_leases_sender(),
-            HashMap::new(),
+            Vec::new(),
             Vec::new(),
         );
     }
@@ -768,21 +782,29 @@ mod tests {
 
         let mac1 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
         let mac2 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x66);
-        let mut static_leases = HashMap::new();
-        static_leases.insert(mac1, Ipv4Addr::new(192, 168, 1, 50));
-        static_leases.insert(mac2, Ipv4Addr::new(192, 168, 1, 60));
+        let static_leases = vec![
+            StaticLease {
+                mac: mac1,
+                ip: Ipv4Addr::new(192, 168, 1, 50),
+                hostname: Some("printer".to_string()),
+            },
+            StaticLease {
+                mac: mac2,
+                ip: Ipv4Addr::new(192, 168, 1, 60),
+                hostname: None,
+            },
+        ];
 
         let remapped_leases =
             remap_static_leases_for_subnet(&static_leases, &primary_net, &backup_net);
         assert_eq!(remapped_leases.len(), 2);
-        assert_eq!(
-            remapped_leases.get(&mac1),
-            Some(&Ipv4Addr::new(10, 0, 0, 50))
-        );
-        assert_eq!(
-            remapped_leases.get(&mac2),
-            Some(&Ipv4Addr::new(10, 0, 0, 60))
-        );
+        assert_eq!(remapped_leases[0].mac, mac1);
+        assert_eq!(remapped_leases[0].ip, Ipv4Addr::new(10, 0, 0, 50));
+        assert_eq!(remapped_leases[0].hostname.as_deref(), Some("printer"));
+
+        assert_eq!(remapped_leases[1].mac, mac2);
+        assert_eq!(remapped_leases[1].ip, Ipv4Addr::new(10, 0, 0, 60));
+        assert_eq!(remapped_leases[1].hostname, None);
 
         let port_forwards = vec![PortForwardRule {
             protocol: ForwardProtocol::Tcp,
@@ -807,16 +829,18 @@ mod tests {
     fn test_remap_static_leases_and_port_forwards_identical_subnets() {
         let primary_net: Ipv4Net = "192.168.1.1/24".parse().unwrap();
         let mac1 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
-        let mut static_leases = HashMap::new();
-        static_leases.insert(mac1, Ipv4Addr::new(192, 168, 1, 50));
+        let static_leases = vec![StaticLease {
+            mac: mac1,
+            ip: Ipv4Addr::new(192, 168, 1, 50),
+            hostname: Some("printer".to_string()),
+        }];
 
         let remapped_leases =
             remap_static_leases_for_subnet(&static_leases, &primary_net, &primary_net);
         assert_eq!(remapped_leases.len(), 1);
-        assert_eq!(
-            remapped_leases.get(&mac1),
-            Some(&Ipv4Addr::new(192, 168, 1, 50))
-        );
+        assert_eq!(remapped_leases[0].mac, mac1);
+        assert_eq!(remapped_leases[0].ip, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(remapped_leases[0].hostname.as_deref(), Some("printer"));
 
         let port_forwards = vec![PortForwardRule {
             protocol: ForwardProtocol::Tcp,
@@ -841,18 +865,25 @@ mod tests {
 
         let mac1 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x55);
         let mac2 = MacAddr::new(0x02, 0x11, 0x22, 0x33, 0x44, 0x66);
-        let mut static_leases = HashMap::new();
-        static_leases.insert(mac1, Ipv4Addr::new(192, 168, 1, 5)); // offset 5 -> valid
-        static_leases.insert(mac2, Ipv4Addr::new(192, 168, 1, 50)); // offset 50 -> out of /28 bounds
+        let static_leases = vec![
+            StaticLease {
+                mac: mac1,
+                ip: Ipv4Addr::new(192, 168, 1, 5), // offset 5 -> valid
+                hostname: Some("valid-host".to_string()),
+            },
+            StaticLease {
+                mac: mac2,
+                ip: Ipv4Addr::new(192, 168, 1, 50), // offset 50 -> out of /28 bounds
+                hostname: Some("overflow-host".to_string()),
+            },
+        ];
 
         let remapped_leases =
             remap_static_leases_for_subnet(&static_leases, &primary_net, &backup_net);
         assert_eq!(remapped_leases.len(), 1);
-        assert_eq!(
-            remapped_leases.get(&mac1),
-            Some(&Ipv4Addr::new(10, 0, 0, 5))
-        );
-        assert_eq!(remapped_leases.get(&mac2), None);
+        assert_eq!(remapped_leases[0].mac, mac1);
+        assert_eq!(remapped_leases[0].ip, Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(remapped_leases[0].hostname.as_deref(), Some("valid-host"));
 
         let port_forwards = vec![
             PortForwardRule {

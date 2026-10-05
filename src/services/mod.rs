@@ -43,7 +43,7 @@ mod tests {
             Some(hb_tx.clone()),
             Some(lh_tx.clone()),
             observability::null_dhcp_leases_sender(),
-            std::collections::HashMap::new(),
+            Vec::new(),
         );
         assert_eq!(dhcp_server.get_worker_pid(), 0);
 
@@ -64,7 +64,7 @@ mod tests {
             Some(hb_tx),
             Some(lh_tx),
             observability::null_dhcp_leases_sender(),
-            std::collections::HashMap::new(),
+            Vec::new(),
             Vec::new(),
         );
 

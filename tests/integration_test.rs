@@ -19,17 +19,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
-#[path = "../src/error.rs"]
-mod error;
-
-#[path = "../src/packet.rs"]
-mod packet;
-
-#[path = "../src/services/ipc.rs"]
-mod ipc;
-
-#[path = "../src/services/utils.rs"]
-mod utils;
+use trimrouter::packet;
+use trimrouter::services::utils;
 
 macro_rules! println {
     ($($arg:tt)*) => {{

@@ -1,3 +1,4 @@
+use crate::config::StaticLease;
 use pnet::util::MacAddr;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
@@ -107,7 +108,7 @@ pub enum DhcpServerParentToWorkerMsg {
         mac_address: MacAddr,
     },
     SetStaticLeases {
-        leases: Vec<(MacAddr, Ipv4Addr)>,
+        leases: Vec<StaticLease>,
     },
 }
 
@@ -187,10 +188,11 @@ mod tests {
 
         // 3b. DhcpServerParentToWorkerMsg::SetStaticLeases
         let static_leases_msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
-            leases: vec![(
-                MacAddr::new(0x52, 0x54, 0x00, 0x12, 0x34, 0x56),
-                Ipv4Addr::new(192, 168, 1, 50),
-            )],
+            leases: vec![StaticLease {
+                mac: MacAddr::new(0x52, 0x54, 0x00, 0x12, 0x34, 0x56),
+                ip: Ipv4Addr::new(192, 168, 1, 50),
+                hostname: Some("nas".to_string()),
+            }],
         };
         parent_server_ipc.send(&static_leases_msg).await.unwrap();
         let received: DhcpServerParentToWorkerMsg = child_server_ipc.recv().await.unwrap().unwrap();

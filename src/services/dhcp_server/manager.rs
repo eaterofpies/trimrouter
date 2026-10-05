@@ -1,3 +1,4 @@
+use crate::config::StaticLease;
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
 use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{
@@ -15,7 +16,6 @@ use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
@@ -27,7 +27,7 @@ pub struct DhcpServer {
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
     leases_tx: DhcpLeasesSender,
-    static_leases: HashMap<MacAddr, Ipv4Addr>,
+    static_leases: Vec<StaticLease>,
 }
 
 impl DhcpServer {
@@ -37,7 +37,7 @@ impl DhcpServer {
         heartbeat_tx: Option<HeartbeatSender>,
         local_hosts_tx: Option<LocalHostSender>,
         leases_tx: DhcpLeasesSender,
-        static_leases: HashMap<MacAddr, Ipv4Addr>,
+        static_leases: Vec<StaticLease>,
     ) -> Self {
         Self {
             lan_interface,
@@ -73,7 +73,7 @@ struct DhcpMonitorParams {
     heartbeat_tx: Option<HeartbeatSender>,
     local_hosts_tx: Option<LocalHostSender>,
     leases_tx: DhcpLeasesSender,
-    static_leases: HashMap<MacAddr, Ipv4Addr>,
+    static_leases: Vec<StaticLease>,
     lan_interface: String,
     lan_ip: String,
 }
@@ -118,7 +118,7 @@ async fn run_parent_dhcp_server_monitor(
     mut params: DhcpMonitorParams,
 ) {
     let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
-        leases: params.static_leases.clone().into_iter().collect(),
+        leases: params.static_leases.clone(),
     };
     if let Err(e) = ipc.send(&msg).await {
         error!(
@@ -294,7 +294,7 @@ mod tests {
             Some(hb_tx),
             Some(lh_tx),
             crate::services::observability::null_dhcp_leases_sender(),
-            HashMap::new(),
+            Vec::new(),
         );
         assert_eq!(srv.get_worker_pid(), 0);
     }

@@ -3,7 +3,7 @@ use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcEndpoint};
 use crate::services::utils::{
     DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload, read_raw_packet,
-    run_sandboxed_worker, send_raw_packet,
+    run_sandboxed_worker, sanitize_hostname, send_raw_packet,
 };
 use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode, OptionCode};
 use dhcproto::{Encodable, Encoder};
@@ -642,20 +642,6 @@ async fn handle_dhcp_request(
     }
 }
 
-pub fn sanitize_hostname(raw: &str) -> Option<String> {
-    let label = raw.split('.').next()?.trim();
-    if label.is_empty() || label.len() > 63 {
-        return None;
-    }
-    if label.starts_with('-') || label.ends_with('-') {
-        return None;
-    }
-    if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return None;
-    }
-    Some(label.to_ascii_lowercase())
-}
-
 fn extract_sanitized_hostname(dhcp: &Message) -> Option<String> {
     match dhcp.opts().get(OptionCode::Hostname) {
         Some(DhcpOption::Hostname(name)) => sanitize_hostname(name),
@@ -678,6 +664,7 @@ fn get_dest_mac_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StaticLease;
     use crate::services::dhcp_server::{ClientLease, LeaseConfirmation, LeaseTable};
     use dhcproto::{Decodable, Decoder};
     use std::time::Instant;
@@ -1393,10 +1380,11 @@ mod tests {
         let leases = spawn_lease_actor();
 
         let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
-            leases: vec![(
-                MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),
-                Ipv4Addr::new(192, 168, 1, 50),
-            )],
+            leases: vec![StaticLease {
+                mac: MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),
+                ip: Ipv4Addr::new(192, 168, 1, 50),
+                hostname: Some("printer".to_string()),
+            }],
         };
         parent_ipc.send(&msg).await.unwrap();
 
