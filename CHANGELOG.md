@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/eaterofpies/trimrouter/compare/v0.4.0...v0.5.0) (2026-10-09)
+
+
+### Features
+
+* add hostname support to static DHCP lease reservations ([506d5ff](https://github.com/eaterofpies/trimrouter/commit/506d5ffff99c48f84aaf9270093b57b13c435ce6))
+
+
+### Bug Fixes
+
+* **deps:** update all dependencies ([#31](https://github.com/eaterofpies/trimrouter/issues/31)) ([3fbd0c3](https://github.com/eaterofpies/trimrouter/commit/3fbd0c35b9140d9aa3f64af69cf835e8be71fc55))
+* **dhcp:** support ciaddr in lease renewal and broadcast DHCPNAK ([51671d0](https://github.com/eaterofpies/trimrouter/commit/51671d020c68ea4d49d04bc140cdbeca2c9d6780))
+
 ## [0.4.0](https://github.com/eaterofpies/trimrouter/compare/v0.3.0...v0.4.0) (2026-09-28)
 
 
