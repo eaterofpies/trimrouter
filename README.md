@@ -21,8 +21,8 @@ It manages virtual filesystems, signal forwarding, orphan reaping, and launches 
 - **Kernel-Space NAT & Routing**: Interacts directly with the Linux kernel using Netlink sockets (`NETLINK_ROUTE` and `NETLINK_NETFILTER`) to manage interface states, IP assignments, default routes, Source NAT (Masquerading), and Destination NAT (Inbound Port Forwarding).
 - **Stateful Firewall**: Implements an `nftables` input filter chain that drops all unsolicited incoming traffic on the WAN interface by default, while supporting declarative port forwarding rules to LAN destinations.
 - **Embedded Network Services**:
-  - **DHCP Client (WAN)**: Handles dynamic leases and unicast renewals on the WAN interface over raw sockets.
-  - **DHCP Server (LAN)**: Manages LAN lease allocations, address conflicts, and lease release/decline requests.
+  - **DHCP Client (WAN)**: Handles dynamic leases and unicast renewals on the WAN interface, isolated in a sandboxed worker communicating with the parent raw socket router over IPC.
+  - **DHCP Server (LAN)**: Manages LAN lease allocations, address conflicts, and static reservations via sandboxed worker IPC, with raw packet I/O and frame encoding handled by the parent supervisor.
   - **DNS Forwarder/Proxy (LAN)**: Accepts inbound queries over both UDP and TCP (RFC 7766), resolves local split-horizon hostnames (`.lan`), serves cached records at wire speed, enforces per-client token-bucket rate limiting on upstream queries, and forwards uncached requests to WAN DNS resolvers with transaction ID randomization and spoofing defense.
   - **NTP Client (SNTP)**: Periodically synchronizes the router system time from time.google.com.
   - **Web Dashboard & Observability (LAN)**: Always-on, read-only HTTP status dashboard on port 80 of the LAN gateway (`http://router.lan`), providing a single-page HTML/CSS/JS interface, JSON status inspection API (`/api/status`), recent logs (`/api/logs`), and real-time log streaming via Server-Sent Events (`/api/logs/stream`).

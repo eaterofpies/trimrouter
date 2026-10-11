@@ -1,5 +1,6 @@
 use crate::config::StaticLease;
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
+use crate::packet::build_raw_packet;
 use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{
     DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcEndpoint, LocalHostEvent,
@@ -7,16 +8,21 @@ use crate::services::ipc::{
 };
 use crate::services::observability::DhcpLeasesSender;
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
-use crate::services::utils::{setup_worker_sockets, terminate_worker};
+use crate::services::utils::{
+    get_interface_mac, read_raw_packet, send_raw_packet, setup_worker_sockets, terminate_worker,
+};
+use dhcproto::v4::{MessageType, SERVER_PORT};
 use futures_util::StreamExt;
 use ipnet::Ipv4Net;
-use log::{error, info};
+use log::{error, info, warn};
 use pnet::util::MacAddr;
 use rtnetlink::MulticastGroup;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
 use std::net::Ipv4Addr;
+use std::os::unix::io::OwnedFd;
+use tokio::io::unix::AsyncFd;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 
@@ -61,9 +67,14 @@ impl DhcpServer {
 
 fn start_parent_arp_listener(
     parent_ipc: IpcEndpoint<DhcpServerWorkerToParentMsg>,
+    raw_socket_fd: OwnedFd,
     params: DhcpMonitorParams,
 ) -> Result<JoinHandle<()>, ServiceError> {
-    let handle = tokio::spawn(run_parent_dhcp_server_monitor(parent_ipc, params));
+    let handle = tokio::spawn(run_parent_dhcp_server_monitor(
+        parent_ipc,
+        raw_socket_fd,
+        params,
+    ));
     Ok(handle)
 }
 
@@ -84,37 +95,236 @@ fn read_lan_ifindex(lan_interface: &str) -> Option<u32> {
         .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
+#[derive(Clone, Copy)]
+struct ServerNetworkConfig {
+    server_mac: MacAddr,
+    server_ip: Ipv4Addr,
+    subnet_mask: Ipv4Addr,
+    lan_net: Ipv4Net,
+}
+
+async fn handle_send_offer(
+    async_sock: &AsyncFd<OwnedFd>,
+    config: &ServerNetworkConfig,
+    client_mac: MacAddr,
+    xid: u32,
+    offered_ip: Ipv4Addr,
+    broadcast: bool,
+) {
+    if !config.lan_net.contains(&offered_ip) || offered_ip == config.server_ip {
+        warn!(
+            "[dhcp-server-parent] Rejected invalid offered IP {} outside LAN subnet",
+            offered_ip
+        );
+        return;
+    }
+    let payload = match super::worker::build_dhcp_reply_payload(
+        MessageType::Offer,
+        client_mac,
+        xid,
+        broadcast,
+        offered_ip,
+        config.server_ip,
+        config.subnet_mask,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[dhcp-server-parent] Failed to build offer payload: {}", e);
+            return;
+        }
+    };
+    let (dest_mac, dest_ip) = get_dest_mac_ip(broadcast, client_mac, offered_ip);
+    match build_raw_packet(
+        config.server_mac,
+        dest_mac,
+        config.server_ip,
+        dest_ip,
+        dhcproto::v4::SERVER_PORT,
+        dhcproto::v4::CLIENT_PORT,
+        &payload,
+    ) {
+        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Err(e) => error!(
+            "[dhcp-server-parent] Failed to build raw offer packet: {}",
+            e
+        ),
+    }
+}
+
+fn get_dest_mac_ip(
+    broadcast: bool,
+    client_mac: MacAddr,
+    target_ip: Ipv4Addr,
+) -> (MacAddr, Ipv4Addr) {
+    if broadcast {
+        (MacAddr::broadcast(), Ipv4Addr::BROADCAST)
+    } else {
+        (client_mac, target_ip)
+    }
+}
+
+async fn handle_send_ack(
+    async_sock: &AsyncFd<OwnedFd>,
+    config: &ServerNetworkConfig,
+    client_mac: MacAddr,
+    xid: u32,
+    leased_ip: Ipv4Addr,
+    broadcast: bool,
+) {
+    if !config.lan_net.contains(&leased_ip) || leased_ip == config.server_ip {
+        warn!(
+            "[dhcp-server-parent] Rejected invalid leased IP {} outside LAN subnet",
+            leased_ip
+        );
+        return;
+    }
+    let payload = match super::worker::build_dhcp_reply_payload(
+        MessageType::Ack,
+        client_mac,
+        xid,
+        broadcast,
+        leased_ip,
+        config.server_ip,
+        config.subnet_mask,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[dhcp-server-parent] Failed to build ack payload: {}", e);
+            return;
+        }
+    };
+    let (dest_mac, dest_ip) = get_dest_mac_ip(broadcast, client_mac, leased_ip);
+    match build_raw_packet(
+        config.server_mac,
+        dest_mac,
+        config.server_ip,
+        dest_ip,
+        dhcproto::v4::SERVER_PORT,
+        dhcproto::v4::CLIENT_PORT,
+        &payload,
+    ) {
+        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Err(e) => error!("[dhcp-server-parent] Failed to build raw ack packet: {}", e),
+    }
+}
+
+async fn handle_send_nak(
+    async_sock: &AsyncFd<OwnedFd>,
+    server_mac: MacAddr,
+    server_ip: Ipv4Addr,
+    client_mac: MacAddr,
+    xid: u32,
+) {
+    let payload = match super::worker::build_dhcp_nak_payload(client_mac, xid, server_ip) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[dhcp-server-parent] Failed to build nak payload: {}", e);
+            return;
+        }
+    };
+    match build_raw_packet(
+        server_mac,
+        MacAddr::broadcast(),
+        server_ip,
+        Ipv4Addr::BROADCAST,
+        dhcproto::v4::SERVER_PORT,
+        dhcproto::v4::CLIENT_PORT,
+        &payload,
+    ) {
+        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Err(e) => error!("[dhcp-server-parent] Failed to build raw nak packet: {}", e),
+    }
+}
+
+async fn handle_probe_arp(
+    async_sock: &AsyncFd<OwnedFd>,
+    server_mac: MacAddr,
+    server_ip: Ipv4Addr,
+    lan_net: &Ipv4Net,
+    target_ip: Ipv4Addr,
+) {
+    if !lan_net.contains(&target_ip) || target_ip == server_ip {
+        warn!(
+            "[dhcp-server-parent] Rejected invalid probe IP {} outside LAN subnet",
+            target_ip
+        );
+        return;
+    }
+    match build_raw_packet(
+        server_mac,
+        MacAddr::broadcast(),
+        server_ip,
+        target_ip,
+        super::worker::DISCARD_PORT,
+        super::worker::DISCARD_PORT,
+        &[0u8],
+    ) {
+        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Err(e) => error!(
+            "[dhcp-server-parent] Failed to build raw arp probe packet: {}",
+            e
+        ),
+    }
+}
+
 async fn handle_worker_ipc_msg(
-    ipc_msg: Result<Option<DhcpServerWorkerToParentMsg>, std::io::Error>,
+    msg: DhcpServerWorkerToParentMsg,
     params: &DhcpMonitorParams,
-) -> bool {
-    match ipc_msg {
-        Ok(Some(DhcpServerWorkerToParentMsg::Heartbeat { leases })) => {
+    async_sock: &AsyncFd<OwnedFd>,
+    server_mac: MacAddr,
+    lan_net: &Ipv4Net,
+) {
+    let server_ip = lan_net.addr();
+    let subnet_mask = lan_net.netmask();
+    let config = ServerNetworkConfig {
+        server_mac,
+        server_ip,
+        subnet_mask,
+        lan_net: *lan_net,
+    };
+    match msg {
+        DhcpServerWorkerToParentMsg::Heartbeat { leases } => {
             send_service_heartbeat(params.heartbeat_tx.as_ref(), MonitoredService::LanManager);
             let _ = params.leases_tx.send(leases);
-            true
         }
-        Ok(Some(DhcpServerWorkerToParentMsg::RegisterLocalHost { name, ip })) => {
+        DhcpServerWorkerToParentMsg::RegisterLocalHost { name, ip } => {
             if let Some(ref tx) = params.local_hosts_tx {
                 let _ = tx.send(LocalHostEvent::Register { name, ip }).await;
             }
-            true
         }
-        Ok(Some(DhcpServerWorkerToParentMsg::DeregisterLocalHost { name })) => {
+        DhcpServerWorkerToParentMsg::DeregisterLocalHost { name } => {
             if let Some(ref tx) = params.local_hosts_tx {
                 let _ = tx.send(LocalHostEvent::Deregister { name }).await;
             }
-            true
         }
-        Ok(None) | Err(_) => {
-            info!("[dhcp-server-parent] Worker closed IPC. Shutting down monitor.");
-            false
+        DhcpServerWorkerToParentMsg::SendOffer {
+            client_mac,
+            xid,
+            offered_ip,
+            broadcast,
+        } => {
+            handle_send_offer(async_sock, &config, client_mac, xid, offered_ip, broadcast).await;
+        }
+        DhcpServerWorkerToParentMsg::SendAck {
+            client_mac,
+            xid,
+            leased_ip,
+            broadcast,
+        } => {
+            handle_send_ack(async_sock, &config, client_mac, xid, leased_ip, broadcast).await;
+        }
+        DhcpServerWorkerToParentMsg::SendNak { client_mac, xid } => {
+            handle_send_nak(async_sock, server_mac, server_ip, client_mac, xid).await;
+        }
+        DhcpServerWorkerToParentMsg::ProbeArpConflict { target_ip } => {
+            handle_probe_arp(async_sock, server_mac, server_ip, lan_net, target_ip).await;
         }
     }
 }
 
 async fn run_parent_dhcp_server_monitor(
     ipc: IpcEndpoint<DhcpServerWorkerToParentMsg>,
+    raw_socket_fd: OwnedFd,
     mut params: DhcpMonitorParams,
 ) {
     let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
@@ -126,6 +336,40 @@ async fn run_parent_dhcp_server_monitor(
             e
         );
     }
+
+    let Ok(lan_net) = params.lan_ip.parse::<Ipv4Net>() else {
+        error!(
+            "[dhcp-server-parent] Invalid LAN IP configuration: {}",
+            params.lan_ip
+        );
+        terminate_worker(params.child_pid).await;
+        return;
+    };
+    let lan_gateway_ip = lan_net.addr();
+
+    let server_mac = match get_interface_mac(&params.lan_interface).await {
+        Ok(m) => m,
+        Err(e) => {
+            error!(
+                "[dhcp-server-parent] Failed to get LAN interface MAC: {}",
+                e
+            );
+            terminate_worker(params.child_pid).await;
+            return;
+        }
+    };
+
+    let async_sock = match AsyncFd::new(raw_socket_fd) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(
+                "[dhcp-server-parent] Failed to wrap raw socket in AsyncFd: {}",
+                e
+            );
+            terminate_worker(params.child_pid).await;
+            return;
+        }
+    };
 
     let (connection, _handle, mut messages) =
         match rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]) {
@@ -141,28 +385,60 @@ async fn run_parent_dhcp_server_monitor(
         };
     tokio::spawn(connection);
 
-    let lan_net: Option<Ipv4Net> = params.lan_ip.parse().ok();
-    let lan_gateway_ip = lan_net.as_ref().map(|n| n.addr());
     let lan_ifindex = read_lan_ifindex(&params.lan_interface);
 
     info!(
         "[dhcp-server-parent] Supervising DHCP server worker (PID {})",
         params.child_pid
     );
+
+    let mut raw_buf = [0u8; 2048];
     loop {
         tokio::select! {
             _ = params.shutdown_rx.changed() => break,
+            read_res = read_raw_packet(&async_sock, &mut raw_buf) => {
+                match read_res {
+                    Ok(n) => {
+                        let frame = raw_buf[..n].to_vec();
+                        let msg = DhcpServerParentToWorkerMsg::RawPacket { frame };
+                        if let Err(e) = ipc.send(&msg).await {
+                            error!("[dhcp-server-parent] Failed to forward raw packet: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[dhcp-server-parent] Socket read error: {}. Continuing.", e);
+                    }
+                }
+            }
             ipc_msg = ipc.recv() => {
-                if !handle_worker_ipc_msg(ipc_msg, &params).await {
-                    break;
+                match ipc_msg {
+                    Ok(Some(msg)) => {
+                        handle_worker_ipc_msg(
+                            msg,
+                            &params,
+                            &async_sock,
+                            server_mac,
+                            &lan_net,
+                        )
+                        .await;
+                    }
+                    Ok(None) => {
+                        info!("[dhcp-server-parent] Worker closed IPC. Shutting down.");
+                        break;
+                    }
+                    Err(e) => {
+                        error!("[dhcp-server-parent] IPC recv error: {}", e);
+                        break;
+                    }
                 }
             }
             Some((message, _addr)) = messages.next() => {
                 if let Some((ip, mac)) = parse_neighbor_update(
                     &message.payload,
                     lan_ifindex,
-                    lan_net.as_ref(),
-                    lan_gateway_ip,
+                    Some(&lan_net),
+                    Some(lan_gateway_ip),
                 ) {
                     let ipc_msg = DhcpServerParentToWorkerMsg::AddNeighbor {
                         ip_address: ip,
@@ -228,20 +504,20 @@ fn setup_dhcp_server_attempt(
 ) -> Result<
     (
         crate::cli::WorkerService,
-        IpcEndpoint<DhcpServerWorkerToParentMsg>,
+        (IpcEndpoint<DhcpServerWorkerToParentMsg>, OwnedFd),
     ),
     ServiceError,
 > {
-    let (raw_socket_fd, parent_ipc, child_ipc) = setup_worker_sockets(lan_interface)
-        .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
+    let (raw_socket_fd, parent_ipc, child_ipc) =
+        setup_worker_sockets(lan_interface, SERVER_PORT)
+            .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
     Ok((
         crate::cli::WorkerService::DhcpServer {
             ipc_fd: child_ipc.into(),
-            raw_socket_fd: raw_socket_fd.into(),
             wan_interface: lan_interface.to_string(),
             lan_ip: lan_ip.to_string(),
         },
-        parent_ipc,
+        (parent_ipc, raw_socket_fd),
     ))
 }
 
@@ -258,7 +534,7 @@ impl Service for DhcpServer {
 
         self.state.start_supervised(
             move || setup_dhcp_server_attempt(&lan_interface, &lan_ip),
-            move |parent_ipc, child_pid, shutdown_rx| {
+            move |(parent_ipc, raw_socket_fd), child_pid, shutdown_rx| {
                 let params = DhcpMonitorParams {
                     child_pid,
                     shutdown_rx,
@@ -269,7 +545,7 @@ impl Service for DhcpServer {
                     lan_interface: lan_interface_spawn.clone(),
                     lan_ip: lan_ip_spawn.clone(),
                 };
-                start_parent_arp_listener(parent_ipc, params)
+                start_parent_arp_listener(parent_ipc, raw_socket_fd, params)
             },
         )
     }
@@ -394,5 +670,19 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn test_get_dest_mac_ip_broadcast_and_unicast() {
+        let client_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
+        let leased_ip = Ipv4Addr::new(192, 168, 1, 100);
+
+        let (b_mac, b_ip) = get_dest_mac_ip(true, client_mac, leased_ip);
+        assert_eq!(b_mac, MacAddr::broadcast());
+        assert_eq!(b_ip, Ipv4Addr::BROADCAST);
+
+        let (u_mac, u_ip) = get_dest_mac_ip(false, client_mac, leased_ip);
+        assert_eq!(u_mac, client_mac);
+        assert_eq!(u_ip, leased_ip);
     }
 }
