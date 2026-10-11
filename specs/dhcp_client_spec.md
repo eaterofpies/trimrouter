@@ -9,14 +9,19 @@ The DHCP Client is an embedded service in `trimrouter` responsible for negotiati
 
 ## 1. Socket and Packet Mechanics
 
-Because the WAN interface does not have an IP address assigned during initial configuration, the DHCP client cannot use standard UDP socket abstractions (`std::net::UdpSocket`). Instead, it communicates directly with the network hardware link layer:
+Because the WAN interface does not have an IP address assigned during initial configuration, the DHCP client cannot use standard UDP socket abstractions (`std::net::UdpSocket`). Instead, it communicates with the network hardware link layer via the privileged parent process:
 
-*   **Socket Type**: A raw packet socket (`AF_PACKET` / `SOCK_RAW`) bound directly to the WAN interface.
-*   **Userspace Header Construction**: The client constructs complete ethernet frames including:
-    *   **Ethernet Header**: Source MAC set to the WAN interface hardware address; destination MAC set to broadcast (`FF:FF:FF:FF:FF:FF`).
-    *   **IPv4 Header**: Source IP set to `0.0.0.0` (or the currently leased IP during renewal); destination IP set to `255.255.255.255` (or the unicast server IP during renewal).
-    *   **UDP Header**: Source port set to `68` (DHCP client); destination port set to `67` (DHCP server).
-*   **Response Filtering**: Parses incoming raw packets, matching the client MAC address and transaction ID (`xid`) to filter out other traffic.
+*   **Parent Raw Socket Management**: A raw packet socket (`AF_PACKET` / `SOCK_RAW`) bound directly to the WAN interface is owned, polled, and managed exclusively by the privileged parent process.
+*   **Inbound Routing & Full Userspace Decode**: The parent routes incoming raw Layer-2 frames to the unprivileged DHCP client worker over a private Unix SEQPACKET IPC channel (`RawPacket`). The worker performs the full packet decode in userspace:
+    *   **Ethernet Header**: Extracts source and destination MACs; validates frame types.
+    *   **IPv4 & UDP Headers**: Extracts source and destination IPs and ports; validates UDP ports 67/68.
+    *   **DHCP Payload & Response Filtering**: Decodes the DHCP message and options, matching against the client MAC address and active transaction ID (`xid`) to filter out unrelated WAN traffic.
+*   **Constrained Outbound Requests & Parent Encoding**: The unprivileged worker does not construct or emit raw packet bytes. Instead, it sends strongly typed semantic domain requests over IPC (`SendDiscover`, `SendRequest`). The privileged parent performs the full packet encoding and transmission:
+    *   **DHCP Message Construction**: Builds the DHCP payload including required options (Parameter Request List, Requested IP, Server Identifier).
+    *   **UDP Header**: Encapsulates source port 68 (DHCP client) and destination port 67 (DHCP server).
+    *   **IPv4 Header**: Sets source IP to `0.0.0.0` (or currently leased IP during unicast renewal) and destination IP to `255.255.255.255` (or unicast server IP during renewal).
+    *   **Ethernet Header**: Sets source MAC to the WAN interface hardware address and destination MAC to broadcast (`FF:FF:FF:FF:FF:FF`) or server unicast MAC.
+    *   **Checksum & Transmit**: Computes IP and UDP checksums and writes the frame directly to the WAN raw packet socket.
 
 ---
 
@@ -87,7 +92,7 @@ The client requests and parses the following standard DHCP options:
 
 ## 4. Failure Recovery & Robustness
 
-*   **Socket Reinitialization**: If the raw socket encounters persistent read/write errors, the client tears down the socket, waits 5 seconds (`SOCKET_RESTART_DELAY_SECS`), and binds a new socket.
+*   **Socket Reinitialization**: If the raw socket encounters persistent read/write errors, the parent supervisor tears down the socket, waits 5 seconds (`SOCKET_RESTART_DELAY_SECS`), and rebinds a new socket on the WAN interface.
 *   **Off-Subnet Gateway Protection**: Validates that any offered gateway IP is non-zero, non-broadcast, and contained within the leased subnet before configuring netlink default routes.
 *   **RFC 2131 Renewal Scaling**: Retransmission intervals during renewal and rebinding wait half the remaining time down to 60s for standard leases (`(remaining / 2).max(60)`), and scale dynamically for sub-minute leases (`(remaining / 2).max(1)`).
 *   **Unrecoverable Lease Expiry**: To prevent routing blackholes, if the lease expires during rebinding, the client immediately deletes the IP address and the default gateway route from the WAN interface before restarting discovery.

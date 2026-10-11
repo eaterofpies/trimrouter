@@ -23,10 +23,12 @@ Crucially, **no other files** will be present on the target filesystem other tha
       (Enable IPv4 Forwarding)
                  │
                  ▼
-       [ Service Controller ]
-        ├── DHCP WAN Client (Raw AF_PACKET)
-        ├── DHCP LAN Server (Raw AF_PACKET)
-        ├── DNS Forwarder (Tokio UDP)
+       [ Service Controller (PID 1 Parent) ]
+        ├── Interface Raw Sockets (AF_PACKET WAN/LAN Routing & Encoding)
+        ├── DHCP WAN Client Worker (Sandboxed IPC)
+        ├── DHCP LAN Server Worker (Sandboxed IPC)
+        ├── DNS Forwarder Worker (Sandboxed UDP/TCP)
+        ├── SNTP Client Worker (Sandboxed UDP)
         └── NAT/Netlink Controller
 ```
 

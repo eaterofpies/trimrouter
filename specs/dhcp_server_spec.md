@@ -9,11 +9,19 @@ The DHCP Server is an embedded service in `trimrouter` responsible for dynamical
 
 ## 1. Socket and Routing Mechanics
 
-During the initial phase of connection, a client does not possess an IP address and therefore cannot resolve ARP queries. Consequently, standard UDP sockets cannot be used to respond to the client.
+During the initial phase of connection, a client does not possess an IP address and therefore cannot resolve ARP queries. Consequently, standard UDP sockets cannot be used to respond to the client. The server relies on link-layer packet mechanics orchestrated via the privileged parent process:
 
-*   **Socket Type**: A raw packet socket (`AF_PACKET`) bound directly to the LAN interface.
-*   **Userspace Broadcast/Unicast**: The server reads raw packets and parses them in userspace. It unicasts replies directly to the client's destination hardware MAC address at the Ethernet layer, bypassing the kernel ARP table.
-*   **Ports**: Listens for client messages on UDP port `67` and responds to client port `68`.
+*   **Parent Raw Socket Management**: An `AF_PACKET` raw packet socket bound directly to the LAN interface is owned, polled, and managed exclusively by the privileged parent process.
+*   **Inbound Routing & Full Userspace Decode**: The parent delivers incoming raw Layer-2 Ethernet frames to the unprivileged DHCP server worker over a private Unix SEQPACKET IPC channel (`RawPacket`). The worker performs the full packet decode in userspace:
+    *   **Ethernet Header & Anti-Spoofing**: Extracts source and destination MACs; verifies that L2 source MAC matches the DHCP `chaddr` client hardware address to drop spoofed packets.
+    *   **IPv4 & UDP Headers**: Inspects packet framing and validates destination port 67.
+    *   **DHCP Payload & Option Decoding**: Decodes the DHCP message opcode, options, requested IP, and hostname (Option 12), and manages the in-memory lease table.
+*   **Constrained Outbound Requests & Parent Encoding**: The unprivileged worker does not construct or emit raw packet bytes. Instead, it emits strongly typed semantic domain requests over IPC (`SendOffer`, `SendAck`, `SendNak`, `ProbeArpConflict`). The privileged parent validates the request and performs the full packet encoding:
+    *   **Subnet Validation**: Verifies that offered or acknowledged IPs reside strictly within the configured LAN subnet.
+    *   **DHCP Reply Construction**: Builds the DHCP reply message with authoritative server options (Subnet Mask, Default Router/Gateway, DNS Server pointing to the router, Lease Time of 3600s, Server Identifier).
+    *   **UDP & IPv4 Encapsulation**: Encapsulates UDP (source port 67, destination port 68) and IPv4 headers (source IP set to LAN gateway IP, destination IP set to client IP or broadcast per RFC 2131 flags).
+    *   **Ethernet Unicast/Broadcast**: Unicasts replies directly to the client's destination hardware MAC address at Layer 2 (or broadcast MAC if requested), bypassing the kernel ARP table.
+    *   **ARP Probe Generation**: For `ProbeArpConflict`, constructs the benign UDP packet targeting the probe IP to provoke kernel ARP resolution without granting raw socket access to the worker.
 
 ---
 
@@ -153,6 +161,6 @@ ip = "192.168.1.60"
 5. **Observability**: Static lease reservations and their configured hostnames appear in the active lease table and `/api/status` observability telemetry with `is_static = true`.
 
 ### 7.4 Startup Synchronization (Race-Free Initialization)
-Upon worker process launch, the DHCP server supervisor immediately transmits the configured static reservations over IPC (`SetStaticLeases`). The sandboxed worker process explicitly awaits and applies this initial synchronization message before binding or polling the raw packet socket for incoming client requests. This guarantees that static reservations and dynamic pool isolation are active before any `DHCPDISCOVER` packet is processed.
+Upon worker process launch, the DHCP server supervisor immediately transmits the configured static reservations over IPC (`SetStaticLeases`). The sandboxed worker process explicitly awaits and applies this initial synchronization message before processing incoming client raw packet requests from the parent over IPC. This guarantees that static reservations and dynamic pool isolation are active before any `DHCPDISCOVER` packet is processed.
 
 
