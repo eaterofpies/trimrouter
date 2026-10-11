@@ -11,7 +11,7 @@ The DHCP Server is an embedded service in `trimrouter` responsible for dynamical
 
 During the initial phase of connection, a client does not possess an IP address and therefore cannot resolve ARP queries. Consequently, standard UDP sockets cannot be used to respond to the client. The server relies on link-layer packet mechanics orchestrated via the privileged parent process:
 
-*   **Parent Raw Socket Management**: An `AF_PACKET` raw packet socket bound directly to the LAN interface is owned, polled, and managed exclusively by the privileged parent process.
+*   **Parent Raw Socket & Kernel Filtering**: An `AF_PACKET` raw packet socket bound directly to the LAN interface is owned, polled, and managed exclusively by the privileged parent process. The socket is opened with protocol `ETH_P_IP` and configured with a Classic BPF filter (compiled via `pktbaffle` and attached via `SO_ATTACH_FILTER`) targeting destination UDP port 67, discarding non-DHCP transit traffic in the kernel before userspace copy.
 *   **Inbound Routing & Full Userspace Decode**: The parent delivers incoming raw Layer-2 Ethernet frames to the unprivileged DHCP server worker over a private Unix SEQPACKET IPC channel (`RawPacket`). The worker performs the full packet decode in userspace:
     *   **Ethernet Header & Anti-Spoofing**: Extracts source and destination MACs; verifies that L2 source MAC matches the DHCP `chaddr` client hardware address to drop spoofed packets.
     *   **IPv4 & UDP Headers**: Inspects packet framing and validates destination port 67.

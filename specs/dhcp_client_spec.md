@@ -11,7 +11,7 @@ The DHCP Client is an embedded service in `trimrouter` responsible for negotiati
 
 Because the WAN interface does not have an IP address assigned during initial configuration, the DHCP client cannot use standard UDP socket abstractions (`std::net::UdpSocket`). Instead, it communicates with the network hardware link layer via the privileged parent process:
 
-*   **Parent Raw Socket Management**: A raw packet socket (`AF_PACKET` / `SOCK_RAW`) bound directly to the WAN interface is owned, polled, and managed exclusively by the privileged parent process.
+*   **Parent Raw Socket & Kernel Filtering**: A raw packet socket (`AF_PACKET` / `SOCK_RAW`) bound directly to the WAN interface is owned, polled, and managed exclusively by the privileged parent process. The socket is opened with protocol `ETH_P_IP` and configured with a Classic BPF filter (compiled via `pktbaffle` and attached via `SO_ATTACH_FILTER`) targeting destination UDP port 68, discarding non-DHCP transit traffic in the kernel before userspace copy.
 *   **Inbound Routing & Full Userspace Decode**: The parent routes incoming raw Layer-2 frames to the unprivileged DHCP client worker over a private Unix SEQPACKET IPC channel (`RawPacket`). The worker performs the full packet decode in userspace:
     *   **Ethernet Header**: Extracts source and destination MACs; validates frame types.
     *   **IPv4 & UDP Headers**: Extracts source and destination IPs and ports; validates UDP ports 67/68.

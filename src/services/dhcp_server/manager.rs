@@ -11,7 +11,7 @@ use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{
     get_interface_mac, read_raw_packet, send_raw_packet, setup_worker_sockets, terminate_worker,
 };
-use dhcproto::v4::MessageType;
+use dhcproto::v4::{MessageType, SERVER_PORT};
 use futures_util::StreamExt;
 use ipnet::Ipv4Net;
 use log::{error, info, warn};
@@ -508,8 +508,9 @@ fn setup_dhcp_server_attempt(
     ),
     ServiceError,
 > {
-    let (raw_socket_fd, parent_ipc, child_ipc) = setup_worker_sockets(lan_interface)
-        .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
+    let (raw_socket_fd, parent_ipc, child_ipc) =
+        setup_worker_sockets(lan_interface, SERVER_PORT)
+            .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
     Ok((
         crate::cli::WorkerService::DhcpServer {
             ipc_fd: child_ipc.into(),

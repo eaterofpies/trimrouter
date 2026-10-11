@@ -8,6 +8,7 @@ use crate::services::utils::{
     CleanOption, WanLease, WanLeaseSender, get_interface_mac, mask_to_prefix_len,
     prefix_len_to_mask, read_raw_packet, send_raw_packet, setup_worker_sockets, terminate_worker,
 };
+use dhcproto::v4::CLIENT_PORT;
 use dhcproto::{Encodable, Encoder};
 use ipnet::Ipv4Net;
 use log::{error, info, warn};
@@ -319,8 +320,9 @@ fn setup_dhcp_client_attempt(
     ),
     ServiceError,
 > {
-    let (raw_socket_fd, parent_ipc, child_ipc) = setup_worker_sockets(wan_interface)
-        .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
+    let (raw_socket_fd, parent_ipc, child_ipc) =
+        setup_worker_sockets(wan_interface, CLIENT_PORT)
+            .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
 
     let worker_service = crate::cli::WorkerService::DhcpClient {
         ipc_fd: child_ipc.into(),

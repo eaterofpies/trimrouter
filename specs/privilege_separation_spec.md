@@ -68,7 +68,7 @@ Because `trimrouter` runs on a read-only filesystem with no external binaries or
 ### 3.1 Socket Passing and Raw Socket Isolation
 Unprivileged services cannot bind to privileged ports (like port 53) or open raw sockets (`AF_PACKET`):
 1.  **Non-Raw Sockets (DNS, SNTP)**: The Privileged Parent opens and binds UDP port 53 (and the TCP listener) for the DNS forwarder and the UDP client socket for SNTP before dropping privileges. These descriptors are passed to the child process during launch.
-2.  **Raw Packet Sockets (DHCP Client, DHCP Server)**: Raw packet sockets (`AF_PACKET`) are **retained entirely in the Privileged Parent** and are never passed to child workers. The parent opens interface-bound raw sockets on WAN and LAN, reads inbound frames, routes them to workers over IPC, and encodes and transmits outbound frames on behalf of workers.
+2.  **Raw Packet Sockets (DHCP Client, DHCP Server)**: Raw packet sockets (`AF_PACKET`) are **retained entirely in the Privileged Parent** and are never passed to child workers. The parent opens interface-bound raw sockets on WAN and LAN bound to `ETH_P_IP` and installs an in-kernel Classic BPF filter (`SO_ATTACH_FILTER`) restricting incoming traffic strictly to the service's target UDP port (68 for client, 67 for server), dropping all non-DHCP transit traffic directly in the kernel. Inbound frames are routed to workers over IPC, and the parent encodes and transmits outbound frames on behalf of workers.
 
 #### 3.1.1 Security Justification of Raw Socket Isolation
 Retaining raw packet sockets in the privileged parent and restricting workers to IPC yields critical security benefits:
@@ -91,6 +91,7 @@ The privilege dropping sequence uses:
 *   **[`nix`](https://docs.rs/nix)**: Performs low-level POSIX and Linux system operations (e.g. `setuid`, `setgid`, `chroot`, signal handling, and process termination) safely in Rust.
 *   **[`caps`](https://docs.rs/caps)**: Provides support for querying, clearing, and dropping specific Linux process/thread capability sets (Bounding, Inheritable, Effective, Permitted).
 *   **[`seccompiler`](https://docs.rs/seccompiler)**: A pure-Rust Seccomp-BPF filter compiler from the `rust-vmm` project. It generates and applies BPF filters directly in Rust without calling out to `libseccomp` C libraries, ensuring completely static binaries.
+*   **[`pktbaffle`](https://docs.rs/pktbaffle)**: A pure-Rust libpcap-compatible packet filter compiler. It compiles human-readable filter expressions (e.g. `ip and udp dst port 67`) directly into Classic BPF (`cBPF`) bytecode loaded via `SO_ATTACH_FILTER`, eliminating manual BPF bytecode construction without C dependencies.
 
 ### 3.4 Service Lifecycle & Process Supervision
 Starting, stopping, and reconfiguring services corresponds directly to executing and terminating their respective child processes:

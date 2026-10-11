@@ -1336,6 +1336,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pktbaffle"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad854f1556559801a58faf1f8c36f4ebf461533b27df3d5877c104058bb0bf9a"
+
+[[package]]
 name = "pnet"
 version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2140,6 +2146,7 @@ dependencies = [
  "mbrman",
  "netlink-sys",
  "nix 0.31.3",
+ "pktbaffle",
  "pnet",
  "postcard",
  "rand",
