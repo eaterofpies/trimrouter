@@ -1,12 +1,10 @@
-use crate::packet::build_raw_packet;
 use crate::services::DHCP_CLIENT_SERVICE_NAME;
-use crate::services::ipc::{DhcpClientToParentMsg, IpcEndpoint};
+use crate::services::ipc::{DhcpClientParentToWorkerMsg, DhcpClientToParentMsg, IpcEndpoint};
 use crate::services::utils::{
-    CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, RawPacketSocket, get_interface_mac,
+    CleanOption, DHCP_CLIENT_GID, DHCP_CLIENT_UID, get_interface_mac,
     mask_to_prefix_len as utils_mask_to_prefix_len, parse_dhcp_payload, run_sandboxed_worker,
 };
 use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
-use dhcproto::{Encodable, Encoder};
 use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
@@ -85,98 +83,22 @@ enum ParseAckResult {
     None,
 }
 
-/// A wrapper around a RawPacketSocket that handles DHCP-specific Layer-2
-/// packet formatting, filtering, and payload parsing.
-struct DhcpClientSocket {
-    raw_socket: RawPacketSocket,
+pub(crate) struct DhcpClientInternal {
     mac: MacAddr,
-}
-
-impl DhcpClientSocket {
-    fn from_raw_socket(raw_socket: RawPacketSocket, mac: MacAddr) -> Self {
-        Self { raw_socket, mac }
-    }
-
-    async fn send(
-        &self,
-        message: &dhcproto::v4::Message,
-        dest_ip: Ipv4Addr,
-    ) -> Result<(), DhcpError> {
-        let mut payload = Vec::new();
-        message
-            .encode(&mut Encoder::new(&mut payload))
-            .map_err(|e| DhcpError::Protocol(e.to_string()))?;
-
-        let src_ip = if message.ciaddr().is_unspecified() {
-            Ipv4Addr::UNSPECIFIED
-        } else {
-            message.ciaddr()
-        };
-
-        let frame = build_raw_packet(
-            self.mac,
-            MacAddr::broadcast(),
-            src_ip,
-            dest_ip,
-            dhcproto::v4::CLIENT_PORT,
-            dhcproto::v4::SERVER_PORT,
-            &payload,
-        )
-        .map_err(|e| DhcpError::Protocol(e.to_string()))?;
-        self.raw_socket.send(&frame).await?;
-        Ok(())
-    }
-
-    async fn recv(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Result<Option<dhcproto::v4::Message>, DhcpError> {
-        let mut raw_buf = [0u8; 2048];
-        let start = std::time::Instant::now();
-
-        while start.elapsed() < timeout {
-            let remaining = timeout.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-
-            let Some(n) = self
-                .raw_socket
-                .recv_timeout(&mut raw_buf, remaining)
-                .await?
-            else {
-                return Ok(None);
-            };
-
-            if let Some(dhcp) = parse_dhcp_payload(&raw_buf[..n], dhcproto::v4::CLIENT_PORT) {
-                return Ok(Some(dhcp));
-            }
-        }
-        Ok(None)
-    }
-}
-
-struct DhcpClientInternal {
-    socket: DhcpClientSocket,
-    mac: MacAddr,
-    ipc: IpcEndpoint<DhcpClientToParentMsg>,
+    ipc: IpcEndpoint<DhcpClientParentToWorkerMsg>,
 }
 
 impl DhcpClientInternal {
     async fn run(&self) {
         loop {
-            tokio::select! {
-                _ = self.ipc.recv() => {
+            let phase_res = self.execute_phases().await;
+            if let Err(e) = phase_res {
+                if matches!(e, DhcpError::Protocol(ref s) if s == "IPC closed by parent") {
                     info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
-                    self.deconfigure().await;
                     break;
                 }
-                phase_res = self.execute_phases() => {
-                    if let Err(e) = phase_res
-                        && !self.handle_phase_failure(e).await
-                    {
-                        break;
-                    }
+                if !self.handle_phase_failure(e).await {
+                    break;
                 }
             }
         }
@@ -196,9 +118,17 @@ impl DhcpClientInternal {
         );
         self.deconfigure().await;
         tokio::select! {
-            _ = self.ipc.recv() => {
-                info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
-                false
+            msg = self.ipc.recv() => {
+                match msg {
+                    Ok(Some(DhcpClientParentToWorkerMsg::RawPacket { .. })) => {
+                        sleep(Duration::from_secs(SOCKET_RESTART_DELAY_SECS)).await;
+                        true
+                    }
+                    Ok(None) | Err(_) => {
+                        info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
+                        false
+                    }
+                }
             }
             _ = sleep(Duration::from_secs(SOCKET_RESTART_DELAY_SECS)) => true,
         }
@@ -258,7 +188,6 @@ impl DhcpClientInternal {
                 offer.offered_ip,
                 offer.server_ip,
                 Ipv4Addr::UNSPECIFIED,
-                Ipv4Addr::BROADCAST,
             )
             .await;
             let timeout = get_jittered_duration(retry_delay_secs);
@@ -296,7 +225,19 @@ impl DhcpClientInternal {
                     BOUND_HEARTBEAT_INTERVAL_SECS,
                     (t1_secs - elapsed) as u64,
                 ));
-                sleep(sleep_duration).await;
+                tokio::select! {
+                    _ = sleep(sleep_duration) => {}
+                    msg = self.ipc.recv() => {
+                        match msg {
+                            Ok(Some(DhcpClientParentToWorkerMsg::RawPacket { .. })) => {}
+                            Ok(None) | Err(_) => {
+                                info!("[dhcp-client-worker] Parent closed IPC. Shutting down.");
+                                self.deconfigure().await;
+                                return Err(DhcpError::Protocol("IPC closed by parent".to_string()));
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -342,7 +283,7 @@ impl DhcpClientInternal {
                 ));
             }
 
-            let (retry_interval, dest_ip, in_rebinding) =
+            let (retry_interval, _dest_ip, in_rebinding) =
                 calculate_renewal_params(current_elapsed, t2_secs, lease_secs, server_ip);
 
             let should_send = match renew_sent {
@@ -351,12 +292,14 @@ impl DhcpClientInternal {
             };
 
             if should_send {
-                if in_rebinding {
-                    debug!("[dhcp-client] REBINDING: sending broadcast DHCPREQUEST...");
+                let target_server_ip = if in_rebinding {
+                    debug!("[dhcp-client] REBINDING: broadcasting DHCPREQUEST...");
+                    None
                 } else {
-                    debug!("[dhcp-client] RENEWING: sending unicast DHCPREQUEST to server...");
-                }
-                self.send_request(renew_xid, ip, None, ip, dest_ip).await;
+                    debug!("[dhcp-client] RENEWING: unicasting DHCPREQUEST to server...");
+                    server_ip
+                };
+                self.send_request(renew_xid, ip, target_server_ip, ip).await;
                 renew_sent = Some(Instant::now());
             }
 
@@ -377,12 +320,8 @@ impl DhcpClientInternal {
         }
     }
 
-    async fn wait_for_offer(
-        &self,
-        xid: u32,
-        timeout: std::time::Duration,
-    ) -> Result<Option<DhcpOffer>, DhcpError> {
-        let start = std::time::Instant::now();
+    async fn recv_dhcp_packet(&self, timeout: Duration) -> Result<Option<Message>, DhcpError> {
+        let start = Instant::now();
 
         while start.elapsed() < timeout {
             let remaining = timeout.saturating_sub(start.elapsed());
@@ -390,8 +329,39 @@ impl DhcpClientInternal {
                 break;
             }
 
-            let Some(dhcp) = self.socket.recv(remaining).await? else {
-                break; // Timeout
+            match tokio::time::timeout(remaining, self.ipc.recv()).await {
+                Ok(Ok(Some(DhcpClientParentToWorkerMsg::RawPacket { frame }))) => {
+                    if let Some(dhcp) = parse_dhcp_payload(&frame, dhcproto::v4::CLIENT_PORT)
+                        .filter(|d| d.chaddr().starts_with(&self.mac.octets()))
+                    {
+                        return Ok(Some(dhcp));
+                    }
+                }
+                Ok(Ok(None)) => {
+                    return Err(DhcpError::Protocol("IPC closed by parent".to_string()));
+                }
+                Ok(Err(e)) => return Err(DhcpError::Io(e)),
+                Err(_) => break,
+            }
+        }
+        Ok(None)
+    }
+
+    async fn wait_for_offer(
+        &self,
+        xid: u32,
+        timeout: std::time::Duration,
+    ) -> Result<Option<DhcpOffer>, DhcpError> {
+        let start = Instant::now();
+
+        while start.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let Some(dhcp) = self.recv_dhcp_packet(remaining).await? else {
+                break;
             };
 
             if let Some(offer) = parse_offer(&dhcp, xid) {
@@ -406,7 +376,7 @@ impl DhcpClientInternal {
         xid: u32,
         timeout: std::time::Duration,
     ) -> Result<Option<ParseAckResult>, DhcpError> {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         while start.elapsed() < timeout {
             let remaining = timeout.saturating_sub(start.elapsed());
@@ -414,8 +384,8 @@ impl DhcpClientInternal {
                 break;
             }
 
-            let Some(dhcp) = self.socket.recv(remaining).await? else {
-                break; // Timeout
+            let Some(dhcp) = self.recv_dhcp_packet(remaining).await? else {
+                break;
             };
 
             let res = parse_ack_nak(&dhcp, xid);
@@ -424,14 +394,6 @@ impl DhcpClientInternal {
             }
         }
         Ok(None)
-    }
-
-    async fn send_dhcp_message(
-        &self,
-        message: dhcproto::v4::Message,
-        dest_ip: Ipv4Addr,
-    ) -> Result<(), DhcpError> {
-        self.socket.send(&message, dest_ip).await
     }
 
     async fn apply_lease_config(
@@ -463,9 +425,8 @@ impl DhcpClientInternal {
     }
 
     async fn send_discover(&self, xid: u32) {
-        let discover = build_discover_message(self.mac, xid);
-        let dest_ip = Ipv4Addr::BROADCAST;
-        if let Err(e) = self.send_dhcp_message(discover, dest_ip).await {
+        let msg = DhcpClientToParentMsg::SendDiscover { xid };
+        if let Err(e) = self.ipc.send(&msg).await {
             error!("[dhcp-client] Failed to send DHCPDISCOVER: {}", e);
         } else {
             debug!("[dhcp-client] Sent DHCPDISCOVER (xid: {}).", xid);
@@ -478,21 +439,25 @@ impl DhcpClientInternal {
         requested_ip: Ipv4Addr,
         server_ip: Option<Ipv4Addr>,
         ciaddr: Ipv4Addr,
-        dest_ip: Ipv4Addr,
     ) {
-        let request = build_request_message(self.mac, xid, requested_ip, server_ip, ciaddr);
-        if let Err(e) = self.send_dhcp_message(request, dest_ip).await {
+        let msg = DhcpClientToParentMsg::SendRequest {
+            xid,
+            requested_ip,
+            server_ip,
+            ciaddr,
+        };
+        if let Err(e) = self.ipc.send(&msg).await {
             error!("[dhcp-client] Failed to send DHCPREQUEST: {}", e);
         } else {
             debug!(
-                "[dhcp-client] Sent DHCPREQUEST (ciaddr: {}, dest_ip: {}).",
-                ciaddr, dest_ip
+                "[dhcp-client] Sent DHCPREQUEST (ciaddr: {}, requested_ip: {}).",
+                ciaddr, requested_ip
             );
         }
     }
 }
 
-fn build_discover_message(mac: MacAddr, xid: u32) -> Message {
+pub(crate) fn build_discover_message(mac: MacAddr, xid: u32) -> Message {
     let mut discover = Message::default();
     discover.set_opcode(Opcode::BootRequest);
     discover.set_xid(xid);
@@ -513,7 +478,7 @@ fn build_discover_message(mac: MacAddr, xid: u32) -> Message {
     discover
 }
 
-fn build_request_message(
+pub(crate) fn build_request_message(
     mac: MacAddr,
     xid: u32,
     requested_ip: Ipv4Addr,
@@ -545,30 +510,22 @@ fn build_request_message(
 
 pub async fn run_dhcp_client_worker(
     ipc_fd: OwnedFd,
-    raw_socket_fd: OwnedFd,
     wan_interface: String,
 ) -> Result<(), std::io::Error> {
-    let socket = RawPacketSocket::from_owned_fd(raw_socket_fd)?;
     let mac = match get_interface_mac(&wan_interface).await {
         Ok(m) => m,
         Err(e) => {
             return Err(std::io::Error::other(e));
         }
     };
-    let client_socket = DhcpClientSocket::from_raw_socket(socket, mac);
 
     run_sandboxed_worker(
         DHCP_CLIENT_SERVICE_NAME,
         DHCP_CLIENT_UID,
         DHCP_CLIENT_GID,
         ipc_fd,
-        |ipc: IpcEndpoint<DhcpClientToParentMsg>| async move {
-            let client = DhcpClientInternal {
-                socket: client_socket,
-                mac,
-                ipc,
-            };
-
+        |ipc: IpcEndpoint<DhcpClientParentToWorkerMsg>| async move {
+            let client = DhcpClientInternal { mac, ipc };
             client.run().await;
             Ok(())
         },

@@ -28,7 +28,7 @@ impl<InMsg: for<'a> Deserialize<'a>> IpcEndpoint<InMsg> {
     }
 
     pub async fn recv(&self) -> Result<Option<InMsg>, std::io::Error> {
-        let mut buf = [0u8; MAX_IPC_MSG_LEN];
+        let mut buf = vec![0u8; MAX_IPC_MSG_LEN];
         let info = self.socket.recv(&mut buf).await?;
         if info.bytes_read() == 0 {
             return Ok(None);
@@ -102,7 +102,15 @@ pub struct DhcpLeaseInfo {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum DhcpClientParentToWorkerMsg {
+    RawPacket { frame: Vec<u8> },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DhcpServerParentToWorkerMsg {
+    RawPacket {
+        frame: Vec<u8>,
+    },
     AddNeighbor {
         ip_address: Ipv4Addr,
         mac_address: MacAddr,
@@ -114,13 +122,48 @@ pub enum DhcpServerParentToWorkerMsg {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DhcpServerWorkerToParentMsg {
-    Heartbeat { leases: Vec<DhcpLeaseInfo> },
-    RegisterLocalHost { name: String, ip: Ipv4Addr },
-    DeregisterLocalHost { name: String },
+    SendOffer {
+        client_mac: MacAddr,
+        xid: u32,
+        offered_ip: Ipv4Addr,
+        broadcast: bool,
+    },
+    SendAck {
+        client_mac: MacAddr,
+        xid: u32,
+        leased_ip: Ipv4Addr,
+        broadcast: bool,
+    },
+    SendNak {
+        client_mac: MacAddr,
+        xid: u32,
+    },
+    ProbeArpConflict {
+        target_ip: Ipv4Addr,
+    },
+    Heartbeat {
+        leases: Vec<DhcpLeaseInfo>,
+    },
+    RegisterLocalHost {
+        name: String,
+        ip: Ipv4Addr,
+    },
+    DeregisterLocalHost {
+        name: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DhcpClientToParentMsg {
+    SendDiscover {
+        xid: u32,
+    },
+    SendRequest {
+        xid: u32,
+        requested_ip: Ipv4Addr,
+        server_ip: Option<Ipv4Addr>,
+        ciaddr: Ipv4Addr,
+    },
     ApplyWanLease {
         ip_address: Ipv4Addr,
         prefix_len: u8,
@@ -271,6 +314,76 @@ mod tests {
             .unwrap();
         let received: DhcpClientToParentMsg = parent_ipc.recv().await.unwrap().unwrap();
         assert_eq!(received, DhcpClientToParentMsg::Heartbeat);
+
+        // 9. New DHCP Client IPC messages
+        let discover_msg = DhcpClientToParentMsg::SendDiscover { xid: 0x12345678 };
+        child_ipc.send(&discover_msg).await.unwrap();
+        let received = parent_ipc.recv().await.unwrap().unwrap();
+        assert_eq!(received, discover_msg);
+
+        let req_msg = DhcpClientToParentMsg::SendRequest {
+            xid: 0x12345678,
+            requested_ip: Ipv4Addr::new(10, 0, 2, 15),
+            server_ip: Some(Ipv4Addr::new(10, 0, 2, 2)),
+            ciaddr: Ipv4Addr::UNSPECIFIED,
+        };
+        child_ipc.send(&req_msg).await.unwrap();
+        let received = parent_ipc.recv().await.unwrap().unwrap();
+        assert_eq!(received, req_msg);
+
+        let (parent_wan_ipc, child_wan_fd) =
+            create_ipc_channel::<DhcpClientParentToWorkerMsg>().unwrap();
+        let child_wan_ipc: IpcEndpoint<DhcpClientParentToWorkerMsg> =
+            IpcEndpoint::from_owned_fd(child_wan_fd).unwrap();
+        let raw_pkt_msg = DhcpClientParentToWorkerMsg::RawPacket {
+            frame: vec![1, 2, 3, 4, 5],
+        };
+        parent_wan_ipc.send(&raw_pkt_msg).await.unwrap();
+        let received = child_wan_ipc.recv().await.unwrap().unwrap();
+        assert_eq!(received, raw_pkt_msg);
+
+        // 10. New DHCP Server IPC messages
+        let offer_msg = DhcpServerWorkerToParentMsg::SendOffer {
+            client_mac: MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),
+            xid: 0x87654321,
+            offered_ip: Ipv4Addr::new(192, 168, 1, 150),
+            broadcast: false,
+        };
+        child_server_ipc.send(&offer_msg).await.unwrap();
+        let received = parent_server_ipc.recv().await.unwrap().unwrap();
+        assert_eq!(received, offer_msg);
+
+        let ack_msg = DhcpServerWorkerToParentMsg::SendAck {
+            client_mac: MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),
+            xid: 0x87654321,
+            leased_ip: Ipv4Addr::new(192, 168, 1, 150),
+            broadcast: false,
+        };
+        child_server_ipc.send(&ack_msg).await.unwrap();
+        let received = parent_server_ipc.recv().await.unwrap().unwrap();
+        assert_eq!(received, ack_msg);
+
+        let nak_msg = DhcpServerWorkerToParentMsg::SendNak {
+            client_mac: MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),
+            xid: 0x87654321,
+        };
+        child_server_ipc.send(&nak_msg).await.unwrap();
+        let received = parent_server_ipc.recv().await.unwrap().unwrap();
+        assert_eq!(received, nak_msg);
+
+        let probe_msg = DhcpServerWorkerToParentMsg::ProbeArpConflict {
+            target_ip: Ipv4Addr::new(192, 168, 1, 150),
+        };
+        child_server_ipc.send(&probe_msg).await.unwrap();
+        let received = parent_server_ipc.recv().await.unwrap().unwrap();
+        assert_eq!(received, probe_msg);
+
+        let srv_raw_pkt = DhcpServerParentToWorkerMsg::RawPacket {
+            frame: vec![6, 7, 8, 9],
+        };
+        parent_server_ipc.send(&srv_raw_pkt).await.unwrap();
+        let received = child_server_ipc.recv().await.unwrap().unwrap();
+        assert_eq!(received, srv_raw_pkt);
     }
 
     #[tokio::test]

@@ -1,15 +1,20 @@
 use super::worker::DhcpError;
 use crate::init::watchdog::{HeartbeatSender, MonitoredService, send_service_heartbeat};
+use crate::packet::build_raw_packet;
 use crate::services::DHCP_CLIENT_SERVICE_NAME;
-use crate::services::ipc::{DhcpClientToParentMsg, IpcEndpoint};
+use crate::services::ipc::{DhcpClientParentToWorkerMsg, DhcpClientToParentMsg, IpcEndpoint};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{
-    CleanOption, WanLease, WanLeaseSender, mask_to_prefix_len, prefix_len_to_mask,
-    setup_worker_sockets, terminate_worker,
+    CleanOption, WanLease, WanLeaseSender, get_interface_mac, mask_to_prefix_len,
+    prefix_len_to_mask, read_raw_packet, send_raw_packet, setup_worker_sockets, terminate_worker,
 };
+use dhcproto::{Encodable, Encoder};
 use ipnet::Ipv4Net;
 use log::{error, info, warn};
+use pnet::util::MacAddr;
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::io::OwnedFd;
+use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 
 pub struct DhcpClient {
@@ -97,6 +102,7 @@ async fn clear_parent_lease(lease_tx: &WanLeaseSender, wan_interface: &str) {
 
 fn start_parent_supervisor_task(
     parent_ipc: IpcEndpoint<DhcpClientToParentMsg>,
+    raw_socket_fd: OwnedFd,
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
@@ -104,6 +110,7 @@ fn start_parent_supervisor_task(
 ) -> Result<JoinHandle<()>, ServiceError> {
     let handle = tokio::spawn(run_parent_dhcp_monitor(
         parent_ipc,
+        raw_socket_fd,
         child_pid,
         wan_interface,
         lease_tx,
@@ -113,8 +120,117 @@ fn start_parent_supervisor_task(
     Ok(handle)
 }
 
+async fn handle_send_discover(async_sock: &AsyncFd<OwnedFd>, wan_mac: MacAddr, xid: u32) {
+    let discover = super::worker::build_discover_message(wan_mac, xid);
+    let mut payload = Vec::new();
+    if let Err(e) = discover.encode(&mut Encoder::new(&mut payload)) {
+        error!("[dhcp-client-parent] Failed to encode DHCPDISCOVER: {}", e);
+        return;
+    }
+    match build_raw_packet(
+        wan_mac,
+        MacAddr::broadcast(),
+        Ipv4Addr::UNSPECIFIED,
+        Ipv4Addr::BROADCAST,
+        dhcproto::v4::CLIENT_PORT,
+        dhcproto::v4::SERVER_PORT,
+        &payload,
+    ) {
+        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Err(e) => error!(
+            "[dhcp-client-parent] Failed to build discover packet: {}",
+            e
+        ),
+    }
+}
+
+async fn handle_send_request(
+    async_sock: &AsyncFd<OwnedFd>,
+    wan_mac: MacAddr,
+    xid: u32,
+    requested_ip: Ipv4Addr,
+    server_ip: Option<Ipv4Addr>,
+    ciaddr: Ipv4Addr,
+) {
+    let request =
+        super::worker::build_request_message(wan_mac, xid, requested_ip, server_ip, ciaddr);
+    let mut payload = Vec::new();
+    if let Err(e) = request.encode(&mut Encoder::new(&mut payload)) {
+        error!("[dhcp-client-parent] Failed to encode DHCPREQUEST: {}", e);
+        return;
+    }
+    let (src_ip, dest_ip) = if ciaddr.is_unspecified() {
+        (Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST)
+    } else {
+        (ciaddr, server_ip.unwrap_or(Ipv4Addr::BROADCAST))
+    };
+    match build_raw_packet(
+        wan_mac,
+        MacAddr::broadcast(),
+        src_ip,
+        dest_ip,
+        dhcproto::v4::CLIENT_PORT,
+        dhcproto::v4::SERVER_PORT,
+        &payload,
+    ) {
+        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Err(e) => error!("[dhcp-client-parent] Failed to build request packet: {}", e),
+    }
+}
+
+async fn handle_client_ipc_msg(
+    msg: DhcpClientToParentMsg,
+    async_sock: &AsyncFd<OwnedFd>,
+    wan_mac: MacAddr,
+    wan_interface: &str,
+    lease_tx: &WanLeaseSender,
+    heartbeat_tx: Option<&HeartbeatSender>,
+) {
+    match msg {
+        DhcpClientToParentMsg::SendDiscover { xid } => {
+            send_service_heartbeat(heartbeat_tx, MonitoredService::DhcpClient);
+            handle_send_discover(async_sock, wan_mac, xid).await;
+        }
+        DhcpClientToParentMsg::SendRequest {
+            xid,
+            requested_ip,
+            server_ip,
+            ciaddr,
+        } => {
+            send_service_heartbeat(heartbeat_tx, MonitoredService::DhcpClient);
+            handle_send_request(async_sock, wan_mac, xid, requested_ip, server_ip, ciaddr).await;
+        }
+        DhcpClientToParentMsg::ApplyWanLease {
+            ip_address,
+            prefix_len,
+            gateway,
+            dns_servers,
+        } => {
+            send_service_heartbeat(heartbeat_tx, MonitoredService::DhcpClient);
+            let mask = prefix_len_to_mask(prefix_len);
+            apply_parent_lease(
+                lease_tx,
+                wan_interface,
+                ip_address,
+                mask,
+                gateway,
+                dns_servers,
+            )
+            .await;
+        }
+        DhcpClientToParentMsg::Heartbeat => {
+            send_service_heartbeat(heartbeat_tx, MonitoredService::DhcpClient);
+        }
+        DhcpClientToParentMsg::ClearWanLease => {
+            send_service_heartbeat(heartbeat_tx, MonitoredService::DhcpClient);
+            clear_parent_lease(lease_tx, wan_interface).await;
+        }
+    }
+}
+
 async fn run_parent_dhcp_monitor(
     ipc: IpcEndpoint<DhcpClientToParentMsg>,
+    raw_socket_fd: OwnedFd,
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
@@ -124,40 +240,69 @@ async fn run_parent_dhcp_monitor(
         "[dhcp-client-parent] Supervising DHCP client worker (PID {})",
         child_pid
     );
+    let wan_mac = match get_interface_mac(&wan_interface).await {
+        Ok(m) => m,
+        Err(e) => {
+            error!(
+                "[dhcp-client-parent] Failed to get WAN interface MAC: {}",
+                e
+            );
+            terminate_worker(child_pid).await;
+            return;
+        }
+    };
+    let async_sock = match AsyncFd::new(raw_socket_fd) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(
+                "[dhcp-client-parent] Failed to wrap raw socket in AsyncFd: {}",
+                e
+            );
+            terminate_worker(child_pid).await;
+            return;
+        }
+    };
+
+    let mut raw_buf = [0u8; 2048];
     loop {
-        match ipc.recv().await {
-            Ok(Some(DhcpClientToParentMsg::ApplyWanLease {
-                ip_address,
-                prefix_len,
-                gateway,
-                dns_servers,
-            })) => {
-                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::DhcpClient);
-                let mask = prefix_len_to_mask(prefix_len);
-                apply_parent_lease(
-                    &lease_tx,
-                    &wan_interface,
-                    ip_address,
-                    mask,
-                    gateway,
-                    dns_servers,
-                )
-                .await;
+        tokio::select! {
+            read_res = read_raw_packet(&async_sock, &mut raw_buf) => {
+                match read_res {
+                    Ok(n) => {
+                        let frame = raw_buf[..n].to_vec();
+                        let msg = DhcpClientParentToWorkerMsg::RawPacket { frame };
+                        if let Err(e) = ipc.send(&msg).await {
+                            error!("[dhcp-client-parent] Failed to forward raw packet: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[dhcp-client-parent] Socket read error: {}. Continuing.", e);
+                    }
+                }
             }
-            Ok(Some(DhcpClientToParentMsg::Heartbeat)) => {
-                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::DhcpClient);
-            }
-            Ok(Some(DhcpClientToParentMsg::ClearWanLease)) => {
-                send_service_heartbeat(heartbeat_tx.as_ref(), MonitoredService::DhcpClient);
-                clear_parent_lease(&lease_tx, &wan_interface).await;
-            }
-            Ok(None) => {
-                info!("[dhcp-client-parent] Worker IPC socket closed.");
-                break;
-            }
-            Err(e) => {
-                error!("[dhcp-client-parent] IPC recv error: {}", e);
-                break;
+            ipc_msg = ipc.recv() => {
+                match ipc_msg {
+                    Ok(Some(msg)) => {
+                        handle_client_ipc_msg(
+                            msg,
+                            &async_sock,
+                            wan_mac,
+                            &wan_interface,
+                            &lease_tx,
+                            heartbeat_tx.as_ref(),
+                        )
+                        .await;
+                    }
+                    Ok(None) => {
+                        info!("[dhcp-client-parent] Worker IPC socket closed.");
+                        break;
+                    }
+                    Err(e) => {
+                        error!("[dhcp-client-parent] IPC recv error: {}", e);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -170,7 +315,7 @@ fn setup_dhcp_client_attempt(
 ) -> Result<
     (
         crate::cli::WorkerService,
-        IpcEndpoint<DhcpClientToParentMsg>,
+        (IpcEndpoint<DhcpClientToParentMsg>, OwnedFd),
     ),
     ServiceError,
 > {
@@ -179,11 +324,10 @@ fn setup_dhcp_client_attempt(
 
     let worker_service = crate::cli::WorkerService::DhcpClient {
         ipc_fd: child_ipc.into(),
-        raw_socket_fd: raw_socket_fd.into(),
         wan_interface: wan_interface.to_string(),
     };
 
-    Ok((worker_service, parent_ipc))
+    Ok((worker_service, (parent_ipc, raw_socket_fd)))
 }
 
 impl Service for DhcpClient {
@@ -195,9 +339,10 @@ impl Service for DhcpClient {
 
         self.state.start_supervised(
             move || setup_dhcp_client_attempt(&wan_interface_setup),
-            move |parent_ipc, child_pid, _shutdown_rx| {
+            move |(parent_ipc, raw_socket_fd), child_pid, _shutdown_rx| {
                 start_parent_supervisor_task(
                     parent_ipc,
+                    raw_socket_fd,
                     child_pid,
                     wan_interface.clone(),
                     lease_tx.clone(),

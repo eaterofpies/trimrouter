@@ -148,16 +148,12 @@ pub enum WorkerService {
     DhcpClient {
         #[arg(value_parser = parse_cli_fd)]
         ipc_fd: CliFd,
-        #[arg(value_parser = parse_cli_fd)]
-        raw_socket_fd: CliFd,
         wan_interface: String,
     },
     #[command(name = "dhcp-server")]
     DhcpServer {
         #[arg(value_parser = parse_cli_fd)]
         ipc_fd: CliFd,
-        #[arg(value_parser = parse_cli_fd)]
-        raw_socket_fd: CliFd,
         wan_interface: String,
         lan_ip: String,
     },
@@ -188,24 +184,17 @@ impl WorkerService {
             }
             Self::DhcpClient {
                 ipc_fd,
-                raw_socket_fd,
                 wan_interface,
             } => {
-                vec![
-                    ipc_fd.as_raw_fd().to_string(),
-                    raw_socket_fd.as_raw_fd().to_string(),
-                    wan_interface.clone(),
-                ]
+                vec![ipc_fd.as_raw_fd().to_string(), wan_interface.clone()]
             }
             Self::DhcpServer {
                 ipc_fd,
-                raw_socket_fd,
                 wan_interface,
                 lan_ip,
             } => {
                 vec![
                     ipc_fd.as_raw_fd().to_string(),
-                    raw_socket_fd.as_raw_fd().to_string(),
                     wan_interface.clone(),
                     lan_ip.clone(),
                 ]
@@ -232,16 +221,8 @@ impl WorkerService {
                 ipc_fd,
                 ntp_socket_fd,
             } => vec![ipc_fd.as_fd(), ntp_socket_fd.as_fd()],
-            Self::DhcpClient {
-                ipc_fd,
-                raw_socket_fd,
-                ..
-            } => vec![ipc_fd.as_fd(), raw_socket_fd.as_fd()],
-            Self::DhcpServer {
-                ipc_fd,
-                raw_socket_fd,
-                ..
-            } => vec![ipc_fd.as_fd(), raw_socket_fd.as_fd()],
+            Self::DhcpClient { ipc_fd, .. } => vec![ipc_fd.as_fd()],
+            Self::DhcpServer { ipc_fd, .. } => vec![ipc_fd.as_fd()],
             Self::DnsForwarder {
                 ipc_fd,
                 dns_socket_fd,
@@ -264,30 +245,26 @@ mod tests {
 
     #[test]
     fn test_worker_multicall_parsing() {
-        let (s1, s2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
         let fd1 = s1.into_raw_fd();
-        let fd2 = s2.into_raw_fd();
 
         let args1 = vec![
             "trimrouter".to_string(),
             "worker".to_string(),
             "dhcp-client".to_string(),
             fd1.to_string(),
-            fd2.to_string(),
             "eth0".to_string(),
         ];
         assert!(Cli::try_parse_from(&args1).is_ok());
 
-        let (s3, s4) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (s3, _s4) = std::os::unix::net::UnixStream::pair().unwrap();
         let fd3 = s3.into_raw_fd();
-        let fd4 = s4.into_raw_fd();
 
         let args2 = vec![
             "/bin/trimrouter".to_string(),
             "worker".to_string(),
             "dhcp-client".to_string(),
             fd3.to_string(),
-            fd4.to_string(),
             "eth0".to_string(),
         ];
         assert!(Cli::try_parse_from(&args2).is_ok());
@@ -369,38 +346,28 @@ mod tests {
         assert_eq!(sntp.child_fds().len(), 2);
 
         // DhcpClient
-        let (dc1, dc2) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (dc_raw1, dc_raw2) = (dc1.as_raw_fd().to_string(), dc2.as_raw_fd().to_string());
+        let (dc1, _dc2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let dc_raw1 = dc1.as_raw_fd().to_string();
         let dhcp_cli = WorkerService::DhcpClient {
             ipc_fd: CliFd(dc1.into()),
-            raw_socket_fd: CliFd(dc2.into()),
             wan_interface: "wan0".to_string(),
         };
-        assert_eq!(
-            dhcp_cli.to_args(),
-            vec![dc_raw1, dc_raw2, "wan0".to_string()]
-        );
-        assert_eq!(dhcp_cli.child_fds().len(), 2);
+        assert_eq!(dhcp_cli.to_args(), vec![dc_raw1, "wan0".to_string()]);
+        assert_eq!(dhcp_cli.child_fds().len(), 1);
 
         // DhcpServer
-        let (ds1, ds2) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (ds_raw1, ds_raw2) = (ds1.as_raw_fd().to_string(), ds2.as_raw_fd().to_string());
+        let (ds1, _ds2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ds_raw1 = ds1.as_raw_fd().to_string();
         let dhcp_srv = WorkerService::DhcpServer {
             ipc_fd: CliFd(ds1.into()),
-            raw_socket_fd: CliFd(ds2.into()),
             wan_interface: "lan0".to_string(),
             lan_ip: "192.168.1.1/24".to_string(),
         };
         assert_eq!(
             dhcp_srv.to_args(),
-            vec![
-                ds_raw1,
-                ds_raw2,
-                "lan0".to_string(),
-                "192.168.1.1/24".to_string()
-            ]
+            vec![ds_raw1, "lan0".to_string(), "192.168.1.1/24".to_string()]
         );
-        assert_eq!(dhcp_srv.child_fds().len(), 2);
+        assert_eq!(dhcp_srv.child_fds().len(), 1);
 
         // DnsForwarder
         let dns = WorkerService::DnsForwarder {

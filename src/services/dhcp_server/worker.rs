@@ -1,9 +1,8 @@
-use crate::packet::build_raw_packet;
 use crate::services::DHCP_SERVER_SERVICE_NAME;
 use crate::services::ipc::{DhcpServerParentToWorkerMsg, DhcpServerWorkerToParentMsg, IpcEndpoint};
 use crate::services::utils::{
-    CleanOption, DHCP_SERVER_GID, DHCP_SERVER_UID, get_interface_mac, parse_dhcp_payload,
-    read_raw_packet, run_sandboxed_worker, sanitize_hostname, send_raw_packet,
+    CleanOption, DHCP_SERVER_GID, DHCP_SERVER_UID, parse_dhcp_payload, run_sandboxed_worker,
+    sanitize_hostname,
 };
 use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode, OptionCode};
 use dhcproto::{Encodable, Encoder};
@@ -14,14 +13,13 @@ use std::net::Ipv4Addr;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::unix::AsyncFd;
 use tokio::time::interval;
 
 use super::lease_table::{LeaseHandle, spawn_lease_actor};
 
-const LAN_LEASE_SECS: u32 = 3600;
+pub(crate) const LAN_LEASE_SECS: u32 = 3600;
 const ARP_RESOLUTION_DELAY: Duration = Duration::from_millis(100);
-const DISCARD_PORT: u16 = 9;
+pub(crate) const DISCARD_PORT: u16 = 9;
 const CONFLICT_HOLD_DURATION: Duration = Duration::from_secs(300);
 const SERVER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -34,14 +32,11 @@ const SERVER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 /// individual fields as function arguments.
 struct ServerConfig {
     server_ip: Ipv4Addr,
-    subnet_mask: Ipv4Addr,
-    server_mac: MacAddr,
     net: ipnet::Ipv4Net,
 }
 
 pub async fn run_dhcp_server_worker(
     ipc_fd: OwnedFd,
-    raw_socket_fd: OwnedFd,
     lan_interface: String,
     lan_ip: String,
 ) -> Result<(), std::io::Error> {
@@ -52,12 +47,7 @@ pub async fn run_dhcp_server_worker(
         )
     })?;
     let server_ip = net.addr();
-    let subnet_mask = net.netmask();
-
-    let mac = get_interface_mac(&lan_interface)
-        .await
-        .map_err(std::io::Error::other)?;
-    let async_sock = AsyncFd::new(raw_socket_fd)?;
+    let _ = lan_interface;
 
     run_sandboxed_worker(
         DHCP_SERVER_SERVICE_NAME,
@@ -68,15 +58,9 @@ pub async fn run_dhcp_server_worker(
             let leases = spawn_lease_actor();
             sync_initial_static_leases(&ipc, &leases).await?;
 
-            let config = Arc::new(ServerConfig {
-                server_ip,
-                subnet_mask,
-                server_mac: mac,
-                net,
-            });
+            let config = Arc::new(ServerConfig { server_ip, net });
 
-            let async_sock_shared = Arc::new(async_sock);
-            let _ = run_server_loop(async_sock_shared, config, leases, ipc).await;
+            let _ = run_server_loop(config, leases, ipc).await;
             Ok(())
         },
     )
@@ -124,12 +108,10 @@ async fn sync_initial_static_leases(
 }
 
 async fn run_server_loop(
-    async_sock: Arc<AsyncFd<OwnedFd>>,
     config: Arc<ServerConfig>,
     leases: LeaseHandle,
     ipc: IpcEndpoint<DhcpServerParentToWorkerMsg>,
 ) -> Result<(), std::io::Error> {
-    let mut buf = [0u8; 2048];
     let mut heartbeat_timer = interval(SERVER_HEARTBEAT_INTERVAL);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<DhcpServerWorkerToParentMsg>(32);
 
@@ -161,6 +143,21 @@ async fn run_server_loop(
             }
             ipc_msg = ipc.recv() => {
                 match ipc_msg {
+                    Ok(Some(DhcpServerParentToWorkerMsg::RawPacket { frame })) => {
+                        let config_clone = Arc::clone(&config);
+                        let leases_clone = leases.clone();
+                        let event_tx_clone = event_tx.clone();
+
+                        tokio::spawn(async move {
+                            process_incoming_packet(
+                                frame,
+                                config_clone,
+                                leases_clone,
+                                event_tx_clone,
+                            )
+                            .await;
+                        });
+                    }
                     Ok(Some(DhcpServerParentToWorkerMsg::AddNeighbor {
                         ip_address,
                         mac_address,
@@ -182,31 +179,6 @@ async fn run_server_loop(
                     }
                 }
             }
-            read_res = read_raw_packet(&async_sock, &mut buf) => {
-                match read_res {
-                    Ok(bytes_read) => {
-                        let pkt_data = buf[..bytes_read].to_vec();
-                        let async_sock_clone = Arc::clone(&async_sock);
-                        let config_clone = Arc::clone(&config);
-                        let leases_clone = leases.clone();
-                        let event_tx_clone = event_tx.clone();
-
-                        tokio::spawn(async move {
-                            process_incoming_packet(
-                                pkt_data,
-                                async_sock_clone,
-                                config_clone,
-                                leases_clone,
-                                event_tx_clone,
-                            )
-                            .await;
-                        });
-                    }
-                    Err(e) => {
-                        warn!("[dhcp-server] Socket read error: {}. Continuing.", e);
-                    }
-                }
-            }
         }
     }
     Ok(())
@@ -214,7 +186,6 @@ async fn run_server_loop(
 
 async fn process_incoming_packet(
     buf: Vec<u8>,
-    async_sock: Arc<AsyncFd<OwnedFd>>,
     config: Arc<ServerConfig>,
     leases: LeaseHandle,
     ipc_tx: tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
@@ -254,10 +225,10 @@ async fn process_incoming_packet(
 
     match msg_type {
         MessageType::Discover => {
-            handle_dhcp_discover(async_sock, &config, &dhcp, client_mac, leases).await;
+            handle_dhcp_discover(&config, &dhcp, client_mac, leases, &ipc_tx).await;
         }
         MessageType::Request => {
-            handle_dhcp_request(async_sock, &config, &dhcp, client_mac, leases, ipc_tx).await;
+            handle_dhcp_request(&config, &dhcp, client_mac, leases, &ipc_tx).await;
         }
         MessageType::Decline | MessageType::Release => {
             let label = if msg_type == MessageType::Decline {
@@ -308,35 +279,34 @@ fn should_process_request_server_id(dhcp: &Message, server_ip: Ipv4Addr) -> bool
     }
 }
 
-/// Builds and encodes the common DHCPOFFER / DHCPACK payload, differing only
-/// in `msg_type`. Returns the encoded bytes or an error string.
-fn build_dhcp_reply_payload(
+pub(crate) fn build_dhcp_reply_payload(
     msg_type: MessageType,
-    dhcp: &Message,
+    client_mac: MacAddr,
+    xid: u32,
+    broadcast: bool,
     leased_ip: Ipv4Addr,
-    config: &ServerConfig,
+    server_ip: Ipv4Addr,
+    subnet_mask: Ipv4Addr,
 ) -> Result<Vec<u8>, String> {
     let mut reply = Message::default();
     reply.set_opcode(Opcode::BootReply);
-    reply.set_xid(dhcp.xid());
-    reply.set_flags(dhcp.flags());
+    reply.set_xid(xid);
+    if broadcast {
+        reply.set_flags(dhcproto::v4::Flags::default().set_broadcast());
+    }
     reply.set_yiaddr(leased_ip);
-    reply.set_siaddr(config.server_ip);
-    reply.set_chaddr(dhcp.chaddr());
+    reply.set_siaddr(server_ip);
+    reply.set_chaddr(&client_mac.octets());
 
     reply.opts_mut().insert(DhcpOption::MessageType(msg_type));
     reply
         .opts_mut()
-        .insert(DhcpOption::ServerIdentifier(config.server_ip));
+        .insert(DhcpOption::ServerIdentifier(server_ip));
+    reply.opts_mut().insert(DhcpOption::SubnetMask(subnet_mask));
+    reply.opts_mut().insert(DhcpOption::Router(vec![server_ip]));
     reply
         .opts_mut()
-        .insert(DhcpOption::SubnetMask(config.subnet_mask));
-    reply
-        .opts_mut()
-        .insert(DhcpOption::Router(vec![config.server_ip]));
-    reply
-        .opts_mut()
-        .insert(DhcpOption::DomainNameServer(vec![config.server_ip]));
+        .insert(DhcpOption::DomainNameServer(vec![server_ip]));
     reply
         .opts_mut()
         .insert(DhcpOption::AddressLeaseTime(LAN_LEASE_SECS));
@@ -348,78 +318,37 @@ fn build_dhcp_reply_payload(
     Ok(payload)
 }
 
-async fn send_dhcp_frame(
-    async_sock: &AsyncFd<OwnedFd>,
-    config: &ServerConfig,
-    dest_mac: MacAddr,
-    dest_ip: Ipv4Addr,
-    payload: &[u8],
-) {
-    let frame = match build_raw_packet(
-        config.server_mac,
-        dest_mac,
-        config.server_ip,
-        dest_ip,
-        dhcproto::v4::SERVER_PORT,
-        dhcproto::v4::CLIENT_PORT,
-        payload,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            warn!("[dhcp-server] Failed to build raw packet frame: {}", e);
-            return;
-        }
-    };
-    send_raw_packet(async_sock, &frame).await;
-}
-
-async fn send_dhcp_nak(async_sock: &AsyncFd<OwnedFd>, dhcp: &Message, config: &ServerConfig) {
+pub(crate) fn build_dhcp_nak_payload(
+    client_mac: MacAddr,
+    xid: u32,
+    server_ip: Ipv4Addr,
+) -> Result<Vec<u8>, String> {
     let mut nak = Message::default();
     nak.set_opcode(Opcode::BootReply);
-    nak.set_xid(dhcp.xid());
-    nak.set_chaddr(dhcp.chaddr());
+    nak.set_xid(xid);
+    nak.set_chaddr(&client_mac.octets());
     nak.opts_mut()
         .insert(DhcpOption::MessageType(MessageType::Nak));
     nak.opts_mut()
-        .insert(DhcpOption::ServerIdentifier(config.server_ip));
+        .insert(DhcpOption::ServerIdentifier(server_ip));
 
     let mut payload = Vec::new();
-    if let Err(e) = nak.encode(&mut Encoder::new(&mut payload)) {
-        error!("[dhcp-server] Failed to encode DHCPNAK: {}", e);
-        return;
-    }
-
-    send_dhcp_frame(
-        async_sock,
-        config,
-        MacAddr::broadcast(),
-        Ipv4Addr::BROADCAST,
-        &payload,
-    )
-    .await;
+    nak.encode(&mut Encoder::new(&mut payload))
+        .map_err(|e| format!("Failed to encode DHCPNAK: {}", e))?;
+    Ok(payload)
 }
 
 async fn trigger_arp_resolution(
-    async_sock: &AsyncFd<OwnedFd>,
-    config: &ServerConfig,
+    event_tx: &tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
     target_ip: Ipv4Addr,
 ) {
-    if let Ok(frame) = build_raw_packet(
-        config.server_mac,
-        MacAddr::broadcast(),
-        config.server_ip,
-        target_ip,
-        DISCARD_PORT,
-        DISCARD_PORT,
-        &[0u8],
-    ) {
-        send_raw_packet(async_sock, &frame).await;
-    }
+    let msg = DhcpServerWorkerToParentMsg::ProbeArpConflict { target_ip };
+    let _ = event_tx.send(msg).await;
     tokio::time::sleep(ARP_RESOLUTION_DELAY).await;
 }
 
 async fn probe_and_allocate_ip(
-    async_sock: &AsyncFd<OwnedFd>,
+    event_tx: &tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
     config: &ServerConfig,
     client_mac: MacAddr,
     leases: &LeaseHandle,
@@ -433,7 +362,7 @@ async fn probe_and_allocate_ip(
             "[dhcp-server] Probing if IP {} is already in use on the LAN...",
             ip
         );
-        trigger_arp_resolution(async_sock, config, ip).await;
+        trigger_arp_resolution(event_tx, ip).await;
 
         if leases.check_conflict(ip, client_mac).await {
             warn!(
@@ -448,7 +377,7 @@ async fn probe_and_allocate_ip(
 }
 
 async fn find_or_allocate_discover_ip(
-    async_sock: &AsyncFd<OwnedFd>,
+    event_tx: &tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
     config: &ServerConfig,
     client_mac: MacAddr,
     leases: &LeaseHandle,
@@ -458,47 +387,23 @@ async fn find_or_allocate_discover_ip(
     if let Some(ip) = existing_ip {
         Some(ip)
     } else {
-        probe_and_allocate_ip(async_sock, config, client_mac, leases).await
+        probe_and_allocate_ip(event_tx, config, client_mac, leases).await
     }
 }
 
-async fn send_dhcp_offer_reply(
-    async_sock: &AsyncFd<OwnedFd>,
-    config: &ServerConfig,
-    dhcp: &Message,
-    client_mac: MacAddr,
-    leased_ip: Ipv4Addr,
-) {
-    let payload = match build_dhcp_reply_payload(MessageType::Offer, dhcp, leased_ip, config) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("[dhcp-server] ERROR: {}", e);
-            return;
-        }
-    };
-
-    let (dest_mac, dest_ip) = get_dest_mac_ip(dhcp.flags().broadcast(), client_mac, leased_ip);
-    send_dhcp_frame(async_sock, config, dest_mac, dest_ip, &payload).await;
-    info!(
-        "[dhcp-server] Sent DHCPOFFER of IP: {} to client.",
-        leased_ip
-    );
-}
-
 async fn handle_dhcp_discover(
-    async_sock: Arc<AsyncFd<OwnedFd>>,
     config: &ServerConfig,
     dhcp: &Message,
     client_mac: MacAddr,
     leases: LeaseHandle,
+    event_tx: &tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
 ) {
     debug!(
         "[dhcp-server] Received DHCPDISCOVER from client MAC: {}",
         client_mac
     );
 
-    let Some(leased_ip) =
-        find_or_allocate_discover_ip(&async_sock, config, client_mac, &leases).await
+    let Some(leased_ip) = find_or_allocate_discover_ip(event_tx, config, client_mac, &leases).await
     else {
         error!("[dhcp-server] DHCP IP pool exhausted!");
         return;
@@ -514,21 +419,27 @@ async fn handle_dhcp_discover(
         )
         .await;
 
-    send_dhcp_offer_reply(&async_sock, config, dhcp, client_mac, leased_ip).await;
+    let broadcast = dhcp.flags().broadcast();
+    let msg = DhcpServerWorkerToParentMsg::SendOffer {
+        client_mac,
+        xid: dhcp.xid(),
+        offered_ip: leased_ip,
+        broadcast,
+    };
+    let _ = event_tx.send(msg).await;
 }
 
 async fn verify_arp_conflict(
-    async_sock: &AsyncFd<OwnedFd>,
+    event_tx: &tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
     leased_ip: Ipv4Addr,
     client_mac: MacAddr,
-    config: &ServerConfig,
     leases: &LeaseHandle,
 ) -> bool {
     debug!(
         "[dhcp-server] Performing ARP verification for requested IP {}...",
         leased_ip
     );
-    trigger_arp_resolution(async_sock, config, leased_ip).await;
+    trigger_arp_resolution(event_tx, leased_ip).await;
 
     if leases.check_conflict(leased_ip, client_mac).await {
         warn!(
@@ -543,33 +454,12 @@ async fn verify_arp_conflict(
     false
 }
 
-async fn send_dhcp_ack(
-    async_sock: &AsyncFd<OwnedFd>,
-    dhcp: &Message,
-    client_mac: MacAddr,
-    leased_ip: Ipv4Addr,
-    config: &ServerConfig,
-) {
-    let payload = match build_dhcp_reply_payload(MessageType::Ack, dhcp, leased_ip, config) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("[dhcp-server] ERROR: {}", e);
-            return;
-        }
-    };
-
-    let (dest_mac, dest_ip) = get_dest_mac_ip(dhcp.flags().broadcast(), client_mac, leased_ip);
-    send_dhcp_frame(async_sock, config, dest_mac, dest_ip, &payload).await;
-    info!("[dhcp-server] Sent DHCPACK of IP: {} to client.", leased_ip);
-}
-
 async fn handle_dhcp_request(
-    async_sock: Arc<AsyncFd<OwnedFd>>,
     config: &ServerConfig,
     dhcp: &Message,
     client_mac: MacAddr,
     leases: LeaseHandle,
-    ipc_tx: tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
+    event_tx: &tokio::sync::mpsc::Sender<DhcpServerWorkerToParentMsg>,
 ) {
     debug!(
         "[dhcp-server] Received DHCPREQUEST from client MAC: {}",
@@ -608,24 +498,39 @@ async fn handle_dhcp_request(
             client_mac,
             CleanOption(&requested_ip_opt)
         );
-        send_dhcp_nak(&async_sock, dhcp, config).await;
+        let msg = DhcpServerWorkerToParentMsg::SendNak {
+            client_mac,
+            xid: dhcp.xid(),
+        };
+        let _ = event_tx.send(msg).await;
         return;
     };
 
     let leased_ip = confirmation.ip;
-    if verify_arp_conflict(&async_sock, leased_ip, client_mac, config, &leases).await {
-        send_dhcp_nak(&async_sock, dhcp, config).await;
+    if verify_arp_conflict(event_tx, leased_ip, client_mac, &leases).await {
+        let msg = DhcpServerWorkerToParentMsg::SendNak {
+            client_mac,
+            xid: dhcp.xid(),
+        };
+        let _ = event_tx.send(msg).await;
         return;
     }
 
-    send_dhcp_ack(&async_sock, dhcp, client_mac, leased_ip, config).await;
+    let broadcast = dhcp.flags().broadcast();
+    let msg = DhcpServerWorkerToParentMsg::SendAck {
+        client_mac,
+        xid: dhcp.xid(),
+        leased_ip,
+        broadcast,
+    };
+    let _ = event_tx.send(msg).await;
 
     if let Some(old_name) = confirmation.old_hostname_to_deregister {
         info!(
             "[dhcp-server] Deregistering previous local hostname '{}' for client MAC: {}",
             old_name, client_mac
         );
-        let _ = ipc_tx
+        let _ = event_tx
             .send(DhcpServerWorkerToParentMsg::DeregisterLocalHost { name: old_name })
             .await;
     }
@@ -635,7 +540,7 @@ async fn handle_dhcp_request(
             "[dhcp-server] Registered local hostname '{}' for IP {} (MAC: {})",
             name, leased_ip, client_mac
         );
-        let _ = ipc_tx
+        let _ = event_tx
             .send(DhcpServerWorkerToParentMsg::RegisterLocalHost {
                 name,
                 ip: leased_ip,
@@ -651,18 +556,6 @@ fn extract_sanitized_hostname(dhcp: &Message) -> Option<String> {
     }
 }
 
-fn get_dest_mac_ip(
-    broadcast: bool,
-    client_mac: MacAddr,
-    leased_ip: Ipv4Addr,
-) -> (MacAddr, Ipv4Addr) {
-    if broadcast {
-        (MacAddr::broadcast(), Ipv4Addr::BROADCAST)
-    } else {
-        (client_mac, leased_ip)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,8 +568,6 @@ mod tests {
         let net: ipnet::Ipv4Net = cidr.parse().unwrap();
         ServerConfig {
             server_ip: net.addr(),
-            subnet_mask: net.netmask(),
-            server_mac: MacAddr::new(0, 0, 0, 0, 0, 1),
             net,
         }
     }
@@ -902,9 +793,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_arp_conflict_detects_conflict() {
-        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
-        let async_sock = AsyncFd::new(OwnedFd::from(s1)).unwrap();
-        let config = make_config("192.168.1.1/24");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let leases = spawn_lease_actor();
 
         let client_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
@@ -913,10 +802,14 @@ mod tests {
 
         leases.add_neighbor(owner_mac, target_ip).await;
 
-        let is_conflict =
-            verify_arp_conflict(&async_sock, target_ip, client_mac, &config, &leases).await;
+        let is_conflict = verify_arp_conflict(&event_tx, target_ip, client_mac, &leases).await;
         assert!(is_conflict);
         assert!(leases.check_conflict(target_ip, client_mac).await);
+        let probe = event_rx.recv().await.unwrap();
+        assert_eq!(
+            probe,
+            DhcpServerWorkerToParentMsg::ProbeArpConflict { target_ip }
+        );
     }
 
     #[test]
@@ -1242,20 +1135,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_dest_mac_ip_broadcast_and_unicast() {
-        let client_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
-        let leased_ip = Ipv4Addr::new(192, 168, 1, 100);
-
-        let (b_mac, b_ip) = get_dest_mac_ip(true, client_mac, leased_ip);
-        assert_eq!(b_mac, MacAddr::broadcast());
-        assert_eq!(b_ip, Ipv4Addr::BROADCAST);
-
-        let (u_mac, u_ip) = get_dest_mac_ip(false, client_mac, leased_ip);
-        assert_eq!(u_mac, client_mac);
-        assert_eq!(u_ip, leased_ip);
-    }
-
-    #[test]
     fn test_record_multiple_conflicts_held_simultaneously() {
         let mut leases = LeaseTable::new();
         let ip1 = Ipv4Addr::new(192, 168, 1, 10);
@@ -1303,33 +1182,49 @@ mod tests {
 
     #[test]
     fn test_build_dhcp_reply_payload_offer_and_ack() {
-        let config = make_config("192.168.1.1/24");
-        let mut req = Message::default();
-        req.set_xid(0x1234);
-        req.set_chaddr(&[1, 2, 3, 4, 5, 6]);
-
+        let net: ipnet::Ipv4Net = "192.168.1.1/24".parse().unwrap();
+        let server_ip = net.addr();
+        let subnet_mask = net.netmask();
+        let client_mac = MacAddr::new(1, 2, 3, 4, 5, 6);
+        let xid = 0x1234;
         let leased_ip = Ipv4Addr::new(192, 168, 1, 100);
 
         // Test Offer payload
-        let offer_bytes =
-            build_dhcp_reply_payload(MessageType::Offer, &req, leased_ip, &config).unwrap();
+        let offer_bytes = build_dhcp_reply_payload(
+            MessageType::Offer,
+            client_mac,
+            xid,
+            false,
+            leased_ip,
+            server_ip,
+            subnet_mask,
+        )
+        .unwrap();
         let offer_msg = Message::decode(&mut Decoder::new(&offer_bytes)).unwrap();
         assert_eq!(offer_msg.opcode(), Opcode::BootReply);
         assert_eq!(offer_msg.xid(), 0x1234);
         assert_eq!(offer_msg.yiaddr(), leased_ip);
-        assert_eq!(offer_msg.siaddr(), config.server_ip);
+        assert_eq!(offer_msg.siaddr(), server_ip);
         assert_eq!(
             offer_msg.opts().get(OptionCode::MessageType),
             Some(&DhcpOption::MessageType(MessageType::Offer))
         );
         assert_eq!(
             offer_msg.opts().get(OptionCode::SubnetMask),
-            Some(&DhcpOption::SubnetMask(config.subnet_mask))
+            Some(&DhcpOption::SubnetMask(subnet_mask))
         );
 
         // Test Ack payload
-        let ack_bytes =
-            build_dhcp_reply_payload(MessageType::Ack, &req, leased_ip, &config).unwrap();
+        let ack_bytes = build_dhcp_reply_payload(
+            MessageType::Ack,
+            client_mac,
+            xid,
+            false,
+            leased_ip,
+            server_ip,
+            subnet_mask,
+        )
+        .unwrap();
         let ack_msg = Message::decode(&mut Decoder::new(&ack_bytes)).unwrap();
         assert_eq!(
             ack_msg.opts().get(OptionCode::MessageType),
@@ -1416,11 +1311,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dynamic_discover_and_request_with_raw_arp_probe() {
-        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
-        let async_sock = Arc::new(AsyncFd::new(OwnedFd::from(s1)).unwrap());
         let config = make_config("192.168.1.1/24");
         let leases = spawn_lease_actor();
         let client_mac = MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x99);
+        let (ipc_tx, mut ipc_rx) = tokio::sync::mpsc::channel(8);
 
         // 1. Dynamic DHCPDISCOVER
         let mut discover_msg = Message::default();
@@ -1431,14 +1325,25 @@ mod tests {
             .opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Discover));
 
-        handle_dhcp_discover(
-            async_sock.clone(),
-            &config,
-            &discover_msg,
-            client_mac,
-            leases.clone(),
-        )
-        .await;
+        handle_dhcp_discover(&config, &discover_msg, client_mac, leases.clone(), &ipc_tx).await;
+
+        let probe_msg = ipc_rx.recv().await.unwrap();
+        assert_eq!(
+            probe_msg,
+            DhcpServerWorkerToParentMsg::ProbeArpConflict {
+                target_ip: Ipv4Addr::new(192, 168, 1, 2)
+            }
+        );
+        let offer_msg = ipc_rx.recv().await.unwrap();
+        assert_eq!(
+            offer_msg,
+            DhcpServerWorkerToParentMsg::SendOffer {
+                client_mac,
+                xid: 12345,
+                offered_ip: Ipv4Addr::new(192, 168, 1, 2),
+                broadcast: false,
+            }
+        );
 
         let allocated_ip = leases.get_existing_ip(client_mac).await;
         assert!(allocated_ip.is_some());
@@ -1446,7 +1351,6 @@ mod tests {
         assert_eq!(leased_ip, Ipv4Addr::new(192, 168, 1, 2));
 
         // 2. Dynamic DHCPREQUEST
-        let (ipc_tx, _ipc_rx) = tokio::sync::mpsc::channel(8);
         let mut request_msg = Message::default();
         request_msg.set_opcode(Opcode::BootRequest);
         request_msg.set_xid(12345);
@@ -1461,15 +1365,25 @@ mod tests {
             .opts_mut()
             .insert(DhcpOption::ServerIdentifier(config.server_ip));
 
-        handle_dhcp_request(
-            async_sock,
-            &config,
-            &request_msg,
-            client_mac,
-            leases.clone(),
-            ipc_tx,
-        )
-        .await;
+        handle_dhcp_request(&config, &request_msg, client_mac, leases.clone(), &ipc_tx).await;
+
+        let probe_req = ipc_rx.recv().await.unwrap();
+        assert_eq!(
+            probe_req,
+            DhcpServerWorkerToParentMsg::ProbeArpConflict {
+                target_ip: leased_ip
+            }
+        );
+        let ack_msg = ipc_rx.recv().await.unwrap();
+        assert_eq!(
+            ack_msg,
+            DhcpServerWorkerToParentMsg::SendAck {
+                client_mac,
+                xid: 12345,
+                leased_ip,
+                broadcast: false,
+            }
+        );
 
         let active_leases = leases.get_active_leases().await;
         assert_eq!(active_leases.len(), 1);
@@ -1479,8 +1393,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_dhcp_request_renewing_state_with_ciaddr() {
-        let (s1, _s2) = std::os::unix::net::UnixStream::pair().unwrap();
-        let async_sock = Arc::new(AsyncFd::new(OwnedFd::from(s1)).unwrap());
         let config = make_config("192.168.1.1/24");
         let leases = spawn_lease_actor();
 
@@ -1488,7 +1400,7 @@ mod tests {
         let renewing_ip = Ipv4Addr::new(192, 168, 1, 105);
 
         // Client sends DHCPREQUEST in RENEWING state: ciaddr is set, Option 50 is omitted
-        let (ipc_tx, _ipc_rx) = tokio::sync::mpsc::channel(8);
+        let (ipc_tx, mut ipc_rx) = tokio::sync::mpsc::channel(8);
         let mut request_msg = Message::default();
         request_msg.set_opcode(Opcode::BootRequest);
         request_msg.set_xid(54321);
@@ -1498,15 +1410,25 @@ mod tests {
             .opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Request));
 
-        handle_dhcp_request(
-            async_sock,
-            &config,
-            &request_msg,
-            client_mac,
-            leases.clone(),
-            ipc_tx,
-        )
-        .await;
+        handle_dhcp_request(&config, &request_msg, client_mac, leases.clone(), &ipc_tx).await;
+
+        let probe_req = ipc_rx.recv().await.unwrap();
+        assert_eq!(
+            probe_req,
+            DhcpServerWorkerToParentMsg::ProbeArpConflict {
+                target_ip: renewing_ip
+            }
+        );
+        let ack_msg = ipc_rx.recv().await.unwrap();
+        assert_eq!(
+            ack_msg,
+            DhcpServerWorkerToParentMsg::SendAck {
+                client_mac,
+                xid: 54321,
+                leased_ip: renewing_ip,
+                broadcast: false,
+            }
+        );
 
         let active_leases = leases.get_active_leases().await;
         assert_eq!(active_leases.len(), 1);
