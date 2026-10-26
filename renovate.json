@@ -7,11 +7,9 @@
   ],
   "platformAutomerge": true,
   "semanticCommitScope": "deps",
-  "postUpdateOptions": [
-    "cargoUpdate"
-  ],
+  "rangeStrategy": "bump",
   "lockFileMaintenance": {
-    "enabled": false
+    "enabled": true
   },
   "packageRules": [
     {
