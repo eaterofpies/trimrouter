@@ -371,7 +371,7 @@ pub struct RawPacketSocket {
 
 impl RawPacketSocket {
     pub fn from_owned_fd(owned_fd: OwnedFd) -> Result<Self, std::io::Error> {
-        let socket = tokio::io::unix::AsyncFd::new(owned_fd)?;
+        let socket = unsafe { tokio::io::unix::AsyncFd::register(owned_fd) }?;
         Ok(Self { socket })
     }
 

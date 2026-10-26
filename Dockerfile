@@ -11,7 +11,7 @@ FROM rust:1.99.1-slim-trixie AS builder
 ARG ARCH="x86_64"
 
 # renovate: datasource=deb depName=linux-image-amd64 versioning=deb
-ARG KERNEL_PACKAGE_VERSION="6.12.107-1"
+ARG KERNEL_PACKAGE_VERSION="6.12.113-1"
 
 # Accept Git commit SHA and build metadata via build arguments
 ARG VERGEN_GIT_SHA="unknown"
