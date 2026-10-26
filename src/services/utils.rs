@@ -19,10 +19,12 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fs;
+use std::io::{ErrorKind, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::time::Duration;
+use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 
 pub const CHROOT_JAIL_PATH: &str = "/run/empty";
 pub const NOBODY_UID: u32 = 65534;
@@ -208,7 +210,7 @@ pub fn attach_dhcp_bpf_filter(fd: RawFd, target_port: u16) -> Result<(), std::io
     Ok(())
 }
 
-pub fn open_raw_socket(ifname: &str, target_port: u16) -> Result<OwnedFd, String> {
+pub fn open_raw_socket(ifname: &str, target_port: u16) -> Result<RawPacketSocket, String> {
     // Create the packet raw socket
     let socket = Socket::new(
         Domain::from(libc::AF_PACKET),
@@ -258,7 +260,8 @@ pub fn open_raw_socket(ifname: &str, target_port: u16) -> Result<OwnedFd, String
     attach_dhcp_bpf_filter(socket.as_raw_fd(), target_port)
         .map_err(|e| format!("SO_ATTACH_FILTER failed: {}", e))?;
 
-    Ok(socket.into())
+    RawPacketSocket::from_socket(socket)
+        .map_err(|e| format!("AsyncFd::register(AF_PACKET) failed: {}", e))
 }
 
 pub fn parse_dhcp_payload(buf: &[u8], expected_port: u16) -> Option<Message> {
@@ -277,136 +280,74 @@ pub fn parse_dhcp_payload(buf: &[u8], expected_port: u16) -> Option<Message> {
     Message::decode(&mut Decoder::new(udp_pkt.payload())).ok()
 }
 
-pub fn try_read_raw(
-    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, OwnedFd>,
-    buf: &mut [u8],
-) -> Result<Option<usize>, std::io::Error> {
-    match guard.try_io(|inner| {
-        let res = unsafe {
-            libc::recv(
-                inner.as_raw_fd(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-                0,
-            )
-        };
-        if res < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted
-                || err.raw_os_error() == Some(libc::ENOBUFS)
-            {
-                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, err));
-            }
-            Err(err)
-        } else {
-            Ok(res as usize)
-        }
-    }) {
-        Ok(res) => res.map(Some),
-        Err(_would_block) => Ok(None),
+fn map_transient_raw_error(err: std::io::Error) -> std::io::Error {
+    if err.kind() == ErrorKind::Interrupted || err.raw_os_error() == Some(libc::ENOBUFS) {
+        std::io::Error::new(ErrorKind::WouldBlock, err)
+    } else {
+        err
     }
 }
 
-pub async fn read_raw_packet(
-    async_sock: &tokio::io::unix::AsyncFd<OwnedFd>,
+pub fn try_read_raw(
+    guard: &mut AsyncFdReadyGuard<'_, Socket>,
     buf: &mut [u8],
-) -> Result<usize, std::io::Error> {
-    loop {
-        let mut guard = async_sock.readable().await?;
-        if let Some(n) = try_read_raw(&mut guard, buf)? {
-            return Ok(n);
-        }
+) -> Result<Option<usize>, std::io::Error> {
+    match guard.try_io(|inner| inner.get_ref().read(buf).map_err(map_transient_raw_error)) {
+        Ok(res) => res.map(Some),
+        Err(_would_block) => Ok(None),
     }
 }
 
 pub fn try_write_raw(
-    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, OwnedFd>,
+    guard: &mut AsyncFdReadyGuard<'_, Socket>,
     frame: &[u8],
-) -> Result<Option<isize>, std::io::Error> {
+) -> Result<Option<usize>, std::io::Error> {
     match guard.try_io(|inner| {
-        let res = unsafe {
-            libc::send(
-                inner.as_raw_fd(),
-                frame.as_ptr() as *const libc::c_void,
-                frame.len(),
-                0,
-            )
-        };
-        if res < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted
-                || err.raw_os_error() == Some(libc::ENOBUFS)
-            {
-                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, err));
-            }
-            Err(err)
-        } else {
-            Ok(res)
-        }
+        inner
+            .get_ref()
+            .write(frame)
+            .map_err(map_transient_raw_error)
     }) {
         Ok(res) => res.map(Some),
         Err(_would_block) => Ok(None),
-    }
-}
-
-pub async fn send_raw_packet(async_sock: &tokio::io::unix::AsyncFd<OwnedFd>, frame: &[u8]) {
-    loop {
-        let mut guard = match async_sock.writable().await {
-            Ok(g) => g,
-            Err(_) => break,
-        };
-
-        match try_write_raw(&mut guard, frame) {
-            Ok(None) => continue,
-            _ => break,
-        }
     }
 }
 
 /// A generic asynchronous wrapper around an AF_PACKET raw socket for sending
 /// and receiving raw Ethernet frames on a specific network interface.
 pub struct RawPacketSocket {
-    socket: tokio::io::unix::AsyncFd<OwnedFd>,
+    socket: AsyncFd<Socket>,
 }
 
 impl RawPacketSocket {
-    pub fn from_owned_fd(owned_fd: OwnedFd) -> Result<Self, std::io::Error> {
-        let socket = unsafe { tokio::io::unix::AsyncFd::register(owned_fd) }?;
+    pub fn from_socket(std_sock: Socket) -> Result<Self, std::io::Error> {
+        // SAFETY: `Socket` owns a valid, open file descriptor for its entire lifetime
+        // and never replaces or closes it until dropped.
+        let socket = unsafe { AsyncFd::register(std_sock) }?;
         Ok(Self { socket })
     }
 
-    pub async fn send(&self, frame: &[u8]) -> Result<(), std::io::Error> {
-        send_raw_packet(&self.socket, frame).await;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        read_raw_packet(&self.socket, buf).await
-    }
-
-    pub async fn recv_timeout(
-        &self,
-        buf: &mut [u8],
-        timeout: std::time::Duration,
-    ) -> Result<Option<usize>, std::io::Error> {
-        let start = std::time::Instant::now();
-        while start.elapsed() < timeout {
-            let remaining = timeout.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-
-            let Ok(Ok(mut guard)) = tokio::time::timeout(remaining, self.socket.readable()).await
-            else {
-                return Ok(None);
+    pub async fn send(&self, frame: &[u8]) {
+        loop {
+            let mut guard = match self.socket.writable().await {
+                Ok(g) => g,
+                Err(_) => break,
             };
 
-            if let Some(n) = try_read_raw(&mut guard, buf)? {
-                return Ok(Some(n));
+            match try_write_raw(&mut guard, frame) {
+                Ok(None) => continue,
+                _ => break,
             }
         }
-        Ok(None)
+    }
+
+    pub async fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        loop {
+            let mut guard = self.socket.readable().await?;
+            if let Some(n) = try_read_raw(&mut guard, buf)? {
+                return Ok(n);
+            }
+        }
     }
 }
 
@@ -590,7 +531,7 @@ where
 pub fn setup_worker_sockets<InMsg: for<'a> Deserialize<'a>>(
     interface: &str,
     target_port: u16,
-) -> std::io::Result<(OwnedFd, IpcEndpoint<InMsg>, OwnedFd)> {
+) -> std::io::Result<(RawPacketSocket, IpcEndpoint<InMsg>, OwnedFd)> {
     let raw_socket = open_raw_socket(interface, target_port).map_err(std::io::Error::other)?;
     let (endpoint, child_fd) = create_ipc_channel()?;
     Ok((raw_socket, endpoint, child_fd))
@@ -1023,5 +964,43 @@ mod tests {
             !check_frame(&valid[..20]),
             "truncated packet must be dropped"
         );
+    }
+
+    #[test]
+    fn test_map_transient_raw_error_converts_interrupted_and_enobufs() {
+        let interrupted = std::io::Error::new(ErrorKind::Interrupted, "interrupted");
+        assert_eq!(
+            map_transient_raw_error(interrupted).kind(),
+            ErrorKind::WouldBlock
+        );
+
+        let enobufs = std::io::Error::from_raw_os_error(libc::ENOBUFS);
+        assert_eq!(
+            map_transient_raw_error(enobufs).kind(),
+            ErrorKind::WouldBlock
+        );
+
+        let perm_denied = std::io::Error::new(ErrorKind::PermissionDenied, "denied");
+        assert_eq!(
+            map_transient_raw_error(perm_denied).kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn test_raw_packet_socket_send_and_recv() {
+        let (s1, s2) = Socket::pair(Domain::UNIX, Type::DGRAM, None).expect("socket pair");
+        s1.set_nonblocking(true).expect("nonblocking s1");
+        s2.set_nonblocking(true).expect("nonblocking s2");
+
+        let raw1 = RawPacketSocket::from_socket(s1).expect("wrap s1");
+        let raw2 = RawPacketSocket::from_socket(s2).expect("wrap s2");
+
+        let payload = [0xDE, 0xAD, 0xBE, 0xEF, 0x42];
+        raw1.send(&payload).await;
+
+        let mut buf = [0u8; 32];
+        let n = raw2.recv(&mut buf).await.expect("recv succeeds");
+        assert_eq!(&buf[..n], &payload);
     }
 }

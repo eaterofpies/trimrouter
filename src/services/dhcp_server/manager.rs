@@ -9,7 +9,7 @@ use crate::services::ipc::{
 use crate::services::observability::DhcpLeasesSender;
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{
-    get_interface_mac, read_raw_packet, send_raw_packet, setup_worker_sockets, terminate_worker,
+    RawPacketSocket, get_interface_mac, setup_worker_sockets, terminate_worker,
 };
 use dhcproto::v4::{MessageType, SERVER_PORT};
 use futures_util::StreamExt;
@@ -21,8 +21,6 @@ use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
 use std::net::Ipv4Addr;
-use std::os::unix::io::OwnedFd;
-use tokio::io::unix::AsyncFd;
 use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 
@@ -67,14 +65,10 @@ impl DhcpServer {
 
 fn start_parent_arp_listener(
     parent_ipc: IpcEndpoint<DhcpServerWorkerToParentMsg>,
-    raw_socket_fd: OwnedFd,
+    raw_sock: RawPacketSocket,
     params: DhcpMonitorParams,
 ) -> Result<JoinHandle<()>, ServiceError> {
-    let handle = tokio::spawn(run_parent_dhcp_server_monitor(
-        parent_ipc,
-        raw_socket_fd,
-        params,
-    ));
+    let handle = tokio::spawn(run_parent_dhcp_server_monitor(parent_ipc, raw_sock, params));
     Ok(handle)
 }
 
@@ -104,7 +98,7 @@ struct ServerNetworkConfig {
 }
 
 async fn handle_send_offer(
-    async_sock: &AsyncFd<OwnedFd>,
+    raw_sock: &RawPacketSocket,
     config: &ServerNetworkConfig,
     client_mac: MacAddr,
     xid: u32,
@@ -143,7 +137,7 @@ async fn handle_send_offer(
         dhcproto::v4::CLIENT_PORT,
         &payload,
     ) {
-        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Ok(frame) => raw_sock.send(&frame).await,
         Err(e) => error!(
             "[dhcp-server-parent] Failed to build raw offer packet: {}",
             e
@@ -164,7 +158,7 @@ fn get_dest_mac_ip(
 }
 
 async fn handle_send_ack(
-    async_sock: &AsyncFd<OwnedFd>,
+    raw_sock: &RawPacketSocket,
     config: &ServerNetworkConfig,
     client_mac: MacAddr,
     xid: u32,
@@ -203,13 +197,13 @@ async fn handle_send_ack(
         dhcproto::v4::CLIENT_PORT,
         &payload,
     ) {
-        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Ok(frame) => raw_sock.send(&frame).await,
         Err(e) => error!("[dhcp-server-parent] Failed to build raw ack packet: {}", e),
     }
 }
 
 async fn handle_send_nak(
-    async_sock: &AsyncFd<OwnedFd>,
+    raw_sock: &RawPacketSocket,
     server_mac: MacAddr,
     server_ip: Ipv4Addr,
     client_mac: MacAddr,
@@ -231,13 +225,13 @@ async fn handle_send_nak(
         dhcproto::v4::CLIENT_PORT,
         &payload,
     ) {
-        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Ok(frame) => raw_sock.send(&frame).await,
         Err(e) => error!("[dhcp-server-parent] Failed to build raw nak packet: {}", e),
     }
 }
 
 async fn handle_probe_arp(
-    async_sock: &AsyncFd<OwnedFd>,
+    raw_sock: &RawPacketSocket,
     server_mac: MacAddr,
     server_ip: Ipv4Addr,
     lan_net: &Ipv4Net,
@@ -259,7 +253,7 @@ async fn handle_probe_arp(
         super::worker::DISCARD_PORT,
         &[0u8],
     ) {
-        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Ok(frame) => raw_sock.send(&frame).await,
         Err(e) => error!(
             "[dhcp-server-parent] Failed to build raw arp probe packet: {}",
             e
@@ -270,7 +264,7 @@ async fn handle_probe_arp(
 async fn handle_worker_ipc_msg(
     msg: DhcpServerWorkerToParentMsg,
     params: &DhcpMonitorParams,
-    async_sock: &AsyncFd<OwnedFd>,
+    raw_sock: &RawPacketSocket,
     server_mac: MacAddr,
     lan_net: &Ipv4Net,
 ) {
@@ -303,7 +297,7 @@ async fn handle_worker_ipc_msg(
             offered_ip,
             broadcast,
         } => {
-            handle_send_offer(async_sock, &config, client_mac, xid, offered_ip, broadcast).await;
+            handle_send_offer(raw_sock, &config, client_mac, xid, offered_ip, broadcast).await;
         }
         DhcpServerWorkerToParentMsg::SendAck {
             client_mac,
@@ -311,20 +305,20 @@ async fn handle_worker_ipc_msg(
             leased_ip,
             broadcast,
         } => {
-            handle_send_ack(async_sock, &config, client_mac, xid, leased_ip, broadcast).await;
+            handle_send_ack(raw_sock, &config, client_mac, xid, leased_ip, broadcast).await;
         }
         DhcpServerWorkerToParentMsg::SendNak { client_mac, xid } => {
-            handle_send_nak(async_sock, server_mac, server_ip, client_mac, xid).await;
+            handle_send_nak(raw_sock, server_mac, server_ip, client_mac, xid).await;
         }
         DhcpServerWorkerToParentMsg::ProbeArpConflict { target_ip } => {
-            handle_probe_arp(async_sock, server_mac, server_ip, lan_net, target_ip).await;
+            handle_probe_arp(raw_sock, server_mac, server_ip, lan_net, target_ip).await;
         }
     }
 }
 
 async fn run_parent_dhcp_server_monitor(
     ipc: IpcEndpoint<DhcpServerWorkerToParentMsg>,
-    raw_socket_fd: OwnedFd,
+    raw_sock: RawPacketSocket,
     mut params: DhcpMonitorParams,
 ) {
     let msg = DhcpServerParentToWorkerMsg::SetStaticLeases {
@@ -359,18 +353,6 @@ async fn run_parent_dhcp_server_monitor(
         }
     };
 
-    let async_sock = match unsafe { AsyncFd::register(raw_socket_fd) } {
-        Ok(s) => s,
-        Err(e) => {
-            error!(
-                "[dhcp-server-parent] Failed to wrap raw socket in AsyncFd: {}",
-                e
-            );
-            terminate_worker(params.child_pid).await;
-            return;
-        }
-    };
-
     let (connection, _handle, mut messages) =
         match rtnetlink::new_multicast_connection(&[MulticastGroup::Neigh]) {
             Ok(res) => res,
@@ -396,7 +378,7 @@ async fn run_parent_dhcp_server_monitor(
     loop {
         tokio::select! {
             _ = params.shutdown_rx.changed() => break,
-            read_res = read_raw_packet(&async_sock, &mut raw_buf) => {
+            read_res = raw_sock.recv(&mut raw_buf) => {
                 match read_res {
                     Ok(n) => {
                         let frame = raw_buf[..n].to_vec();
@@ -417,7 +399,7 @@ async fn run_parent_dhcp_server_monitor(
                         handle_worker_ipc_msg(
                             msg,
                             &params,
-                            &async_sock,
+                            &raw_sock,
                             server_mac,
                             &lan_net,
                         )
@@ -504,20 +486,19 @@ fn setup_dhcp_server_attempt(
 ) -> Result<
     (
         crate::cli::WorkerService,
-        (IpcEndpoint<DhcpServerWorkerToParentMsg>, OwnedFd),
+        (IpcEndpoint<DhcpServerWorkerToParentMsg>, RawPacketSocket),
     ),
     ServiceError,
 > {
-    let (raw_socket_fd, parent_ipc, child_ipc) =
-        setup_worker_sockets(lan_interface, SERVER_PORT)
-            .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
+    let (raw_sock, parent_ipc, child_ipc) = setup_worker_sockets(lan_interface, SERVER_PORT)
+        .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
     Ok((
         crate::cli::WorkerService::DhcpServer {
             ipc_fd: child_ipc.into(),
             wan_interface: lan_interface.to_string(),
             lan_ip: lan_ip.to_string(),
         },
-        (parent_ipc, raw_socket_fd),
+        (parent_ipc, raw_sock),
     ))
 }
 
@@ -534,7 +515,7 @@ impl Service for DhcpServer {
 
         self.state.start_supervised(
             move || setup_dhcp_server_attempt(&lan_interface, &lan_ip),
-            move |(parent_ipc, raw_socket_fd), child_pid, shutdown_rx| {
+            move |(parent_ipc, raw_sock), child_pid, shutdown_rx| {
                 let params = DhcpMonitorParams {
                     child_pid,
                     shutdown_rx,
@@ -545,7 +526,7 @@ impl Service for DhcpServer {
                     lan_interface: lan_interface_spawn.clone(),
                     lan_ip: lan_ip_spawn.clone(),
                 };
-                start_parent_arp_listener(parent_ipc, raw_socket_fd, params)
+                start_parent_arp_listener(parent_ipc, raw_sock, params)
             },
         )
     }
