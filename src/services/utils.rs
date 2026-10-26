@@ -3,8 +3,10 @@ use crate::error::RouterError;
 use dhcproto::v4::Message;
 use dhcproto::{Decodable, Decoder};
 use futures_util::TryStreamExt;
+use libc::{SO_ATTACH_FILTER, SOL_SOCKET, sock_filter, sock_fprog, socklen_t};
 use log::{info, warn};
 use nix::unistd::{Gid, Uid, setgid, setuid};
+use pktbaffle::{LinkType, Program, Target, compile};
 use pnet::packet::Packet;
 use pnet::packet::ethernet::EthernetPacket;
 use pnet::packet::ipv4::Ipv4Packet;
@@ -19,7 +21,7 @@ use std::convert::TryInto;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 pub const CHROOT_JAIL_PATH: &str = "/run/empty";
@@ -178,12 +180,40 @@ pub async fn get_interface_mac(ifname: &str) -> Result<MacAddr, String> {
     })
 }
 
-pub fn open_raw_socket(ifname: &str) -> Result<OwnedFd, String> {
+pub fn compile_dhcp_bpf_filter(target_port: u16) -> Result<Program, std::io::Error> {
+    let filter_expr = format!("ip and udp dst port {}", target_port);
+    compile(&filter_expr, LinkType::Ethernet, Target::Classic)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))
+}
+
+pub fn attach_dhcp_bpf_filter(fd: RawFd, target_port: u16) -> Result<(), std::io::Error> {
+    let prog = compile_dhcp_bpf_filter(target_port)?;
+    let insns = prog.instructions();
+    let mut sock_prog = sock_fprog {
+        len: insns.len() as u16,
+        filter: insns.as_ptr() as *const sock_filter as *mut sock_filter,
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_ATTACH_FILTER,
+            &mut sock_prog as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<sock_fprog>() as socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn open_raw_socket(ifname: &str, target_port: u16) -> Result<OwnedFd, String> {
     // Create the packet raw socket
     let socket = Socket::new(
         Domain::from(libc::AF_PACKET),
         Type::RAW,
-        Some(Protocol::from((libc::ETH_P_ALL as u16).to_be() as i32)),
+        Some(Protocol::from((libc::ETH_P_IP as u16).to_be() as i32)),
     )
     .map_err(|e| format!("socket(AF_PACKET) failed: {}", e))?;
 
@@ -203,7 +233,7 @@ pub fn open_raw_socket(ifname: &str) -> Result<OwnedFd, String> {
     // Set up Link-Layer address struct
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as u16;
-    addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+    addr.sll_protocol = (libc::ETH_P_IP as u16).to_be();
     addr.sll_ifindex = if_index as i32;
 
     // Wrap in SockAddr and bind
@@ -224,6 +254,9 @@ pub fn open_raw_socket(ifname: &str) -> Result<OwnedFd, String> {
     socket
         .bind(&sockaddr)
         .map_err(|e| format!("bind(AF_PACKET) failed: {}", e))?;
+
+    attach_dhcp_bpf_filter(socket.as_raw_fd(), target_port)
+        .map_err(|e| format!("SO_ATTACH_FILTER failed: {}", e))?;
 
     Ok(socket.into())
 }
@@ -556,8 +589,9 @@ where
 
 pub fn setup_worker_sockets<InMsg: for<'a> Deserialize<'a>>(
     interface: &str,
+    target_port: u16,
 ) -> std::io::Result<(OwnedFd, IpcEndpoint<InMsg>, OwnedFd)> {
-    let raw_socket = open_raw_socket(interface).map_err(std::io::Error::other)?;
+    let raw_socket = open_raw_socket(interface, target_port).map_err(std::io::Error::other)?;
     let (endpoint, child_fd) = create_ipc_channel()?;
     Ok((raw_socket, endpoint, child_fd))
 }
@@ -651,6 +685,7 @@ pub async fn terminate_worker(pid: u32) {
 #[allow(unused_imports)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixDatagram;
 
     #[test]
     fn test_mask_to_prefix_len_valid() {
@@ -928,5 +963,65 @@ mod tests {
             }
             Err(e) => panic!("Fork failed: {}", e),
         }
+    }
+
+    #[test]
+    fn test_compile_dhcp_bpf_filter() {
+        let prog = compile_dhcp_bpf_filter(67).expect("server filter compiles");
+        assert!(!prog.is_empty());
+        assert!(!prog.instructions().is_empty());
+
+        let prog_client = compile_dhcp_bpf_filter(68).expect("client filter compiles");
+        assert!(!prog_client.is_empty());
+        assert!(!prog_client.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_dhcp_bpf_filter_drop_and_accept() {
+        let (s1, s2) = UnixDatagram::pair().expect("socket pair created");
+        s1.set_nonblocking(true).unwrap();
+        s2.set_nonblocking(true).unwrap();
+        attach_dhcp_bpf_filter(s2.as_raw_fd(), 67).expect("attach filter succeeds");
+
+        let check_frame = |frame: &[u8]| -> bool {
+            s1.send(frame).unwrap();
+            let mut buf = [0u8; 128];
+            s2.recv(&mut buf).is_ok()
+        };
+
+        // Valid DHCP packet: Ethernet (14) + IPv4 (20) + UDP (8) to destination port 67
+        let mut valid = vec![0u8; 42];
+        valid[12..14].copy_from_slice(&(libc::ETH_P_IP as u16).to_be_bytes()); // IPv4 (0x0800)
+        valid[14] = 0x45; // Version 4, IHL 5 (20 bytes)
+        valid[23] = 17; // UDP
+        valid[36..38].copy_from_slice(&67u16.to_be_bytes()); // Port 67
+        assert!(check_frame(&valid), "valid DHCP packet must be accepted");
+
+        // Negative tests:
+        // 1. Wrong port
+        let mut wrong_port = valid.clone();
+        wrong_port[36..38].copy_from_slice(&80u16.to_be_bytes());
+        assert!(!check_frame(&wrong_port), "wrong port must be dropped");
+
+        // 2. Non-IPv4 (ARP)
+        let mut arp = valid.clone();
+        arp[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+        assert!(!check_frame(&arp), "non-IPv4 must be dropped");
+
+        // 3. Non-UDP (TCP)
+        let mut tcp = valid.clone();
+        tcp[23] = 6;
+        assert!(!check_frame(&tcp), "non-UDP must be dropped");
+
+        // 4. Fragmented
+        let mut frag = valid.clone();
+        frag[20..22].copy_from_slice(&1u16.to_be_bytes());
+        assert!(!check_frame(&frag), "fragmented packet must be dropped");
+
+        // 5. Truncated
+        assert!(
+            !check_frame(&valid[..20]),
+            "truncated packet must be dropped"
+        );
     }
 }

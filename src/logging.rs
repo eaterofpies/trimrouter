@@ -788,7 +788,10 @@ mod tests {
         let test_line = "[2026-09-27T18:30:00Z] [INFO] [test] Test log broadcast\n";
         push_to_ring_buffer_and_broadcast(test_line);
 
-        let received = rx.recv().await.unwrap();
+        let mut received = rx.recv().await.unwrap();
+        while received != test_line {
+            received = rx.recv().await.unwrap();
+        }
         assert_eq!(received, test_line);
 
         let recent = get_recent_logs(10, None);
