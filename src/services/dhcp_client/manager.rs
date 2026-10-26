@@ -252,7 +252,7 @@ async fn run_parent_dhcp_monitor(
             return;
         }
     };
-    let async_sock = match AsyncFd::new(raw_socket_fd) {
+    let async_sock = match unsafe { AsyncFd::register(raw_socket_fd) } {
         Ok(s) => s,
         Err(e) => {
             error!(
