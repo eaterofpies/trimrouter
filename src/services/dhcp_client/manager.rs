@@ -5,8 +5,8 @@ use crate::services::DHCP_CLIENT_SERVICE_NAME;
 use crate::services::ipc::{DhcpClientParentToWorkerMsg, DhcpClientToParentMsg, IpcEndpoint};
 use crate::services::supervisor::{ExternalWorker, Service, ServiceError};
 use crate::services::utils::{
-    CleanOption, WanLease, WanLeaseSender, get_interface_mac, mask_to_prefix_len,
-    prefix_len_to_mask, read_raw_packet, send_raw_packet, setup_worker_sockets, terminate_worker,
+    CleanOption, RawPacketSocket, WanLease, WanLeaseSender, get_interface_mac, mask_to_prefix_len,
+    prefix_len_to_mask, setup_worker_sockets, terminate_worker,
 };
 use dhcproto::v4::CLIENT_PORT;
 use dhcproto::{Encodable, Encoder};
@@ -14,8 +14,6 @@ use ipnet::Ipv4Net;
 use log::{error, info, warn};
 use pnet::util::MacAddr;
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::unix::io::OwnedFd;
-use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 
 pub struct DhcpClient {
@@ -103,7 +101,7 @@ async fn clear_parent_lease(lease_tx: &WanLeaseSender, wan_interface: &str) {
 
 fn start_parent_supervisor_task(
     parent_ipc: IpcEndpoint<DhcpClientToParentMsg>,
-    raw_socket_fd: OwnedFd,
+    raw_sock: RawPacketSocket,
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
@@ -111,7 +109,7 @@ fn start_parent_supervisor_task(
 ) -> Result<JoinHandle<()>, ServiceError> {
     let handle = tokio::spawn(run_parent_dhcp_monitor(
         parent_ipc,
-        raw_socket_fd,
+        raw_sock,
         child_pid,
         wan_interface,
         lease_tx,
@@ -121,7 +119,7 @@ fn start_parent_supervisor_task(
     Ok(handle)
 }
 
-async fn handle_send_discover(async_sock: &AsyncFd<OwnedFd>, wan_mac: MacAddr, xid: u32) {
+async fn handle_send_discover(raw_sock: &RawPacketSocket, wan_mac: MacAddr, xid: u32) {
     let discover = super::worker::build_discover_message(wan_mac, xid);
     let mut payload = Vec::new();
     if let Err(e) = discover.encode(&mut Encoder::new(&mut payload)) {
@@ -137,7 +135,7 @@ async fn handle_send_discover(async_sock: &AsyncFd<OwnedFd>, wan_mac: MacAddr, x
         dhcproto::v4::SERVER_PORT,
         &payload,
     ) {
-        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Ok(frame) => raw_sock.send(&frame).await,
         Err(e) => error!(
             "[dhcp-client-parent] Failed to build discover packet: {}",
             e
@@ -146,7 +144,7 @@ async fn handle_send_discover(async_sock: &AsyncFd<OwnedFd>, wan_mac: MacAddr, x
 }
 
 async fn handle_send_request(
-    async_sock: &AsyncFd<OwnedFd>,
+    raw_sock: &RawPacketSocket,
     wan_mac: MacAddr,
     xid: u32,
     requested_ip: Ipv4Addr,
@@ -174,14 +172,14 @@ async fn handle_send_request(
         dhcproto::v4::SERVER_PORT,
         &payload,
     ) {
-        Ok(frame) => send_raw_packet(async_sock, &frame).await,
+        Ok(frame) => raw_sock.send(&frame).await,
         Err(e) => error!("[dhcp-client-parent] Failed to build request packet: {}", e),
     }
 }
 
 async fn handle_client_ipc_msg(
     msg: DhcpClientToParentMsg,
-    async_sock: &AsyncFd<OwnedFd>,
+    raw_sock: &RawPacketSocket,
     wan_mac: MacAddr,
     wan_interface: &str,
     lease_tx: &WanLeaseSender,
@@ -190,7 +188,7 @@ async fn handle_client_ipc_msg(
     match msg {
         DhcpClientToParentMsg::SendDiscover { xid } => {
             send_service_heartbeat(heartbeat_tx, MonitoredService::DhcpClient);
-            handle_send_discover(async_sock, wan_mac, xid).await;
+            handle_send_discover(raw_sock, wan_mac, xid).await;
         }
         DhcpClientToParentMsg::SendRequest {
             xid,
@@ -199,7 +197,7 @@ async fn handle_client_ipc_msg(
             ciaddr,
         } => {
             send_service_heartbeat(heartbeat_tx, MonitoredService::DhcpClient);
-            handle_send_request(async_sock, wan_mac, xid, requested_ip, server_ip, ciaddr).await;
+            handle_send_request(raw_sock, wan_mac, xid, requested_ip, server_ip, ciaddr).await;
         }
         DhcpClientToParentMsg::ApplyWanLease {
             ip_address,
@@ -231,7 +229,7 @@ async fn handle_client_ipc_msg(
 
 async fn run_parent_dhcp_monitor(
     ipc: IpcEndpoint<DhcpClientToParentMsg>,
-    raw_socket_fd: OwnedFd,
+    raw_sock: RawPacketSocket,
     child_pid: u32,
     wan_interface: String,
     lease_tx: WanLeaseSender,
@@ -252,22 +250,11 @@ async fn run_parent_dhcp_monitor(
             return;
         }
     };
-    let async_sock = match unsafe { AsyncFd::register(raw_socket_fd) } {
-        Ok(s) => s,
-        Err(e) => {
-            error!(
-                "[dhcp-client-parent] Failed to wrap raw socket in AsyncFd: {}",
-                e
-            );
-            terminate_worker(child_pid).await;
-            return;
-        }
-    };
 
     let mut raw_buf = [0u8; 2048];
     loop {
         tokio::select! {
-            read_res = read_raw_packet(&async_sock, &mut raw_buf) => {
+            read_res = raw_sock.recv(&mut raw_buf) => {
                 match read_res {
                     Ok(n) => {
                         let frame = raw_buf[..n].to_vec();
@@ -287,7 +274,7 @@ async fn run_parent_dhcp_monitor(
                     Ok(Some(msg)) => {
                         handle_client_ipc_msg(
                             msg,
-                            &async_sock,
+                            &raw_sock,
                             wan_mac,
                             &wan_interface,
                             &lease_tx,
@@ -316,20 +303,19 @@ fn setup_dhcp_client_attempt(
 ) -> Result<
     (
         crate::cli::WorkerService,
-        (IpcEndpoint<DhcpClientToParentMsg>, OwnedFd),
+        (IpcEndpoint<DhcpClientToParentMsg>, RawPacketSocket),
     ),
     ServiceError,
 > {
-    let (raw_socket_fd, parent_ipc, child_ipc) =
-        setup_worker_sockets(wan_interface, CLIENT_PORT)
-            .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
+    let (raw_sock, parent_ipc, child_ipc) = setup_worker_sockets(wan_interface, CLIENT_PORT)
+        .map_err(|e| ServiceError::FailedToStart(format!("Socket setup failed: {}", e)))?;
 
     let worker_service = crate::cli::WorkerService::DhcpClient {
         ipc_fd: child_ipc.into(),
         wan_interface: wan_interface.to_string(),
     };
 
-    Ok((worker_service, (parent_ipc, raw_socket_fd)))
+    Ok((worker_service, (parent_ipc, raw_sock)))
 }
 
 impl Service for DhcpClient {
@@ -341,10 +327,10 @@ impl Service for DhcpClient {
 
         self.state.start_supervised(
             move || setup_dhcp_client_attempt(&wan_interface_setup),
-            move |(parent_ipc, raw_socket_fd), child_pid, _shutdown_rx| {
+            move |(parent_ipc, raw_sock), child_pid, _shutdown_rx| {
                 start_parent_supervisor_task(
                     parent_ipc,
-                    raw_socket_fd,
+                    raw_sock,
                     child_pid,
                     wan_interface.clone(),
                     lease_tx.clone(),
