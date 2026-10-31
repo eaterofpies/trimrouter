@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.1](https://github.com/eaterofpies/trimrouter/compare/v0.5.0...v0.5.1) (2026-10-31)
+
+
+### Bug Fixes
+
+* **deps:** update all dependencies ([#33](https://github.com/eaterofpies/trimrouter/issues/33)) ([f260fee](https://github.com/eaterofpies/trimrouter/commit/f260fee6b3bcfc1c2b3d4429e45edd994b0ae2c4))
+* **deps:** update all dependencies ([#41](https://github.com/eaterofpies/trimrouter/issues/41)) ([38c1489](https://github.com/eaterofpies/trimrouter/commit/38c1489a57051f3966e9d21c7aa6797dbc59432d))
+* **deps:** update kernel package to 6.12.113-1 and migrate to AsyncFd::register ([#39](https://github.com/eaterofpies/trimrouter/issues/39)) ([1b49468](https://github.com/eaterofpies/trimrouter/commit/1b4946851eb3a049a9982c52018f1011d1d878b8))
+
 ## [0.5.0](https://github.com/eaterofpies/trimrouter/compare/v0.4.0...v0.5.0) (2026-10-09)
 
 
