@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/eaterofpies/trimrouter/compare/v0.5.2...v0.5.3) (2026-11-13)
+
+
+### Bug Fixes
+
+* **deps:** update all dependencies ([#47](https://github.com/eaterofpies/trimrouter/issues/47)) ([1e1659b](https://github.com/eaterofpies/trimrouter/commit/1e1659b23b2a7f0d7a746d321e76c6d289a554da))
+
 ## [0.5.2](https://github.com/eaterofpies/trimrouter/compare/v0.5.1...v0.5.2) (2026-11-10)
 
 
