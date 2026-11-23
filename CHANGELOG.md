@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.3](https://github.com/eaterofpies/trimrouter/compare/v0.5.2...v0.5.3) (2026-11-23)
+
+
+### Bug Fixes
+
+* **deps:** lock file maintenance ([#50](https://github.com/eaterofpies/trimrouter/issues/50)) ([35b8176](https://github.com/eaterofpies/trimrouter/commit/35b8176a64d77f192f1d22d6eb499eadd6d0b64f))
+* **deps:** lock file maintenance ([#51](https://github.com/eaterofpies/trimrouter/issues/51)) ([d00e201](https://github.com/eaterofpies/trimrouter/commit/d00e201b2888ee9d58e7cc38e5057357391d9b16))
+* **deps:** update all dependencies ([#47](https://github.com/eaterofpies/trimrouter/issues/47)) ([1e1659b](https://github.com/eaterofpies/trimrouter/commit/1e1659b23b2a7f0d7a746d321e76c6d289a554da))
+* **deps:** update all dependencies ([#49](https://github.com/eaterofpies/trimrouter/issues/49)) ([7a93a44](https://github.com/eaterofpies/trimrouter/commit/7a93a44c4e5f18a4e316f543b2a4f7247affccb2))
+
 ## [0.5.2](https://github.com/eaterofpies/trimrouter/compare/v0.5.1...v0.5.2) (2026-11-10)
 
 
