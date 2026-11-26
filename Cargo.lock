@@ -72,9 +72,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.104"
+version = "1.0.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
 name = "atomic-polyfill"
@@ -2174,9 +2174,9 @@ checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "vergen"
-version = "10.0.4"
+version = "10.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f46299131ce897c3740a03d2ee49ef3e977e21e355a6d3885f9eae22e5d62bf2"
+checksum = "a1e657ec41dc2e06c78ab6f8228914c6e8c4b604b485d8f7436f4081e8565938"
 dependencies = [
  "anyhow",
  "bon",
@@ -2187,9 +2187,9 @@ dependencies = [
 
 [[package]]
 name = "vergen-gitcl"
-version = "10.0.4"
+version = "10.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b687a85788cc84e6c1c04dc31f09646da57ca91d93c1acb309b3955199851383"
+checksum = "bba5b498f5696afbfd29ce13648e32e11777c50ed63712714990249fa9d68770"
 dependencies = [
  "anyhow",
  "bon",
@@ -2201,9 +2201,9 @@ dependencies = [
 
 [[package]]
 name = "vergen-lib"
-version = "10.0.4"
+version = "10.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e12cbbddb1486ac56915be42972cd30a273e3872d9f98ac9fdb6ac41115f7d5"
+checksum = "d7693a14090017adc8eac3c3af50fa3b502b567e85b9f524ee089be122021d50"
 dependencies = [
  "anyhow",
  "bon",
